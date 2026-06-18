@@ -1,0 +1,18 @@
+{
+  "name": "@affiliate/db",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./schema.sql": "./src/schema.sql"
+  },
+  "dependencies": {
+    "@affiliate/core": "*"
+  },
+  "scripts": {
+    "typecheck": "tsc -b"
+  }
+}

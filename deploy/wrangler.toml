@@ -1,0 +1,29 @@
+# Cloudflare Workers config for the tracking redirect hot path (Section 11).
+# The redirect deliberately does NOT run on the origin: a single-region box serving
+# worldwide clicks would add latency to the most critical always-on endpoint.
+#
+# Deploy:  wrangler deploy
+# The Worker resolves links from KV (LINKS), which the backend syncs, and pushes
+# click records onto a Queue (CLICKS) that the Hetzner pipeline drains.
+
+name = "vantage-tracking-edge"
+main = "../packages/tracking-edge/src/worker.ts"
+compatibility_date = "2024-11-01"
+
+# Route the redirect host through the Worker (e.g. track.you.com/c/<code>).
+routes = [
+  { pattern = "track.you.com/c/*", zone_name = "you.com" }
+]
+
+# Workers KV: code -> ResolvedLink JSON. The backend writes here on link creation.
+[[kv_namespaces]]
+binding = "LINKS"
+id = "REPLACE_WITH_KV_NAMESPACE_ID"
+
+# Queue the pipeline consumes click records from (async write off the hot path).
+[[queues.producers]]
+binding = "CLICKS"
+queue = "vantage-clicks"
+
+[observability]
+enabled = true

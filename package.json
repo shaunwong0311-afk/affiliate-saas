@@ -1,0 +1,31 @@
+{
+  "name": "affiliate-saas",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Merchant-focused affiliate program management platform with a recruitment wedge, built on a pluggable commission engine over a shared substrate.",
+  "type": "module",
+  "workspaces": [
+    "packages/*"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc -b",
+    "typecheck": "tsc -b --noEmit || tsc -b",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "api": "node --import tsx packages/api/src/server.ts",
+    "edge": "node --import tsx packages/tracking-edge/src/server.ts",
+    "worker": "node --import tsx packages/recruitment/src/worker.ts",
+    "demo": "node --import tsx packages/api/src/dev/demo.ts",
+    "web:dev": "npm run dev -w @affiliate/web",
+    "lint": "tsc -b --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  }
+}

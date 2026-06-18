@@ -1,0 +1,11 @@
+{
+  "files": [],
+  "references": [
+    { "path": "packages/core" },
+    { "path": "packages/db" },
+    { "path": "packages/integrations" },
+    { "path": "packages/tracking-edge" },
+    { "path": "packages/recruitment" },
+    { "path": "packages/api" }
+  ]
+}
