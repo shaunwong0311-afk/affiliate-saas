@@ -1,6 +1,7 @@
 import { InMemoryQueue, type JobQueue } from "./queue.js";
 import type { RecruitmentDeps } from "./deps.js";
 import { enrich, score, send } from "./pipeline.js";
+import { autonomousCycle } from "./automation.js";
 
 /**
  * Stage workers over a durable queue (Section 8.7). Each stage is registered as a
@@ -27,4 +28,45 @@ export function buildQueue(): JobQueue {
     enrich: { perWindow: 30, windowMs: 60_000 }, // email-finder API budget
     send: { perWindow: 50, windowMs: 60_000 }, // per-mailbox daily cap proxy
   });
+}
+
+/**
+ * The scheduler — drives the autonomous from-scratch engine. For every merchant
+ * with automation `running`, it runs one `autonomousCycle` per tick (source →
+ * enrich → score → auto-send + follow-ups, gated by the deliverability circuit
+ * breaker and the HITL tier). In production this is a cron/interval; here it is a
+ * single `tick()` plus a `loop()` so it is testable and embeddable.
+ */
+export async function tickScheduler(deps: RecruitmentDeps): Promise<{ merchants: number; cycles: unknown[] }> {
+  const states = await deps.db.automationStates.find((s) => s.status === "running");
+  const cycles: unknown[] = [];
+  for (const state of states) {
+    cycles.push(await autonomousCycle(deps, state.merchantId));
+  }
+  return { merchants: states.length, cycles };
+}
+
+export interface SchedulerHandle {
+  stop(): void;
+}
+
+/** Run the scheduler on an interval (production worker entrypoint). */
+export function runScheduler(deps: RecruitmentDeps, intervalMs = 60_000): SchedulerHandle {
+  let stopped = false;
+  const run = async () => {
+    if (stopped) return;
+    try {
+      await tickScheduler(deps);
+    } catch {
+      /* isolate cycle failures */
+    }
+    if (!stopped) timer = setTimeout(run, intervalMs);
+  };
+  let timer = setTimeout(run, intervalMs);
+  return {
+    stop() {
+      stopped = true;
+      clearTimeout(timer);
+    },
+  };
 }

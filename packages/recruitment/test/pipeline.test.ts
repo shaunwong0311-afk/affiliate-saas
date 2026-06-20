@@ -79,8 +79,17 @@ describe("recruitment pipeline", () => {
     expect(unsub.action).toBe("suppress");
     expect(await isSuppressed(deps, "m1", "hi@trailtester.com")).toBe(true);
 
-    const prospect2 = await db.prospects.insert({ ...prospect, id: newId("prosp"), email: "yes@trailtester.com" });
-    const interested = await handleReply(deps, prospect2.id, "This sounds great, what's the commission rate?");
-    expect(["hitl_queue", "ai_sdr"]).toContain(interested.action);
+    // Two-track routing: a B-tier interested reply goes to the automated self-serve
+    // track (signup link), not a human meeting.
+    const bTier = await db.prospects.insert({ ...prospect, id: newId("prosp"), email: "yes@trailtester.com", tier: "B" });
+    const selfServe = await handleReply(deps, bTier.id, "This sounds great, what's the commission rate?");
+    expect(["self_serve", "ai_sdr"]).toContain(selfServe.action);
+    expect(selfServe.signupUrl).toBeTruthy();
+
+    // An A-tier interested reply books a meeting (the managed, human-closed track).
+    const aTier = await db.prospects.insert({ ...prospect, id: newId("prosp"), email: "vip@trailtester.com", tier: "A" });
+    const meeting = await handleReply(deps, aTier.id, "Very interested — let's talk.", { meetingTier: "A" });
+    expect(meeting.action).toBe("meeting_booked");
+    expect(meeting.meeting).toBeTruthy();
   });
 });

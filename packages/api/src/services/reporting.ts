@@ -8,6 +8,76 @@ import type { AppContext } from "../context.js";
  * number that proves the program's value beyond clicks.
  */
 
+/**
+ * The producing funnel (Section 13) — the metrics best operators actually track,
+ * now computable because relationships carry a prospectId/source. Goes past
+ * signup to "did they produce sales", and attributes producers to the source that
+ * found them: cost per PRODUCING affiliate, % producing, time-to-first-sale, and
+ * revenue by source cohort.
+ */
+export async function producingFunnel(ctx: AppContext, merchantId: string) {
+  const { db } = ctx;
+  const prospects = await db.prospects.find((p) => p.merchantId === merchantId);
+  const relationships = await db.relationships.find((r) => r.merchantId === merchantId);
+  const recruited = relationships.filter((r) => r.prospectId != null);
+  const conversions = await db.conversions.find((c) => c.merchantId === merchantId && c.status !== "rejected");
+  const orders = await db.orders.find((o) => o.merchantId === merchantId);
+  const orderById = new Map(orders.map((o) => [o.id, o]));
+
+  const producingAffiliateIds = new Set(conversions.map((c) => c.affiliateId));
+  const usage = await db.usageEvents.find((e) => e.merchantId === merchantId);
+  const sends = usage.filter((e) => e.kind === "send").reduce((s, e) => s + e.quantity, 0);
+  const enrichments = usage.filter((e) => e.kind === "enrichment").reduce((s, e) => s + e.quantity, 0);
+
+  // Source cohorts: sourced → recruited → producing → revenue.
+  const cohorts = new Map<string, { sourced: number; recruited: number; producing: number; revenueCents: number }>();
+  const ensure = (s: string) => {
+    let c = cohorts.get(s);
+    if (!c) {
+      c = { sourced: 0, recruited: 0, producing: 0, revenueCents: 0 };
+      cohorts.set(s, c);
+    }
+    return c;
+  };
+  for (const p of prospects) ensure(p.source).sourced += 1;
+  for (const r of recruited) {
+    const c = ensure(r.source);
+    c.recruited += 1;
+    if (producingAffiliateIds.has(r.affiliateId)) {
+      c.producing += 1;
+      c.revenueCents += conversions.filter((cv) => cv.affiliateId === r.affiliateId).reduce((s, cv) => s + cv.amountCents, 0);
+    }
+  }
+
+  // Time-to-first-sale: days from join to first conversion, for recruited producers.
+  const ttfsDays: number[] = [];
+  for (const r of recruited) {
+    const first = conversions
+      .filter((c) => c.affiliateId === r.affiliateId)
+      .map((c) => orderById.get(c.orderId)?.ts ?? c.ts)
+      .sort()[0];
+    if (first) ttfsDays.push((new Date(first).getTime() - new Date(r.joinedAt).getTime()) / 86_400_000);
+  }
+
+  const recruitedProducing = recruited.filter((r) => producingAffiliateIds.has(r.affiliateId)).length;
+  // Cost proxies (no real $ spend tracked): enrichment + send unit counts.
+  const recruitedCount = recruited.length || 1;
+  return {
+    sourced: prospects.length,
+    recruited: recruited.length,
+    producing: recruitedProducing,
+    percentProducingOfRecruited: recruited.length ? recruitedProducing / recruited.length : 0,
+    avgTimeToFirstSaleDays: ttfsDays.length ? ttfsDays.reduce((a, b) => a + b, 0) / ttfsDays.length : null,
+    enrichmentUnits: enrichments,
+    sendUnits: sends,
+    enrichmentUnitsPerRecruited: enrichments / recruitedCount,
+    sendUnitsPerProducing: recruitedProducing ? sends / recruitedProducing : null,
+    bySource: [...cohorts.entries()]
+      .map(([source, c]) => ({ source, ...c, producingRate: c.sourced ? c.producing / c.sourced : 0 }))
+      .sort((a, b) => b.producing - a.producing),
+  };
+}
+
 export async function programHealth(ctx: AppContext, merchantId: string) {
   const { db, clock } = ctx;
   const now = clock.now();

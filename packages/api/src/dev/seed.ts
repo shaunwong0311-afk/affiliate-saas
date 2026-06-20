@@ -1,6 +1,6 @@
 import { newId, newCode, type Order } from "@affiliate/core";
 import type { NormalizedOrder } from "@affiliate/integrations";
-import { runSourcing } from "@affiliate/recruitment";
+import { runSourcing, setAutomationState, autonomousCycle, recordOutcome } from "@affiliate/recruitment";
 import type { AppContext } from "../context.js";
 import { hashPassword } from "../auth/jwt.js";
 import { ingestNormalizedOrder } from "../services/conversion-pipeline.js";
@@ -96,6 +96,7 @@ export async function seedDemo(ctx: AppContext): Promise<SeedResult> {
       ownerUserId: null,
       tags: role === "recruiter" ? ["vip"] : [],
       sponsorAffiliateId: sponsor,
+      prospectId: null,
     });
 
   await mkRel(recruiter.id, "recruiter", null, "inbound");
@@ -166,11 +167,21 @@ export async function seedDemo(ctx: AppContext): Promise<SeedResult> {
   await writeClick(ctx, samClick2, { merchantId: merchant.id, affiliateId: sam.id, offerId: offer.id, ip: "70.1.2.3", ua: "demo" });
   await ingestNormalizedOrder(ctx, { order: baseOrder("ord_sam_2", 60_000), clickId: samClick2, customerRef: "cust_d" } as NormalizedOrder);
 
-  // ---- Recruitment: source a prospect queue --------------------------------
-  await runSourcing(ctx, merchant.id, { limit: 14 });
+  // ---- Recruitment: the autonomous from-scratch engine ---------------------
+  // A connected, warmed mailbox so the engine can send as the merchant.
+  await db.mailboxes.insert({
+    id: newId("mbx"),
+    merchantId: merchant.id,
+    provider: "gmail",
+    email: "dana@lumenskincare.test",
+    status: "connected",
+    dailyCap: 80,
+    warmupStatus: "ready",
+    credentialsRef: "",
+  });
 
-  // A campaign so the recruitment surface has something to launch.
-  await db.campaigns.insert({
+  // An active campaign (24h send window for the demo) the engine sends through.
+  const campaign = await db.campaigns.insert({
     id: newId("camp"),
     merchantId: merchant.id,
     mailboxId: null,
@@ -179,11 +190,45 @@ export async function seedDemo(ctx: AppContext): Promise<SeedResult> {
     sequence: [
       { step: 1, delayDays: 0, subject: "Partner with {{merchant}}?", body: "Hi {{name}}, {{angle}} — want to earn on {{offer}}?", kind: "initial" },
       { step: 2, delayDays: 3, subject: "Following up", body: "Just circling back, {{name}}.", kind: "follow_up" },
+      { step: 3, delayDays: 6, subject: "Closing the loop", body: "Last note, {{name}} — door's open.", kind: "breakup" },
     ],
-    sendWindow: { startHour: 9, endHour: 17, timezone: "America/Los_Angeles" },
-    dailyCap: 40,
+    sendWindow: { startHour: 0, endHour: 24, timezone: "UTC" },
+    dailyCap: 80,
     status: "active",
   });
+  await db.campaigns.update(campaign.id, { mailboxId: (await db.mailboxes.findOne((m) => m.merchantId === merchant.id))!.id });
+
+  // Turn automation on and run one autonomous cycle (source → score → auto-send,
+  // A-tier held for the human gate).
+  await setAutomationState(ctx, merchant.id, { status: "running", autoSendMinScore: 50, hitlTier: "A", meetingTier: "A", sourcingLimitPerCycle: 16 });
+  await autonomousCycle(ctx, merchant.id);
+
+  // Convert the top prospect into a PRODUCING affiliate so source-yield and the
+  // producing funnel are populated (the metric that matters).
+  const top = (await db.prospects.find((p) => p.merchantId === merchant.id && p.email != null)).sort((a, b) => (b.score ?? 0) - (a.score ?? 0))[0];
+  if (top) {
+    const aff = await mkAffiliate(top.identity, top.email!);
+    const rel = await db.relationships.insert({
+      id: newId("rel"),
+      affiliateId: aff.id,
+      merchantId: merchant.id,
+      programId: program.id,
+      status: "active",
+      joinedAt: now(),
+      role: "seller",
+      commissionTerms: null,
+      source: top.source,
+      ownerUserId: null,
+      tags: [],
+      sponsorAffiliateId: null,
+      prospectId: top.id,
+    });
+    await db.prospects.update(top.id, { state: "converted" });
+    await recordOutcome(ctx, top.id, "produced_sales", { relationshipId: rel.id, producedRevenueCents: 18_000 });
+    const recruitClick = mintClickId();
+    await writeClick(ctx, recruitClick, { merchantId: merchant.id, affiliateId: aff.id, offerId: offer.id, ip: "70.4.4.4", ua: "demo" });
+    await ingestNormalizedOrder(ctx, { order: baseOrder("ord_recruit_1", 12_000), clickId: recruitClick, customerRef: "cust_e" } as NormalizedOrder);
+  }
 
   return { email, password, merchantId: merchant.id };
 }

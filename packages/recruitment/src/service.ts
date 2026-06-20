@@ -1,7 +1,8 @@
-import { blendWeights, defaultWeights } from "@affiliate/core";
-import type { OutreachCampaign } from "@affiliate/db";
+import { blendWeights, defaultWeights, newId } from "@affiliate/core";
+import type { OutreachCampaign, ProspectOutcome } from "@affiliate/db";
 import type { RecruitmentDeps } from "./deps.js";
-import { discover, enrich, score, queueFirstTouch, send, ingestReply } from "./pipeline.js";
+import { discover, enrich, score, queueFirstTouch, send } from "./pipeline.js";
+import { routeReply, type ReplyOutcome } from "./reply-router.js";
 
 /**
  * High-level recruitment orchestration used by the API routes. Composes the
@@ -16,7 +17,11 @@ export interface SourcingSummary {
 }
 
 /** Run sourcing → enrich → score for a merchant (the discovery half of the wedge). */
-export async function runSourcing(deps: RecruitmentDeps, merchantId: string, opts?: { limit?: number }): Promise<SourcingSummary> {
+export async function runSourcing(
+  deps: RecruitmentDeps,
+  merchantId: string,
+  opts?: { limit?: number; excludeSourceTypes?: string[] },
+): Promise<SourcingSummary> {
   const created = await discover(deps, merchantId, opts);
   let enriched = 0;
   let scored = 0;
@@ -92,9 +97,14 @@ export async function launchCampaign(
   return { queued, sent, bounced, skipped };
 }
 
-/** Operator records a reply (or a webhook delivers one) → classify + route. */
-export async function handleReply(deps: RecruitmentDeps, prospectId: string, raw: string) {
-  return ingestReply(deps, prospectId, raw);
+/** A reply (operator-entered or webhook-delivered) → classify + two-track route. */
+export async function handleReply(
+  deps: RecruitmentDeps,
+  prospectId: string,
+  raw: string,
+  opts?: { meetingTier?: "A" | "B" | "C"; signupBaseUrl?: string },
+): Promise<ReplyOutcome> {
+  return routeReply(deps, prospectId, raw, opts);
 }
 
 export type OutcomeLabel =
@@ -112,11 +122,32 @@ export type OutcomeLabel =
  * record the label and, when enough "produced_sales" outcomes accumulate, nudge
  * the scoring weights toward what actually drove revenue (heuristic → learned).
  */
-export async function recordOutcome(deps: RecruitmentDeps, prospectId: string, label: OutcomeLabel): Promise<void> {
+export async function recordOutcome(
+  deps: RecruitmentDeps,
+  prospectId: string,
+  label: OutcomeLabel,
+  extra?: { relationshipId?: string; producedRevenueCents?: number },
+): Promise<void> {
   const prospect = await deps.db.prospects.require(prospectId);
+  const now = deps.clock.now().toISOString();
+
+  // Append an immutable outcome event — the durable substrate for source-yield,
+  // cost-per-producing-affiliate, and the learned-weights loop.
+  const outcome: ProspectOutcome = {
+    id: newId("pout"),
+    merchantId: prospect.merchantId,
+    prospectId,
+    relationshipId: extra?.relationshipId ?? null,
+    sourceType: prospect.source,
+    label,
+    producedRevenueCents: extra?.producedRevenueCents ?? 0,
+    ts: now,
+  };
+  await deps.db.prospectOutcomes.insert(outcome);
+
   const breakdown = (prospect.scoreBreakdown as Record<string, unknown> | null) ?? {};
   await deps.db.prospects.update(prospectId, {
-    scoreBreakdown: { ...breakdown, outcome: label, outcomeAt: deps.clock.now().toISOString() },
+    scoreBreakdown: { ...breakdown, outcome: label, outcomeAt: now },
     ...(label === "bad_fit" || label === "not_an_affiliate" ? { state: "dead" as const } : {}),
   });
 }

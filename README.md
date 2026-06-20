@@ -65,9 +65,12 @@ packages/
   tracking-edge/  Cloudflare Workers-style redirect hot path (KV resolve → mint
                   click_id → cookie → 302 → async click to queue). Runs as a Worker in
                   prod and a Node service locally — same handler.
-  recruitment/    The wedge: durable queue, per-prospect state machine, six pipeline
-                  stages (source → enrich → score → outreach → reply → loop), HITL,
-                  suppression, closed-loop learning hook.
+  recruitment/    The wedge: an AUTONOMOUS from-scratch engine — scheduler + durable
+                  queue, per-prospect state machine, six pipeline stages (source →
+                  enrich → score → outreach → reply → loop), multi-touch sequencing,
+                  two-track reply router (self-serve vs AI-SDR + meeting booking),
+                  deliverability circuit breaker, and a live closed loop (learned
+                  scoring + source-yield pruning). See **RECRUITMENT.md**.
   api/            Fastify app: JWT + API-key auth, tenant-scoped RBAC, the substrate
                   write path (ingest → attribution → fraud → engine → ledger), payout
                   orchestration, and the full management surface (~110 endpoints).

@@ -1,7 +1,7 @@
 import type { RouteModule } from "./helpers.js";
 import { ok } from "./helpers.js";
 import { requireMerchant } from "../auth/middleware.js";
-import { programHealth, moneyOps, recruitmentFunnel, affiliatePerformance, ltvCohort } from "../services/reporting.js";
+import { programHealth, moneyOps, recruitmentFunnel, affiliatePerformance, ltvCohort, producingFunnel } from "../services/reporting.js";
 
 /**
  * Dashboards (Section 9 / 13). Read-only aggregations over the merchant's data.
@@ -31,6 +31,13 @@ export const reportingRoutes: RouteModule = (app, ctx) => {
   app.get("/reports/ltv-cohort", async (request, reply) => {
     const { merchantId } = await requireMerchant(ctx, request, "read");
     return ok(reply, await ltvCohort(ctx, merchantId));
+  });
+
+  // The producing funnel + source cohorts — cost per producing affiliate, the
+  // metric that matters (Section 13).
+  app.get("/reports/producing-funnel", async (request, reply) => {
+    const { merchantId } = await requireMerchant(ctx, request, "read");
+    return ok(reply, await producingFunnel(ctx, merchantId));
   });
 
   app.get("/reports/overview", async (request, reply) => {

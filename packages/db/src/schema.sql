@@ -187,6 +187,7 @@ CREATE TABLE affiliate_relationships (
   owner_user_id        text,
   tags                 text[] NOT NULL DEFAULT '{}',
   sponsor_affiliate_id text REFERENCES affiliates(id),          -- the recruiter
+  prospect_id          text,                                    -- source-yield FK
   UNIQUE (affiliate_id, program_id)
 );
 CREATE INDEX rel_merchant_idx ON affiliate_relationships(merchant_id);
@@ -501,6 +502,47 @@ CREATE TABLE replies (
   classification text NOT NULL,
   handled_by     text,
   ts             timestamptz NOT NULL DEFAULT now()
+);
+
+-- Append-only outcome events — source-yield + cost-per-producing-affiliate.
+CREATE TABLE prospect_outcomes (
+  id                    text PRIMARY KEY,
+  merchant_id           text NOT NULL REFERENCES merchants(id) ON DELETE CASCADE,
+  prospect_id           text NOT NULL REFERENCES prospects(id) ON DELETE CASCADE,
+  relationship_id       text REFERENCES affiliate_relationships(id),
+  source_type           text NOT NULL,
+  label                 text NOT NULL,
+  produced_revenue_cents bigint NOT NULL DEFAULT 0,
+  ts                    timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX prospect_outcomes_merchant_idx ON prospect_outcomes(merchant_id, source_type, label);
+
+-- Booked calls with A-tier prospects (the managed, human-closed track).
+CREATE TABLE meetings (
+  id            text PRIMARY KEY,
+  merchant_id   text NOT NULL REFERENCES merchants(id) ON DELETE CASCADE,
+  prospect_id   text NOT NULL REFERENCES prospects(id) ON DELETE CASCADE,
+  owner_user_id text,
+  scheduled_at  timestamptz,
+  status        text NOT NULL DEFAULT 'requested',
+  booking_ref   text,
+  booking_url   text,
+  notes         text,
+  created_at    timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX meetings_merchant_status_idx ON meetings(merchant_id, status);
+
+-- Per-merchant autonomous-engine control state.
+CREATE TABLE automation_states (
+  id                     text PRIMARY KEY,
+  merchant_id            text NOT NULL REFERENCES merchants(id) ON DELETE CASCADE,
+  status                 text NOT NULL DEFAULT 'off',
+  auto_send_min_score    numeric NOT NULL DEFAULT 70,
+  hitl_tier              text NOT NULL DEFAULT 'A',
+  meeting_tier           text NOT NULL DEFAULT 'A',
+  sourcing_limit_per_cycle integer NOT NULL DEFAULT 20,
+  last_cycle_at          timestamptz,
+  updated_at             timestamptz NOT NULL DEFAULT now()
 );
 
 -- Global + per-merchant suppression (one-click unsubscribe honored everywhere).

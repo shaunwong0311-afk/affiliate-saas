@@ -1,7 +1,8 @@
 import { buildApp } from "../app.js";
 import { seedDemo } from "./seed.js";
-import { programHealth, moneyOps, recruitmentFunnel, affiliatePerformance } from "../services/reporting.js";
+import { programHealth, moneyOps, recruitmentFunnel, affiliatePerformance, producingFunnel } from "../services/reporting.js";
 import { computePayableLines } from "../services/payout-service.js";
+import { autonomousCycle, sourceYield, deliverabilityHealth, getAutomationState } from "@affiliate/recruitment";
 import { money, formatMoney } from "@affiliate/core";
 
 /**
@@ -47,6 +48,24 @@ async function main() {
   line("  RECRUITMENT FUNNEL (the wedge)");
   line(`    sourced ${funnel.sourced} → contacted ${funnel.contacted} → replied ${funnel.replied} → converted ${funnel.converted}`);
   line(`    tiers: ${JSON.stringify(funnel.byTier)}`);
+  line();
+
+  const auto = await getAutomationState(ctx, merchantId);
+  const cycle = await autonomousCycle(ctx, merchantId); // one more cycle, live
+  const deliv = await deliverabilityHealth(ctx, merchantId);
+  line("  AUTONOMOUS ENGINE (from-scratch; L4 with HITL gates)");
+  line(`    automation: ${auto.status}   auto-send ≥ ${auto.autoSendMinScore}   HITL tier ${auto.hitlTier}   meeting tier ${auto.meetingTier}`);
+  line(`    last cycle → sourced ${cycle.sourced}, auto-sent ${cycle.autoSent}, follow-ups ${cycle.followUpsSent}, held for review ${cycle.heldForReview}`);
+  line(`    deliverability: ${deliv.sent} sent, bounce ${(deliv.bounceRate * 100).toFixed(1)}%, circuit ${deliv.circuitOpen ? "OPEN (paused)" : "ok"}`);
+  line();
+
+  const prod = await producingFunnel(ctx, merchantId);
+  line("  PRODUCING FUNNEL (cost per PRODUCING affiliate — the number that matters)");
+  line(`    sourced ${prod.sourced} → recruited ${prod.recruited} → producing ${prod.producing}  (${(prod.percentProducingOfRecruited * 100).toFixed(0)}% of recruited)`);
+  line(`    time-to-first-sale: ${prod.avgTimeToFirstSaleDays != null ? prod.avgTimeToFirstSaleDays.toFixed(1) + "d" : "n/a"}   enrichment units ${prod.enrichmentUnits}   send units ${prod.sendUnits}`);
+  for (const s of (await sourceYield(ctx, merchantId)).slice(0, 4)) {
+    line(`    source ${s.sourceType.padEnd(24)} sourced ${String(s.sourced).padStart(3)}  producing ${s.producing}  yield ${(s.yield * 100).toFixed(0)}%  rev ${formatMoney(money(s.producedRevenueCents, "USD"))}`);
+  }
   line();
 
   line("  PAYOUT CONSOLE (orchestration without custody; tax-gated)");

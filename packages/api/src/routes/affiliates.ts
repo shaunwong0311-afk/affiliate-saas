@@ -77,6 +77,7 @@ export const affiliateRoutes: RouteModule = (app, ctx) => {
       ownerUserId: null,
       tags: [],
       sponsorAffiliateId: body.sponsorAffiliateId ?? null,
+      prospectId: null,
     };
     await ctx.db.relationships.insert(relationship);
     await writeAudit(ctx, {
@@ -204,6 +205,7 @@ export const affiliateRoutes: RouteModule = (app, ctx) => {
       ownerUserId: null,
       tags: [],
       sponsorAffiliateId: null,
+      prospectId: null,
     };
     await ctx.db.relationships.insert(relationship);
     await writeAudit(ctx, {

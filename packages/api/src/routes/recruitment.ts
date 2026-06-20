@@ -134,15 +134,18 @@ export const recruitmentRoutes: RouteModule = (app, ctx) => {
       joinedAt: ctx.clock.now().toISOString(),
       role: "seller",
       commissionTerms: null,
-      source: "recruitment",
+      // Carry the discovery sourceType + prospect id so a producing affiliate can
+      // be traced to the source that found it (source-yield / cost-per-producing).
+      source: prospect.source,
       ownerUserId: null,
       tags: [],
       sponsorAffiliateId: null,
+      prospectId: id,
     };
     await ctx.db.relationships.insert(relationship);
 
     await ctx.db.prospects.update(id, { state: "converted" });
-    await recordOutcome(ctx, id, "high_potential");
+    await recordOutcome(ctx, id, "high_potential", { relationshipId: relationship.id });
     await writeAudit(ctx, {
       merchantId,
       actorId: null,

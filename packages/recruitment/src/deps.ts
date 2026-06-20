@@ -1,6 +1,13 @@
 import type { Clock } from "@affiliate/core";
 import type { Database } from "@affiliate/db";
-import type { DiscoverySource, EmailFinder, Embedder, LlmClient, MailboxSender } from "@affiliate/integrations";
+import type {
+  DiscoverySource,
+  EmailFinder,
+  Embedder,
+  LlmClient,
+  MailboxSender,
+  CalendarBooking,
+} from "@affiliate/integrations";
 
 /**
  * The recruitment engine's dependency surface. Deliberately a structural subset
@@ -14,5 +21,7 @@ export interface RecruitmentDeps {
   emailFinder: EmailFinder;
   mailer: MailboxSender;
   discoverySources: DiscoverySource[];
+  /** Meeting booking for the managed (A-tier) track. Optional. */
+  calendar?: CalendarBooking;
   clock: Clock;
 }

@@ -12,6 +12,7 @@ import { renderTemplate, classifyReply, type DiscoveryQuery } from "@affiliate/i
 import type { RecruitmentDeps } from "./deps.js";
 import { isSuppressed, suppress } from "./suppression.js";
 import { firstStep, personalizationDepth } from "./sequencing.js";
+import { weightsForMerchant } from "./learning.js";
 
 /**
  * The recruitment pipeline (Section 8). Six stages, each a pure-ish step over the
@@ -21,7 +22,11 @@ import { firstStep, personalizationDepth } from "./sequencing.js";
  */
 
 // ---- 1. Source / discover ---------------------------------------------------
-export async function discover(deps: RecruitmentDeps, merchantId: string, opts?: { limit?: number }): Promise<Prospect[]> {
+export async function discover(
+  deps: RecruitmentDeps,
+  merchantId: string,
+  opts?: { limit?: number; excludeSourceTypes?: string[] },
+): Promise<Prospect[]> {
   const merchant = await deps.db.merchants.require(merchantId);
   const query: DiscoveryQuery = {
     merchantId,
@@ -32,8 +37,10 @@ export async function discover(deps: RecruitmentDeps, merchantId: string, opts?:
     limit: opts?.limit ?? 10,
   };
 
+  const excluded = new Set(opts?.excludeSourceTypes ?? []);
   const created: Prospect[] = [];
   for (const source of deps.discoverySources) {
+    if (excluded.has(source.sourceType)) continue; // source-yield pruning
     let candidates;
     try {
       candidates = await source.discover(query);
@@ -124,7 +131,9 @@ export async function enrich(deps: RecruitmentDeps, prospectId: string): Promise
     } as Partial<ProspectSignal>);
   }
 
-  return deps.db.prospects.update(prospectId, { email: chosenEmail, state: "enriched", updatedAt: deps.clock.now().toISOString() });
+  const ts = deps.clock.now().toISOString();
+  await deps.db.usageEvents.insert({ id: newId("use"), merchantId: prospect.merchantId, kind: "enrichment", quantity: 1, sourceId: prospectId, ts });
+  return deps.db.prospects.update(prospectId, { email: chosenEmail, state: "enriched", updatedAt: ts });
 }
 
 // ---- 3. Score ---------------------------------------------------------------
@@ -151,7 +160,9 @@ export async function score(deps: RecruitmentDeps, prospectId: string): Promise<
     contactable: signal.verifiedEmail || !!prospect.email,
     audienceOverlap: signal.audienceOverlap,
   };
-  const result = scoreSignals(scoringSignals);
+  // Closed loop: blend toward weights learned from this merchant's producer outcomes.
+  const weights = await weightsForMerchant(deps, prospect.merchantId);
+  const result = scoreSignals(scoringSignals, weights);
 
   await deps.db.prospectSignals.update(signal.id, { relevance });
   return deps.db.prospects.update(prospectId, {
@@ -220,13 +231,23 @@ export async function send(deps: RecruitmentDeps, messageId: string): Promise<Ou
     return deps.db.outreachMessages.update(messageId, { status: "failed" });
   }
 
+  // Geo-gate EU/Canada cold outreach (Section 8.9 — GDPR/CASL are strict/high-risk).
+  if (prospect.country && GEO_GATED.has(prospect.country.toUpperCase())) {
+    return deps.db.outreachMessages.update(messageId, { status: "failed" });
+  }
+
   const mailbox = campaign.mailboxId ? await deps.db.mailboxes.get(campaign.mailboxId) : null;
+  // CAN-SPAM compliant footer: valid physical address + one-click unsubscribe.
+  const footer =
+    `\n\n—\n${merchant.name}` +
+    (merchant.physicalAddress ? `\n${merchant.physicalAddress}` : "") +
+    `\nUnsubscribe: reply STOP, or ${unsubscribeLink(prospect.merchantId, prospect.email)}`;
   const result = await deps.mailer.send({
     fromName: merchant.name,
     fromEmail: mailbox?.email ?? `team@${merchant.name.toLowerCase().replace(/\s+/g, "")}.com`,
     toEmail: prospect.email,
     subject: message.subject,
-    body: message.body + "\n\nUnsubscribe: reply STOP.",
+    body: message.body + footer,
   });
 
   const now = deps.clock.now().toISOString();
@@ -238,6 +259,7 @@ export async function send(deps: RecruitmentDeps, messageId: string): Promise<Ou
 
   const nextState = prospect.state === "queued" ? "contacted" : "in_sequence";
   await deps.db.prospects.update(prospect.id, { state: nextState, updatedAt: now });
+  await deps.db.usageEvents.insert({ id: newId("use"), merchantId: prospect.merchantId, kind: "send", quantity: 1, sourceId: message.id, ts: now });
   return deps.db.outreachMessages.update(messageId, { status: "sent", sentAt: now });
 }
 
@@ -279,6 +301,16 @@ function hostOf(url: string | null): string | null {
   } catch {
     return null;
   }
+}
+
+/** EU + Canada — cold B2B email is restricted (GDPR/ePrivacy) or consent-based (CASL). */
+const GEO_GATED: ReadonlySet<string> = new Set([
+  "AT", "BE", "BG", "HR", "CY", "CZ", "DK", "EE", "FI", "FR", "DE", "GR", "HU", "IE", "IT", "LV",
+  "LT", "LU", "MT", "NL", "PL", "PT", "RO", "SK", "SI", "ES", "SE", "CA",
+]);
+
+function unsubscribeLink(merchantId: string, email: string): string {
+  return `https://track.vantage.dev/u/${merchantId.slice(-6)}?e=${encodeURIComponent(email)}`;
 }
 
 function estimateDomainAuthority(domain: string | null): number {

@@ -17,7 +17,33 @@ export {
   DEFAULT_DISCOVERY_SOURCES,
 } from "./discovery.js";
 export { HashingEmbedder, DeterministicLlm, classifyReply, renderTemplate } from "./llm.js";
+export { AnthropicLlmClient } from "./anthropic-llm.js";
 export { InMemorySecretStore, EnvSecretStore } from "./secrets.js";
+export * from "./http.js";
+export {
+  SerpApiProvider,
+  DeterministicSerpProvider,
+  SerpDiscoverySource,
+  BacklinkDiscoverySource,
+  DbCustomerMiningSource,
+  type SerpProvider,
+  type SerpHit,
+} from "./discovery-real.js";
+export {
+  StubCalendarBooking,
+  CalcomBooking,
+  GoogleCalendarBooking,
+  type CalendarBooking,
+  type BookingRequest,
+  type BookingResult,
+} from "./calendar.js";
+export {
+  ImapReplyIngestion,
+  extractReplyText,
+  parseInboundWebhook,
+  type ReplyIngestionSource,
+  type InboundReply,
+} from "./reply-ingestion.js";
 export {
   ConsoleTransactionalMailer,
   ResendMailer,

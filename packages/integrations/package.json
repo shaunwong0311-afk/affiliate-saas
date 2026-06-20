@@ -10,7 +10,8 @@
   },
   "dependencies": {
     "@affiliate/core": "*",
-    "@affiliate/db": "*"
+    "@affiliate/db": "*",
+    "@anthropic-ai/sdk": "^0.69.0"
   },
   "scripts": {
     "typecheck": "tsc -b"

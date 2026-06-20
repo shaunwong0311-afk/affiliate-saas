@@ -1,0 +1,153 @@
+import { newId, type Tier } from "@affiliate/core";
+import { classifyReply } from "@affiliate/integrations";
+import type { Meeting, Reply } from "@affiliate/db";
+import type { RecruitmentDeps } from "./deps.js";
+import { suppress } from "./suppression.js";
+
+/**
+ * Two-track reply routing (the agreed model). The funnel's job is to get a warm
+ * "yes, let's talk" and then split by value:
+ *
+ *  - Long-tail (below the meeting tier): AI-SDR answers routine questions and
+ *    drops a self-serve signup link. Fully automated, no human, no meeting.
+ *  - High-value (A-tier / at-or-above the meeting tier): AI-SDR qualifies, books a
+ *    meeting on the merchant's calendar, and assigns an owner. Human closes with
+ *    negotiated terms.
+ *
+ * Revenue is hyper-concentrated, so human time goes only where it converts.
+ */
+
+export type ReplyAction =
+  | "suppress"
+  | "dead"
+  | "snooze"
+  | "self_serve"
+  | "meeting_booked"
+  | "ai_sdr"
+  | "review";
+
+export interface ReplyOutcome {
+  reply: Reply;
+  classification: Reply["classification"];
+  action: ReplyAction;
+  /** Self-serve signup link (long-tail track). */
+  signupUrl?: string;
+  /** AI-SDR generated answer to a question. */
+  answer?: string;
+  /** Booked meeting (managed track). */
+  meeting?: Meeting;
+  bookingUrl?: string;
+}
+
+const tierRank: Record<Tier, number> = { A: 3, B: 2, C: 1 };
+
+export interface RouteOptions {
+  /** Tier at/above which an interested reply books a meeting (managed track). */
+  meetingTier?: Tier;
+  /** Base URL for self-serve signup links. */
+  signupBaseUrl?: string;
+}
+
+export async function routeReply(deps: RecruitmentDeps, prospectId: string, raw: string, opts: RouteOptions = {}): Promise<ReplyOutcome> {
+  const prospect = await deps.db.prospects.require(prospectId);
+  const now = deps.clock.now().toISOString();
+  const classification = await classify(deps, raw);
+
+  const reply: Reply = { id: newId("rep"), prospectId, raw, classification, handledBy: null, ts: now };
+  await deps.db.replies.insert(reply);
+
+  if (classification === "unsubscribe") {
+    if (prospect.email) await suppress(deps, { merchantId: prospect.merchantId, email: prospect.email, reason: "unsubscribe", scope: "global" });
+    await deps.db.prospects.update(prospectId, { state: "suppressed", suppressionStatus: "suppressed", updatedAt: now });
+    return { reply, classification, action: "suppress" };
+  }
+  if (classification === "not_interested") {
+    await deps.db.prospects.update(prospectId, { state: "dead", updatedAt: now });
+    return { reply, classification, action: "dead" };
+  }
+  if (classification === "out_of_office") {
+    return { reply, classification, action: "snooze" };
+  }
+  if (classification !== "interested" && classification !== "question") {
+    // Unknown intent → human review (the high-value HITL checkpoint).
+    await deps.db.prospects.update(prospectId, { state: "replied", updatedAt: now });
+    return { reply, classification, action: "review" };
+  }
+
+  await deps.db.prospects.update(prospectId, { state: "replied", updatedAt: now });
+
+  const meetingTier = opts.meetingTier ?? "A";
+  const isHighValue = prospect.tier != null && tierRank[prospect.tier] >= tierRank[meetingTier];
+
+  if (isHighValue) {
+    // Managed track: qualify, book a meeting, assign an owner.
+    const owner = await deps.db.merchantUsers.findOne((u) => u.merchantId === prospect.merchantId && u.role === "owner");
+    let bookingRef: string | null = null;
+    let bookingUrl: string | null = null;
+    if (deps.calendar) {
+      const booking = await deps.calendar.createBookingLink({
+        merchantId: prospect.merchantId,
+        prospectId,
+        prospectName: prospect.identity,
+        ownerEmail: owner?.email ?? null,
+      });
+      bookingRef = booking.bookingRef;
+      bookingUrl = booking.bookingUrl;
+    }
+    const meeting: Meeting = {
+      id: newId("mtg"),
+      merchantId: prospect.merchantId,
+      prospectId,
+      ownerUserId: owner?.userId ?? null,
+      scheduledAt: null,
+      status: bookingUrl ? "requested" : "requested",
+      bookingRef,
+      bookingUrl,
+      notes: `Warm ${classification} reply from an A-tier prospect.`,
+      createdAt: now,
+    };
+    await deps.db.meetings.insert(meeting);
+    return { reply, classification, action: "meeting_booked", meeting, bookingUrl: bookingUrl ?? undefined };
+  }
+
+  // Long-tail self-serve track. For a question, the AI-SDR drafts an answer.
+  const signupUrl = `${opts.signupBaseUrl ?? "https://app.vantage.dev/join"}/${prospect.merchantId.slice(-6)}?p=${prospectId.slice(-8)}`;
+  if (classification === "question") {
+    const answer = await aiSdrAnswer(deps, prospect.identity, raw, signupUrl);
+    return { reply, classification, action: "ai_sdr", answer, signupUrl };
+  }
+  return { reply, classification, action: "self_serve", signupUrl };
+}
+
+/** Use the real LLM for intent when available; fall back to the keyword classifier. */
+async function classify(deps: RecruitmentDeps, raw: string): Promise<Reply["classification"]> {
+  if (deps.llm.model === "deterministic-llm-v1") {
+    return classifyReply(raw) as Reply["classification"];
+  }
+  try {
+    const out = await deps.llm.complete(
+      `Classify the intent of this email reply as exactly one of: interested, question, not_interested, out_of_office, unsubscribe, unknown.\n\nReply:\n"""${raw}"""\n\nReturn JSON: {"classification": "..."}`,
+      { json: true, maxTokens: 64 },
+    );
+    const parsed = JSON.parse(out) as { classification?: string };
+    const c = parsed.classification as Reply["classification"];
+    return c ?? (classifyReply(raw) as Reply["classification"]);
+  } catch {
+    return classifyReply(raw) as Reply["classification"];
+  }
+}
+
+/** AI-SDR: answer a routine question and drive to self-serve signup. */
+async function aiSdrAnswer(deps: RecruitmentDeps, name: string, question: string, signupUrl: string): Promise<string> {
+  if (deps.llm.model === "deterministic-llm-v1") {
+    return `Hi ${name}, great question — happy to help. You can see the program terms and join here: ${signupUrl}`;
+  }
+  try {
+    return await deps.llm.complete(
+      `You are an affiliate-program SDR replying to a creator's question. Be concise, warm, and end by inviting them to join at ${signupUrl}.\n\nTheir question: ${question}`,
+      { system: "Answer in 2-3 sentences, in the merchant's voice. No AI tells.", maxTokens: 256 },
+    );
+  } catch {
+    return `Thanks for asking! You can review everything and join here: ${signupUrl}`;
+  }
+}

@@ -1,5 +1,6 @@
 import { buildApp } from "./app.js";
 import { seedDemo } from "./dev/seed.js";
+import { runScheduler } from "@affiliate/recruitment";
 
 const port = Number(process.env.PORT ?? 8787);
 const host = process.env.HOST ?? "0.0.0.0";
@@ -12,6 +13,15 @@ async function start() {
     const creds = await seedDemo(app.appContext);
     // eslint-disable-next-line no-console
     console.log(`seeded demo tenant — login: ${creds.email} / ${creds.password}`);
+  }
+
+  // Optional: run the autonomous recruitment scheduler in-process (dev). In
+  // production this runs as a separate worker against Postgres/Redis.
+  if (process.env.SCHEDULER === "true") {
+    const intervalMs = Number(process.env.SCHEDULER_INTERVAL_MS ?? 60_000);
+    runScheduler(app.appContext, intervalMs);
+    // eslint-disable-next-line no-console
+    console.log(`recruitment scheduler running every ${intervalMs}ms`);
   }
 
   await app.listen({ port, host });

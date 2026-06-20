@@ -12,6 +12,7 @@ import { payoutRoutes } from "./payouts.js";
 import { billingRoutes } from "./billing.js";
 import { reportingRoutes } from "./reporting.js";
 import { recruitmentRoutes } from "./recruitment.js";
+import { automationRoutes } from "./automation.js";
 import { integrationRoutes } from "./integrations.js";
 import { onboardingRoutes } from "./onboarding.js";
 import { developerRoutes } from "./developer.js";
@@ -35,6 +36,7 @@ export const allRouteModules: RouteModule[] = [
   billingRoutes,
   reportingRoutes,
   recruitmentRoutes,
+  automationRoutes,
   integrationRoutes,
   onboardingRoutes,
   developerRoutes,

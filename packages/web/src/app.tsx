@@ -4,6 +4,7 @@ import { Spinner } from "./ui";
 import { Login } from "./pages/Login";
 import { Dashboard } from "./pages/Dashboard";
 import { Recruitment } from "./pages/Recruitment";
+import { Automation } from "./pages/Automation";
 import { Programs } from "./pages/Programs";
 import { Affiliates } from "./pages/Affiliates";
 import { AffiliateDetail } from "./pages/AffiliateDetail";
@@ -35,6 +36,7 @@ const MERCHANT_NAV: { section: string; items: NavItem[] }[] = [
     items: [
       { label: "Dashboard", ico: "▦", path: "/dashboard" },
       { label: "Recruitment", ico: "⌖", path: "/recruitment" },
+      { label: "Automation", ico: "⚡", path: "/automation" },
       { label: "Affiliates", ico: "⦿", path: "/affiliates" },
       { label: "Reporting", ico: "▥", path: "/reporting" },
     ],
@@ -77,6 +79,7 @@ const PORTAL_NAV: { section: string; items: NavItem[] }[] = [
 const ROUTES: { pattern: string; render: (params: Record<string, string>) => JSX.Element }[] = [
   { pattern: "/dashboard", render: () => <Dashboard /> },
   { pattern: "/recruitment", render: () => <Recruitment /> },
+  { pattern: "/automation", render: () => <Automation /> },
   { pattern: "/affiliates", render: () => <Affiliates /> },
   { pattern: "/affiliates/:id", render: (p) => <AffiliateDetail relationshipId={p.id!} /> },
   { pattern: "/conversions", render: () => <Conversions /> },

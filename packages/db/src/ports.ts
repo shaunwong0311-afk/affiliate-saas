@@ -39,6 +39,9 @@ import type {
   OutreachMessage,
   Reply,
   Suppression,
+  ProspectOutcome,
+  Meeting,
+  AutomationState,
   ApiKey,
   WebhookSubscription,
 } from "./entities.js";
@@ -122,6 +125,9 @@ export interface Database {
   outreachMessages: Repo<OutreachMessage>;
   replies: Repo<Reply>;
   suppressions: Repo<Suppression>;
+  prospectOutcomes: Repo<ProspectOutcome>;
+  meetings: Repo<Meeting>;
+  automationStates: Repo<AutomationState>;
 
   // API surface
   apiKeys: Repo<ApiKey>;

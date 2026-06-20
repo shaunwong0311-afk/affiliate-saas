@@ -41,11 +41,17 @@ export interface AffiliateRelationship {
   role: AffiliateRole;
   /** Per-relationship overrides of program defaults (VIP terms, group terms). */
   commissionTerms: CommissionTermsOverride | null;
-  source: string; // 'inbound' | 'recruitment' | 'auto_invite' | merchant-defined
+  source: string; // 'inbound' | 'recruitment' | 'auto_invite' | a discovery sourceType
   ownerUserId: Id | null;
   tags: string[];
   /** The recruiter who brought this affiliate in. Null when self-sourced. */
   sponsorAffiliateId: Id | null;
+  /**
+   * The prospect this affiliate was converted from, if recruited. This FK is what
+   * makes source-yield attribution and cost-per-producing-affiliate computable —
+   * a producing affiliate can be traced back to the source that found it.
+   */
+  prospectId: Id | null;
 }
 
 export type RelationshipStatus = "pending" | "active" | "paused" | "banned" | "rejected";

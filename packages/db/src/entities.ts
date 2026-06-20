@@ -355,6 +355,61 @@ export interface Suppression {
   ts: Timestamp;
 }
 
+// ---- Recruitment closed-loop + meetings -------------------------------------
+/**
+ * Append-only outcome events per prospect — the durable substrate for
+ * source-yield pruning, cost-per-producing-affiliate, and the learned-weights
+ * loop. recordOutcome appends here instead of overwriting a JSON field.
+ */
+export interface ProspectOutcome {
+  id: Id;
+  merchantId: Id;
+  prospectId: Id;
+  relationshipId: Id | null;
+  sourceType: string;
+  label:
+    | "bad_fit"
+    | "wrong_contact"
+    | "not_an_affiliate"
+    | "already_partnered"
+    | "competitor_exclusive"
+    | "high_potential"
+    | "produced_sales";
+  /** Realized revenue attributed to this prospect once producing (for ROI). */
+  producedRevenueCents: number;
+  ts: Timestamp;
+}
+
+/** A booked call with an A-tier prospect (the managed, human-closed track). */
+export interface Meeting {
+  id: Id;
+  merchantId: Id;
+  prospectId: Id;
+  ownerUserId: Id | null;
+  scheduledAt: Timestamp | null;
+  status: "requested" | "booked" | "completed" | "no_show" | "cancelled";
+  bookingRef: string | null;
+  bookingUrl: string | null;
+  notes: string | null;
+  createdAt: Timestamp;
+}
+
+/** Per-merchant autonomous-engine control state (the scheduler reads this). */
+export interface AutomationState {
+  id: Id; // == merchantId (one row per merchant)
+  merchantId: Id;
+  status: "off" | "running" | "paused";
+  /** Auto-send threshold: prospects scoring at/above this auto-advance to outreach. */
+  autoSendMinScore: number;
+  /** Tier at/above which a human must approve before the first send. */
+  hitlTier: "A" | "B" | "C";
+  /** Tier at/above which an interested reply books a meeting (managed track). */
+  meetingTier: "A" | "B" | "C";
+  sourcingLimitPerCycle: number;
+  lastCycleAt: Timestamp | null;
+  updatedAt: Timestamp;
+}
+
 // ---- API surface / webhooks -------------------------------------------------
 export interface ApiKey {
   id: Id;

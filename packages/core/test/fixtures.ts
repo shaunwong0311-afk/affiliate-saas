@@ -65,6 +65,7 @@ export function makeRelationship(overrides: Partial<AffiliateRelationship> = {})
     ownerUserId: null,
     tags: [],
     sponsorAffiliateId: null,
+    prospectId: null,
     ...overrides,
   };
 }

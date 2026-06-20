@@ -137,6 +137,9 @@ export function createMemoryDatabase(): Database {
     outreachMessages: byId(),
     replies: byId(),
     suppressions: byId(),
+    prospectOutcomes: byId(),
+    meetings: byId(),
+    automationStates: byId(),
     apiKeys: byId(),
     webhookSubscriptions: byId(),
   } as unknown as Database;

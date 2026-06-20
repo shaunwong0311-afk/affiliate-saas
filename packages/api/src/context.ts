@@ -11,14 +11,20 @@ import {
   StubEmailFinder,
   HashingEmbedder,
   DeterministicLlm,
+  AnthropicLlmClient,
   InMemorySecretStore,
-  DEFAULT_DISCOVERY_SOURCES,
+  CompetitorAffiliateSource,
+  CreatorDiscoverySource,
+  SerpDiscoverySource,
+  DbCustomerMiningSource,
+  StubCalendarBooking,
   type MailboxSender,
   type EmailFinder,
   type Embedder,
   type LlmClient,
   type SecretStore,
   type DiscoverySource,
+  type CalendarBooking,
 } from "@affiliate/integrations";
 import { loadConfig, type AppConfig } from "./config.js";
 
@@ -26,6 +32,9 @@ import { loadConfig, type AppConfig } from "./config.js";
  * AppContext is the dependency container wired once at startup. Everything is an
  * interface with a default in-process implementation, so the whole platform runs
  * with no external services; production swaps any field for a real adapter.
+ *
+ * It is also a structural superset of the recruitment engine's `RecruitmentDeps`,
+ * so it can be passed straight to the autonomous recruitment functions.
  */
 export interface AppContext {
   config: AppConfig;
@@ -38,21 +47,42 @@ export interface AppContext {
   llm: LlmClient;
   secrets: SecretStore;
   discoverySources: DiscoverySource[];
+  calendar: CalendarBooking;
   clock: Clock;
 }
 
 export function createContext(overrides: Partial<AppContext> = {}): AppContext {
+  const db = overrides.db ?? createMemoryDatabase();
+
+  // The autonomous "from-scratch" discovery sources: SERP mining (the headline
+  // source) + competitor-affiliate + creator + first-party customer mining. The
+  // SERP source uses deterministic providers by default (runs offline); production
+  // injects a real SERP API + proxy fetcher with no pipeline change.
+  const discoverySources: DiscoverySource[] = overrides.discoverySources ?? [
+    new SerpDiscoverySource(),
+    new CompetitorAffiliateSource(),
+    new CreatorDiscoverySource(),
+    new DbCustomerMiningSource(db),
+  ];
+
+  // Real LLM (AI-SDR + personalization) when an API key is present; deterministic
+  // stub otherwise so the platform still runs with zero external services.
+  const llm =
+    overrides.llm ??
+    (process.env.ANTHROPIC_API_KEY ? new AnthropicLlmClient({ apiKey: process.env.ANTHROPIC_API_KEY }) : new DeterministicLlm());
+
   return {
     config: overrides.config ?? loadConfig(),
-    db: overrides.db ?? createMemoryDatabase(),
+    db,
     engines: overrides.engines ?? defaultEngineRegistry,
     rails: overrides.rails ?? new PayoutRailRegistry(),
     mailer: overrides.mailer ?? new MockMailboxSender(),
     emailFinder: overrides.emailFinder ?? new StubEmailFinder(),
     embedder: overrides.embedder ?? new HashingEmbedder(),
-    llm: overrides.llm ?? new DeterministicLlm(),
+    llm,
     secrets: overrides.secrets ?? new InMemorySecretStore(),
-    discoverySources: overrides.discoverySources ?? DEFAULT_DISCOVERY_SOURCES,
+    discoverySources,
+    calendar: overrides.calendar ?? new StubCalendarBooking(),
     clock: overrides.clock ?? systemClock,
   };
 }
