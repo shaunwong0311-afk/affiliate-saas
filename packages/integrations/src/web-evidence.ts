@@ -165,3 +165,105 @@ function isPlausibleEmail(e: string): boolean {
   if (/(sentry|wixpress|example|domain|your-?email|email@)/i.test(e)) return false;
   return /^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}$/i.test(e);
 }
+
+// ---- Secondary contact surfaces (Section 8.2) ------------------------------
+// Creators rarely put a raw email on the homepage; they put it on a Linktree-style
+// bio page, a /contact or /work-with-me page, or their YouTube About tab. These
+// helpers find those pages from the links a creator actually placed, so the enrich
+// stage can fetch them and run the same real extraction — more free, real emails
+// before paying a finder.
+
+const BIO_HOSTS = [
+  "linktr.ee", "beacons.ai", "bio.link", "solo.to", "lnk.bio", "carrd.co", "tap.bio",
+  "withkoji.com", "koji.to", "msha.ke", "linkpop.com", "komi.io", "snipfeed.co",
+  "stan.store", "flowcode.com", "shor.by", "campsite.bio", "many.link", "pillar.io",
+];
+const CONTACT_PATH_RE = /\/(contact|about|work-with-me|collaborat|sponsor|advertis|partnership|press|media-?kit|pr-?inquir|business)/i;
+
+export type ContactUrlKind = "bio_aggregator" | "contact_page" | "youtube_about";
+export interface ContactUrl {
+  url: string;
+  kind: ContactUrlKind;
+}
+
+function safeBase(b?: string | null): URL | null {
+  if (!b) return null;
+  try {
+    return new URL(b.startsWith("http") ? b : `https://${b}`);
+  } catch {
+    return null;
+  }
+}
+
+function absolutize(url: string, base: URL | null): string | null {
+  try {
+    if (/^(mailto:|tel:|javascript:|data:|#)/i.test(url)) return null;
+    const u = base ? new URL(url, base) : new URL(url);
+    if (u.protocol !== "http:" && u.protocol !== "https:") return null;
+    u.hash = "";
+    return u.toString();
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * From a page's HTML, surface the contact-bearing pages the creator actually
+ * linked: bio aggregators (Linktree/Beacons/…), same-site contact/about/collab
+ * pages, and the YouTube About tab. Prioritized and capped; the enrich stage
+ * fetches these and runs `extractEmailsFromHtml` over each.
+ */
+export function discoverContactUrls(html: string, baseUrl?: string | null): ContactUrl[] {
+  const base = safeBase(baseUrl);
+  const out: ContactUrl[] = [];
+  const seen = new Set<string>();
+  const push = (raw: string, kind: ContactUrlKind) => {
+    const abs = absolutize(raw, base);
+    if (!abs || seen.has(abs)) return;
+    seen.add(abs);
+    out.push({ url: abs, kind });
+  };
+
+  for (const m of html.matchAll(/href\s*=\s*["']([^"']+)["']/gi)) {
+    const abs = absolutize(m[1]!, base);
+    if (!abs) continue;
+    let host: string;
+    let path: string;
+    try {
+      const u = new URL(abs);
+      host = u.hostname.replace(/^www\./, "").toLowerCase();
+      path = u.pathname;
+    } catch {
+      continue;
+    }
+    if (BIO_HOSTS.some((b) => host === b || host.endsWith(`.${b}`))) {
+      push(abs, "bio_aggregator");
+    } else if (host.endsWith("youtube.com") && /^\/(@[^/]+|channel\/[^/]+|c\/[^/]+|user\/[^/]+)/.test(path)) {
+      push(`${abs.replace(/\/+$/, "")}/about`, "youtube_about");
+    } else if (base && host === base.hostname.replace(/^www\./, "").toLowerCase() && CONTACT_PATH_RE.test(path)) {
+      push(abs, "contact_page");
+    }
+  }
+
+  const rank: Record<ContactUrlKind, number> = { bio_aggregator: 0, contact_page: 1, youtube_about: 2 };
+  return out.sort((a, b) => rank[a.kind] - rank[b.kind]).slice(0, 6);
+}
+
+/**
+ * Heuristic: does this page have a contact FORM (rather than a raw email)? True
+ * when a form is explicitly a contact form, or contains both an email field and a
+ * message/textarea field. Used to route form-only prospects to the human gate with
+ * a pre-drafted message (we do not auto-submit).
+ */
+export function detectsContactForm(html: string): boolean {
+  if (/<form[^>]*(?:id|class|name|action)\s*=\s*["'][^"']*(contact|inquir|message|reach|connect|collaborat)[^"']*["']/i.test(html)) {
+    return true;
+  }
+  const forms = html.match(/<form[\s\S]*?<\/form>/gi) ?? [];
+  for (const f of forms) {
+    const hasEmail = /type\s*=\s*["']email["']|name\s*=\s*["'][^"']*e-?mail/i.test(f);
+    const hasMessage = /<textarea|name\s*=\s*["'][^"']*(message|comment|inquiry|body|note)/i.test(f);
+    if (hasEmail && hasMessage) return true;
+  }
+  return false;
+}

@@ -5,6 +5,7 @@ import type {
   EmailFinder,
   EmailVerifier,
   Embedder,
+  HttpFetcher,
   LlmClient,
   MailboxSender,
   RedirectResolver,
@@ -36,6 +37,12 @@ export interface RecruitmentDeps {
    * an address exists.
    */
   emailVerifier?: EmailVerifier;
+  /**
+   * Page fetcher for following contact-bearing links (Linktree, /contact, YouTube
+   * About) during enrichment to extract more real emails. Optional — when absent,
+   * enrichment uses only the primary page + the EmailFinder (no secondary fetches).
+   */
+  fetcher?: HttpFetcher;
   /** Meeting booking for the managed (A-tier) track. Optional. */
   calendar?: CalendarBooking;
   clock: Clock;

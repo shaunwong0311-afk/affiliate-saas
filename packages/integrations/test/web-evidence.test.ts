@@ -1,6 +1,8 @@
 import { describe, it, expect, vi } from "vitest";
 import {
   extractEmailsFromHtml,
+  discoverContactUrls,
+  detectsContactForm,
   FetchRedirectResolver,
   MxEmailVerifier,
   NoopEmailVerifier,
@@ -74,6 +76,52 @@ describe("extractEmailsFromHtml — obfuscation handling", () => {
 
   it("does NOT false-positive on ordinary prose (lowercase at/dot)", () => {
     expect(emailsIn("Look at the best dot com sites and meet me at the cafe.")).toEqual([]);
+  });
+});
+
+describe("discoverContactUrls", () => {
+  const base = "https://creator.com/blog";
+
+  it("finds bio aggregators (Linktree/Beacons)", () => {
+    const html = `<a href="https://linktr.ee/creator">links</a><a href="https://beacons.ai/creator">bio</a>`;
+    const kinds = discoverContactUrls(html, base);
+    expect(kinds.every((c) => c.kind === "bio_aggregator")).toBe(true);
+    expect(kinds.map((c) => c.url)).toContain("https://linktr.ee/creator");
+  });
+
+  it("finds same-site contact / work-with-me pages and resolves relative links", () => {
+    const html = `<a href="/work-with-me">collab</a><a href="/about">about</a><a href="/random">x</a>`;
+    const urls = discoverContactUrls(html, base).map((c) => c.url);
+    expect(urls).toContain("https://creator.com/work-with-me");
+    expect(urls).toContain("https://creator.com/about");
+    expect(urls).not.toContain("https://creator.com/random");
+  });
+
+  it("derives the YouTube About tab from a channel link", () => {
+    const html = `<a href="https://youtube.com/@creator">channel</a>`;
+    const urls = discoverContactUrls(html, base);
+    expect(urls).toContainEqual({ url: "https://youtube.com/@creator/about", kind: "youtube_about" });
+  });
+
+  it("ignores off-site non-contact links and mailto/tel", () => {
+    const html = `<a href="https://random.com/page">x</a><a href="mailto:a@b.com">m</a><a href="tel:123">t</a>`;
+    expect(discoverContactUrls(html, base)).toEqual([]);
+  });
+});
+
+describe("detectsContactForm", () => {
+  it("detects an explicit contact form by class/id/action", () => {
+    expect(detectsContactForm(`<form class="contact-form" action="/send"><input/></form>`)).toBe(true);
+    expect(detectsContactForm(`<form action="/inquiry"><input/></form>`)).toBe(true);
+  });
+
+  it("detects a form with both an email field and a message field", () => {
+    expect(detectsContactForm(`<form><input type="email"/><textarea name="message"></textarea></form>`)).toBe(true);
+  });
+
+  it("does not flag a plain search/newsletter form", () => {
+    expect(detectsContactForm(`<form action="/search"><input type="text" name="q"/></form>`)).toBe(false);
+    expect(detectsContactForm(`<form><input type="email" name="newsletter"/></form>`)).toBe(false);
   });
 });
 

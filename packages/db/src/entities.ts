@@ -289,10 +289,16 @@ export interface Prospect {
   evidence: {
     affiliateLinks?: { url: string; network: string; confidence: string; verified?: boolean }[];
     competitorPromoted?: string | null;
-    /** How the email was obtained: "page:mailto" | "page" | "pattern-guess" | null. */
+    /** How the email was obtained: "page:mailto" | "bio_aggregator:mailto" | "pattern-guess" | null. */
     contactSource?: string | null;
     /** Contact emails extracted from the real fetched page (unverified candidates). */
     contactEmails?: { email: string; source: string }[];
+    /** Contact-bearing pages the creator linked (Linktree, /contact, YouTube About). */
+    contactUrls?: { url: string; kind: string }[];
+    /** A contact FORM was detected (no raw email) — route to the human gate. */
+    contactForm?: boolean;
+    /** The page URL carrying the contact form, for the operator to open. */
+    contactFormUrl?: string | null;
     pageUrl?: string | null;
   } | null;
   createdAt: Timestamp;

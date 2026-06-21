@@ -7,9 +7,18 @@ import {
   canTransition,
   type ScoringSignals,
   type AffiliateSignal,
+  type Tier,
 } from "@affiliate/core";
-import type { Prospect, ProspectSignal, OutreachCampaign, OutreachMessage, Reply } from "@affiliate/db";
-import { renderTemplate, classifyReply, extractEmailsFromHtml, type DiscoveryQuery, type RedirectResolver } from "@affiliate/integrations";
+import type { Prospect, ProspectSignal, OutreachCampaign, OutreachMessage, Reply, Merchant } from "@affiliate/db";
+import {
+  renderTemplate,
+  classifyReply,
+  extractEmailsFromHtml,
+  discoverContactUrls,
+  detectsContactForm,
+  type DiscoveryQuery,
+  type RedirectResolver,
+} from "@affiliate/integrations";
 import type { RecruitmentDeps } from "./deps.js";
 import { isSuppressed, suppress } from "./suppression.js";
 import { firstStep, personalizationDepth } from "./sequencing.js";
@@ -72,6 +81,15 @@ export async function discover(
       const competitorPromoted = firstPromotedCompetitor(signals, merchant.competitors);
       // Real contact extraction from the fetched page (mailto: first). Never guessed.
       const contactEmails = cand.pageHtml ? extractEmailsFromHtml(cand.pageHtml).slice(0, 5) : [];
+      // Secondary contact surfaces the creator linked (Linktree, /contact, YT About)
+      // — enrichment fetches these for more real emails. Plus a YouTube About tab
+      // derived from the channel URL, and whether a contact FORM is present.
+      const contactUrls = cand.pageHtml ? discoverContactUrls(cand.pageHtml, cand.siteUrl) : [];
+      if (cand.channelUrl && /(^|\.)youtube\.com$/i.test(hostOf(cand.channelUrl) ?? "")) {
+        const about = `${cand.channelUrl.replace(/\/+$/, "")}/about`;
+        if (!contactUrls.some((u) => u.url === about)) contactUrls.push({ url: about, kind: "youtube_about" });
+      }
+      const hasContactForm = cand.pageHtml ? detectsContactForm(cand.pageHtml) : false;
 
       const prospect: Prospect = {
         id: newId("prosp"),
@@ -95,6 +113,9 @@ export async function discover(
           competitorPromoted,
           contactSource: null,
           contactEmails,
+          contactUrls,
+          contactForm: hasContactForm,
+          contactFormUrl: hasContactForm ? cand.evidenceUrl : null,
           pageUrl: cand.evidenceUrl,
         },
         createdAt: now,
@@ -156,7 +177,32 @@ export async function enrich(deps: RecruitmentDeps, prospectId: string): Promise
     }
   }
 
-  // 2) FALL BACK to the EmailFinder (Hunter in prod; pattern-guessing stub in dev).
+  // 2) FOLLOW the contact-bearing pages the creator linked (Linktree, /contact,
+  //    YouTube About) and run the SAME real extraction over each. More free, real
+  //    emails — no finder spend. Only for real prospects with a fetcher wired.
+  if (!chosenEmail && deps.fetcher && !prospect.synthetic) {
+    for (const c of prospect.evidence?.contactUrls ?? []) {
+      let html: string | null = null;
+      try {
+        const r = await deps.fetcher.get(c.url);
+        if (r.status >= 200 && r.status < 300 && r.html && r.html.length > 200) html = r.html;
+      } catch {
+        /* skip unreachable contact page */
+      }
+      if (!html) continue;
+      for (const f of extractEmailsFromHtml(html)) {
+        const v = await verify(f.email).catch(() => ({ deliverable: false, reason: "verify error" }));
+        if (v.deliverable) {
+          chosenEmail = f.email;
+          contactSource = `${c.kind}:${f.source}`;
+          break;
+        }
+      }
+      if (chosenEmail) break;
+    }
+  }
+
+  // 3) FALL BACK to the EmailFinder (Hunter in prod; pattern-guessing stub in dev).
   //    Pattern-guessed addresses are clearly labeled so the UI can flag them.
   if (!chosenEmail) {
     const candidates = await deps.emailFinder
@@ -346,6 +392,32 @@ export async function ingestReply(deps: RecruitmentDeps, prospectId: string, raw
   }
 
   return { reply, action };
+}
+
+/**
+ * A pre-drafted first-touch message for the HUMAN-gated contact-form track. When a
+ * prospect has only a contact form (no email), the operator opens the form and
+ * pastes this — compliant, personalized by tier, never auto-submitted. Pure.
+ */
+export function draftOutreach(
+  merchant: Pick<Merchant, "name" | "niche">,
+  prospect: Pick<Prospect, "identity" | "tier">,
+): { subject: string; body: string } {
+  const niche = merchant.niche ?? "your space";
+  const angle =
+    prospect.tier === "A"
+      ? `I came across your work in ${niche} and the affiliate links you already run — you'd be a standout fit for our program.`
+      : prospect.tier === "B"
+        ? `Your content is a great match for what we sell in ${niche}.`
+        : `I think our affiliate program could be a fit for your audience.`;
+  return {
+    subject: `Partnering with ${merchant.name}`,
+    body:
+      `Hi ${prospect.identity},\n\n${angle}\n\n` +
+      `We pay affiliates to promote ${merchant.niche ?? "our products"} and I'd love to send over the details — ` +
+      `commission terms, creative, and your tracking link. Just reply and I'll share everything.\n\n` +
+      `Thanks,\n${merchant.name}`,
+  };
 }
 
 // ---- helpers ----------------------------------------------------------------

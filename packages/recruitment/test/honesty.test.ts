@@ -10,6 +10,8 @@ import {
   type RawCandidate,
   type RedirectResolver,
   type EmailVerifier,
+  type HttpFetcher,
+  type FetchResult,
 } from "@affiliate/integrations";
 import { systemClock } from "@affiliate/core";
 import { runSourcing, type RecruitmentDeps } from "../src/index.js";
@@ -122,5 +124,46 @@ describe("discovery honesty (pipeline)", () => {
     const p = (await db.prospects.find((x) => x.merchantId === "m1"))[0]!;
     expect(p.email).toBe("editor@realblog.com");
     expect(p.evidence?.contactSource).toBe("page:mailto");
+  });
+
+  it("follows a linked Linktree page to find an email the homepage didn't expose", async () => {
+    // Homepage has NO email but links a Linktree; the fetcher returns a Linktree
+    // page carrying the contact email → enrichment should find + verify it.
+    const homepage = `<html><body><a href="https://linktr.ee/creator">my links</a></body></html>`;
+    const fetcher: HttpFetcher = {
+      kind: "mock",
+      async get(url: string): Promise<FetchResult> {
+        const html = url.includes("linktr.ee")
+          ? `<a href="mailto:business@creator.com">contact</a>`.padEnd(260, " ")
+          : "<html></html>";
+        return { status: 200, url, html };
+      },
+    };
+    const verifier: EmailVerifier = { kind: "mock", async verify() { return { deliverable: true, reason: "ok" }; } };
+    await runSourcing(
+      deps([new StaticSource([cand({ identity: "BioCreator", siteUrl: "https://creator.com", pageHtml: homepage })])], { fetcher, emailVerifier: verifier }),
+      "m1",
+      { limit: 5 },
+    );
+    const p = (await db.prospects.find((x) => x.merchantId === "m1"))[0]!;
+    expect(p.evidence?.contactUrls?.some((u) => u.kind === "bio_aggregator")).toBe(true);
+    expect(p.email).toBe("business@creator.com");
+    expect(p.evidence?.contactSource).toBe("bio_aggregator:mailto");
+  });
+
+  it("flags a contact-form-only prospect for the human gate (no email invented)", async () => {
+    // No email on page, no finder hits → the prospect must be flagged form-only, not
+    // assigned a fabricated address.
+    const emptyFinder = { name: "none", async find() { return []; }, async verify() { return { deliverable: false, reason: "n/a" }; } };
+    const formPage = `<html><body><form class="contact-form"><input type="email"/><textarea name="message"></textarea></form></body></html>`;
+    await runSourcing(
+      deps([new StaticSource([cand({ identity: "FormOnly", evidenceUrl: "https://formonly.com/contact", pageHtml: formPage })])], { emailFinder: emptyFinder }),
+      "m1",
+      { limit: 5 },
+    );
+    const p = (await db.prospects.find((x) => x.merchantId === "m1"))[0]!;
+    expect(p.evidence?.contactForm).toBe(true);
+    expect(p.evidence?.contactFormUrl).toBe("https://formonly.com/contact");
+    expect(p.email).toBeNull(); // never fabricated
   });
 });

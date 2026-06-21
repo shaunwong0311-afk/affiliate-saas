@@ -37,6 +37,7 @@ import {
   type SecretStore,
   type DiscoverySource,
   type RedirectResolver,
+  type HttpFetcher,
   type CalendarBooking,
   type TransactionalMailer,
 } from "@affiliate/integrations";
@@ -65,6 +66,8 @@ export interface AppContext {
   redirectResolver?: RedirectResolver;
   /** Real MX/SMTP deliverability check for extracted emails. Optional. */
   emailVerifier?: EmailVerifier;
+  /** Page fetcher for following contact-bearing links during enrichment. Optional. */
+  fetcher?: HttpFetcher;
   calendar: CalendarBooking;
   /** Transactional mail (magic links, payout notices) — routed via an ESP, never the box IP. */
   transactionalMailer: TransactionalMailer;
@@ -118,6 +121,9 @@ export function createContext(overrides: Partial<AppContext> = {}): AppContext {
   // verification falls back to the finder's own check.
   const redirectResolver = overrides.redirectResolver ?? (realDiscovery ? new FetchRedirectResolver() : undefined);
   const emailVerifier = overrides.emailVerifier ?? (realDiscovery ? new MxEmailVerifier() : undefined);
+  // Reuse the (proxy) page fetcher for following contact links — real discovery only,
+  // so dev/test never make secondary network calls.
+  const fetcher = overrides.fetcher ?? (realDiscovery ? pageFetcher : undefined);
 
   // Real LLM (AI-SDR + personalization) when an API key is present; deterministic
   // stub otherwise so the platform still runs with zero external services.
@@ -138,6 +144,7 @@ export function createContext(overrides: Partial<AppContext> = {}): AppContext {
     discoverySources,
     redirectResolver,
     emailVerifier,
+    fetcher,
     calendar: overrides.calendar ?? new StubCalendarBooking(),
     transactionalMailer: overrides.transactionalMailer ?? new ConsoleTransactionalMailer(),
     clock: overrides.clock ?? systemClock,

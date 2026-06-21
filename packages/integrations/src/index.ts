@@ -21,6 +21,11 @@ export {
   MxEmailVerifier,
   NoopEmailVerifier,
   extractEmailsFromHtml,
+  discoverContactUrls,
+  detectsContactForm,
+  type EmailSource,
+  type ContactUrl,
+  type ContactUrlKind,
 } from "./web-evidence.js";
 export { HashingEmbedder, DeterministicLlm, classifyReply, renderTemplate } from "./llm.js";
 export { AnthropicLlmClient } from "./anthropic-llm.js";

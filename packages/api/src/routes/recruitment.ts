@@ -1,7 +1,7 @@
 import { z } from "zod";
 import { newId } from "@affiliate/core";
 import type { Affiliate, AffiliateRelationship, OutreachCampaign, Suppression } from "@affiliate/db";
-import { runSourcing, processBacklog, launchCampaign, handleReply, recordOutcome } from "@affiliate/recruitment";
+import { runSourcing, processBacklog, launchCampaign, handleReply, recordOutcome, draftOutreach } from "@affiliate/recruitment";
 import type { RouteModule } from "./helpers.js";
 import { parseBody, parseQuery, ok, paginationSchema, paginate } from "./helpers.js";
 import { requireMerchant } from "../auth/middleware.js";
@@ -178,6 +178,18 @@ export const recruitmentRoutes: RouteModule = (app, ctx) => {
     const body = parseBody(z.object({ label: outcomeLabel }), request);
     await recordOutcome(ctx, id, body.label);
     return ok(reply, { ok: true });
+  });
+
+  // Pre-drafted message for the HUMAN-gated contact-form track (no auto-submit).
+  app.get("/recruitment/prospects/:id/contact-draft", async (request, reply) => {
+    const { merchantId } = await requireMerchant(ctx, request, "read");
+    const id = (request.params as { id: string }).id;
+    const prospect = await ctx.db.prospects.get(id);
+    if (!prospect || prospect.merchantId !== merchantId) throw notFound("prospect");
+    const merchant = await ctx.db.merchants.require(merchantId);
+    const draft = draftOutreach(merchant, prospect);
+    const evidence = prospect.evidence as { contactFormUrl?: string | null } | null;
+    return ok(reply, { ...draft, formUrl: evidence?.contactFormUrl ?? prospect.siteUrl ?? null });
   });
 
   app.post("/recruitment/prospects/:id/reply", async (request, reply) => {

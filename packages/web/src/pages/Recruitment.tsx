@@ -7,6 +7,9 @@ interface Evidence {
   competitorPromoted?: string | null;
   contactSource?: string | null;
   contactEmails?: { email: string; source: string }[];
+  contactUrls?: { url: string; kind: string }[];
+  contactForm?: boolean;
+  contactFormUrl?: string | null;
   pageUrl?: string | null;
 }
 
@@ -30,6 +33,7 @@ export function Recruitment() {
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState<string | null>(null);
   const [selected, setSelected] = useState<Prospect | null>(null);
+  const [draft, setDraft] = useState<{ subject: string; body: string; formUrl: string | null } | null>(null);
   const prospects = useApi<{ items: Prospect[]; total: number }>(() => api.get("/recruitment/prospects?limit=100"));
   const icp = useApi<{ niche: string | null; competitors: string[] }>(() => api.get("/recruitment/icp"));
 
@@ -55,6 +59,20 @@ export function Recruitment() {
       setSelected(null);
     } catch (e: any) {
       setMsg(e?.message ?? "approve failed");
+    }
+  }
+
+  function select(p: Prospect) {
+    setSelected(p);
+    setDraft(null); // clear any stale contact-form draft
+  }
+
+  async function loadDraft(p: Prospect) {
+    try {
+      const d = await api.get<{ subject: string; body: string; formUrl: string | null }>(`/recruitment/prospects/${p.id}/contact-draft`);
+      setDraft(d);
+    } catch (e: any) {
+      setMsg(e?.message ?? "could not load draft");
     }
   }
 
@@ -112,7 +130,7 @@ export function Recruitment() {
                 </thead>
                 <tbody>
                   {items.map((p) => (
-                    <tr key={p.id} style={{ cursor: "pointer" }} onClick={() => setSelected(p)}>
+                    <tr key={p.id} style={{ cursor: "pointer" }} onClick={() => select(p)}>
                       <td>
                         <div style={{ fontWeight: 600 }} className="row gap-8">
                           {p.identity}
@@ -202,7 +220,7 @@ export function Recruitment() {
                         <div className="muted" style={{ fontSize: 12.5, marginBottom: 4 }}>Affiliate links detected ({selected.evidence.affiliateLinks.length}):</div>
                         {selected.evidence.affiliateLinks.slice(0, 4).map((l, i) => (
                           <div key={i} className="row gap-8" style={{ marginBottom: 3 }}>
-                            <Badge kind={l.confidence === "high" ? "ok" : "warn"}>{l.confidence}</Badge>
+                            <Badge kind={l.confidence === "high" ? "pos" : "warn"}>{l.confidence}</Badge>
                             <span className="mono faint" style={{ fontSize: 11, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: 220 }}>{l.network}: {l.url}</span>
                             {l.verified && <Badge kind="info">resolved</Badge>}
                           </div>
@@ -222,7 +240,46 @@ export function Recruitment() {
                     Reject
                   </button>
                 </div>
-                {!selected.email && <div className="faint" style={{ fontSize: 11, marginTop: 8 }}>No verified email — enrichment incomplete.</div>}
+                {!selected.email && !selected.evidence?.contactForm && (
+                  <div className="faint" style={{ fontSize: 11, marginTop: 8 }}>No verified email — enrichment incomplete.</div>
+                )}
+
+                {!selected.email && selected.evidence?.contactForm && (
+                  <div className="card" style={{ background: "var(--ink-850)", marginTop: 14, padding: 14, borderColor: "rgba(109,181,240,0.3)" }}>
+                    <div className="row between" style={{ marginBottom: 6 }}>
+                      <strong style={{ fontSize: 13, color: "var(--info)" }}>Contact form only — human send</strong>
+                      <Badge kind="info">HITL</Badge>
+                    </div>
+                    <p className="muted" style={{ fontSize: 12, marginBottom: 10 }}>
+                      No public email — this creator prefers their contact form. Open it and paste the draft below.
+                      We don't auto-submit forms (deliverability + compliance).
+                    </p>
+                    <div className="row gap-8" style={{ marginBottom: 10 }}>
+                      {(selected.evidence.contactFormUrl ?? selected.siteUrl) && (
+                        <a className="btn sm" href={selected.evidence.contactFormUrl ?? selected.siteUrl ?? "#"} target="_blank" rel="noreferrer">Open contact form ↗</a>
+                      )}
+                      <button className="btn sm primary" onClick={() => loadDraft(selected)}>Generate message</button>
+                    </div>
+                    {draft && (
+                      <div>
+                        <div className="faint mono" style={{ fontSize: 11, marginBottom: 4 }}>Subject: {draft.subject}</div>
+                        <textarea
+                          readOnly
+                          value={draft.body}
+                          onFocus={(e) => e.currentTarget.select()}
+                          style={{ width: "100%", minHeight: 150, fontSize: 12.5, padding: 10, background: "var(--ink-900)", color: "var(--text)", border: "1px solid var(--line)", borderRadius: 6, fontFamily: "inherit" }}
+                        />
+                        <div className="faint" style={{ fontSize: 11, marginTop: 4 }}>Click to select all, then copy into the form.</div>
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {selected.evidence?.contactUrls?.length ? (
+                  <div className="faint" style={{ fontSize: 11, marginTop: 10 }}>
+                    Contact links followed: {selected.evidence.contactUrls.map((u) => u.kind.replace(/_/g, " ")).join(", ")}
+                  </div>
+                ) : null}
               </div>
             )}
           </Card>
