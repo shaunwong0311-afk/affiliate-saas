@@ -3,9 +3,11 @@ import type { Database } from "@affiliate/db";
 import type {
   DiscoverySource,
   EmailFinder,
+  EmailVerifier,
   Embedder,
   LlmClient,
   MailboxSender,
+  RedirectResolver,
   CalendarBooking,
 } from "@affiliate/integrations";
 
@@ -21,6 +23,19 @@ export interface RecruitmentDeps {
   emailFinder: EmailFinder;
   mailer: MailboxSender;
   discoverySources: DiscoverySource[];
+  /**
+   * Follows redirects to confirm where a generic (low-confidence) affiliate link
+   * actually points, upgrading `?ref=`/`?via=` links to trustworthy competitor
+   * evidence. Optional — when absent, low-confidence links stay unverified and
+   * never count as competitor promotion (no false positives).
+   */
+  redirectResolver?: RedirectResolver;
+  /**
+   * Real deliverability check (MX/SMTP) for emails extracted from a page. Optional
+   * — when absent, the EmailFinder's own verify() is used. Distinct from guessing
+   * an address exists.
+   */
+  emailVerifier?: EmailVerifier;
   /** Meeting booking for the managed (A-tier) track. Optional. */
   calendar?: CalendarBooking;
   clock: Clock;

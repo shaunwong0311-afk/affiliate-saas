@@ -112,7 +112,26 @@ export interface RawCandidate {
   evidenceSummary: string | null;
   /** Outbound links found on the candidate's page, for affiliate-pattern detection. */
   outboundLinks: string[];
+  /** Raw page HTML (for contact extraction), if the source fetched it. */
+  pageHtml?: string | null;
   reachHint?: number;
+  /**
+   * TRUE when this candidate is from a deterministic/synthetic source (no real web
+   * data). Real sources set false. Carried through so prospects can be labeled.
+   */
+  synthetic: boolean;
+}
+
+/** Follows redirects to confirm where a (possibly affiliate) link actually points. */
+export interface RedirectResolver {
+  readonly kind: string;
+  resolve(url: string): Promise<{ finalUrl: string; finalHost: string } | null>;
+}
+
+/** Verifies an email is deliverable (MX/SMTP) — distinct from guessing it exists. */
+export interface EmailVerifier {
+  readonly kind: string;
+  verify(email: string): Promise<{ deliverable: boolean; reason: string }>;
 }
 
 export interface DiscoverySource {

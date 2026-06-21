@@ -71,6 +71,9 @@ describe("recruitment pipeline", () => {
       language: null,
       suppressionStatus: "none",
       scoreBreakdown: null,
+      synthetic: false,
+      confidence: null,
+      evidence: null,
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
     });

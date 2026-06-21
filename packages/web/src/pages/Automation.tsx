@@ -14,7 +14,7 @@ interface AutomationState {
 interface Deliverability { sent: number; bounceRate: number; complaintRate: number; circuitOpen: boolean }
 interface SourceYieldRow { sourceType: string; sourced: number; contacted: number; producing: number; producedRevenueCents: number; yield: number }
 interface Meeting { id: string; prospectId: string; status: string; bookingUrl: string | null; notes: string | null; createdAt: string }
-interface CycleSummary { sourced: number; scored: number; autoSent: number; followUpsSent: number; heldForReview: number; circuitOpen: boolean; prunedSources: string[] }
+interface CycleSummary { sourced: number; scored: number; real?: number; synthetic?: number; autoSent: number; followUpsSent: number; heldForReview: number; circuitOpen: boolean; prunedSources: string[] }
 
 export function Automation() {
   const auto = useApi<AutomationState>(() => api.get("/recruitment/automation"));
@@ -75,6 +75,7 @@ export function Automation() {
         <Card title="Last cycle" sub="one autonomous pass" >
           <div className="row wrap gap-8 mt-16">
             <Badge>sourced {lastCycle.sourced}</Badge>
+            {lastCycle.synthetic ? <Badge kind="warn">{lastCycle.synthetic} demo</Badge> : null}
             <Badge kind="pos">auto-sent {lastCycle.autoSent}</Badge>
             <Badge kind="info">follow-ups {lastCycle.followUpsSent}</Badge>
             <Badge kind="warn">held for review {lastCycle.heldForReview}</Badge>

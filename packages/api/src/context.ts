@@ -9,6 +9,7 @@ import {
   PayoutRailRegistry,
   MockMailboxSender,
   StubEmailFinder,
+  HunterFinder,
   HashingEmbedder,
   DeterministicLlm,
   AnthropicLlmClient,
@@ -16,15 +17,26 @@ import {
   CompetitorAffiliateSource,
   CreatorDiscoverySource,
   SerpDiscoverySource,
+  SerpApiProvider,
+  DeterministicSerpProvider,
+  BacklinkDiscoverySource,
   DbCustomerMiningSource,
+  ProxyHttpFetcher,
+  DeterministicFetcher,
+  FetchJsonClient,
+  staticProxyPool,
+  FetchRedirectResolver,
+  MxEmailVerifier,
   StubCalendarBooking,
   ConsoleTransactionalMailer,
   type MailboxSender,
   type EmailFinder,
+  type EmailVerifier,
   type Embedder,
   type LlmClient,
   type SecretStore,
   type DiscoverySource,
+  type RedirectResolver,
   type CalendarBooking,
   type TransactionalMailer,
 } from "@affiliate/integrations";
@@ -49,6 +61,10 @@ export interface AppContext {
   llm: LlmClient;
   secrets: SecretStore;
   discoverySources: DiscoverySource[];
+  /** Follows redirects so generic affiliate links can be trusted (real network). Optional. */
+  redirectResolver?: RedirectResolver;
+  /** Real MX/SMTP deliverability check for extracted emails. Optional. */
+  emailVerifier?: EmailVerifier;
   calendar: CalendarBooking;
   /** Transactional mail (magic links, payout notices) — routed via an ESP, never the box IP. */
   transactionalMailer: TransactionalMailer;
@@ -57,17 +73,51 @@ export interface AppContext {
 
 export function createContext(overrides: Partial<AppContext> = {}): AppContext {
   const db = overrides.db ?? createMemoryDatabase();
+  const config = overrides.config ?? loadConfig();
 
-  // The autonomous "from-scratch" discovery sources: SERP mining (the headline
-  // source) + competitor-affiliate + creator + first-party customer mining. The
-  // SERP source uses deterministic providers by default (runs offline); production
-  // injects a real SERP API + proxy fetcher with no pipeline change.
+  // --- Real discovery wiring (Section 8.1). The headline SERP source is REAL when
+  // a SERP API key is present: a SerpApiProvider + a proxy/direct page fetcher,
+  // feeding actually-scraped HTML through the affiliate-link detector. With no key
+  // it falls back to deterministic providers (which mark their output `synthetic`).
+  const proxyUrls = (process.env.PROXY_URL ?? "").split(",").map((s) => s.trim()).filter(Boolean);
+  const jsonHttp = new FetchJsonClient();
+  const hasSerp = !!process.env.SERPAPI_KEY;
+  const realDiscovery = hasSerp || proxyUrls.length > 0;
+
+  const serpProvider = hasSerp
+    ? new SerpApiProvider({ apiKey: process.env.SERPAPI_KEY!, http: jsonHttp })
+    : new DeterministicSerpProvider();
+  // A real page fetcher (proxy pool, or direct fetch when only a SERP key is set)
+  // whenever we have real SERP results; deterministic (no network) otherwise.
+  const pageFetcher = realDiscovery ? new ProxyHttpFetcher(staticProxyPool(proxyUrls)) : new DeterministicFetcher();
+  const serpSource = new SerpDiscoverySource(serpProvider, pageFetcher);
+
+  // Synthetic generators fabricate demo prospects — only included when allowed
+  // (never in production). The SERP source, first-party customer mining, and the
+  // (real-or-empty) backlink source are always present.
+  const syntheticSources = config.allowSyntheticDiscovery
+    ? [new CompetitorAffiliateSource(), new CreatorDiscoverySource()]
+    : [];
   const discoverySources: DiscoverySource[] = overrides.discoverySources ?? [
-    new SerpDiscoverySource(),
-    new CompetitorAffiliateSource(),
-    new CreatorDiscoverySource(),
+    serpSource,
+    ...syntheticSources,
     new DbCustomerMiningSource(db),
+    new BacklinkDiscoverySource({
+      apiKey: process.env.BACKLINK_API_KEY,
+      http: process.env.BACKLINK_API_KEY ? jsonHttp : undefined,
+    }),
   ];
+
+  // Email finding: real Hunter.io when keyed, deterministic pattern stub otherwise.
+  const emailFinder =
+    overrides.emailFinder ??
+    (process.env.HUNTER_API_KEY ? new HunterFinder({ apiKey: process.env.HUNTER_API_KEY, http: jsonHttp }) : new StubEmailFinder());
+
+  // Real network helpers — only wired when real discovery is on, so tests/dev never
+  // hit the network. When absent, generic affiliate links stay unverified and email
+  // verification falls back to the finder's own check.
+  const redirectResolver = overrides.redirectResolver ?? (realDiscovery ? new FetchRedirectResolver() : undefined);
+  const emailVerifier = overrides.emailVerifier ?? (realDiscovery ? new MxEmailVerifier() : undefined);
 
   // Real LLM (AI-SDR + personalization) when an API key is present; deterministic
   // stub otherwise so the platform still runs with zero external services.
@@ -76,16 +126,18 @@ export function createContext(overrides: Partial<AppContext> = {}): AppContext {
     (process.env.ANTHROPIC_API_KEY ? new AnthropicLlmClient({ apiKey: process.env.ANTHROPIC_API_KEY }) : new DeterministicLlm());
 
   return {
-    config: overrides.config ?? loadConfig(),
+    config,
     db,
     engines: overrides.engines ?? defaultEngineRegistry,
     rails: overrides.rails ?? new PayoutRailRegistry(),
     mailer: overrides.mailer ?? new MockMailboxSender(),
-    emailFinder: overrides.emailFinder ?? new StubEmailFinder(),
+    emailFinder,
     embedder: overrides.embedder ?? new HashingEmbedder(),
     llm,
     secrets: overrides.secrets ?? new InMemorySecretStore(),
     discoverySources,
+    redirectResolver,
+    emailVerifier,
     calendar: overrides.calendar ?? new StubCalendarBooking(),
     transactionalMailer: overrides.transactionalMailer ?? new ConsoleTransactionalMailer(),
     clock: overrides.clock ?? systemClock,

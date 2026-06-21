@@ -16,6 +16,12 @@ export {
   CustomerMiningSource,
   DEFAULT_DISCOVERY_SOURCES,
 } from "./discovery.js";
+export {
+  FetchRedirectResolver,
+  MxEmailVerifier,
+  NoopEmailVerifier,
+  extractEmailsFromHtml,
+} from "./web-evidence.js";
 export { HashingEmbedder, DeterministicLlm, classifyReply, renderTemplate } from "./llm.js";
 export { AnthropicLlmClient } from "./anthropic-llm.js";
 export { InMemorySecretStore, EnvSecretStore } from "./secrets.js";

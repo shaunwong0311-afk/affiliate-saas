@@ -82,6 +82,32 @@ async function proxyDispatcher(proxyUrl: string): Promise<unknown | null> {
   }
 }
 
+/**
+ * Real JSON HTTP client for API adapters (SerpApi, Hunter, backlink providers).
+ * Satisfies both the `{ get(url) }` and `{ get(url, headers?) }` shapes those
+ * adapters expect. Returns parsed JSON (or null on a non-JSON/empty body).
+ */
+export class FetchJsonClient {
+  readonly kind = "fetch-json";
+  constructor(private readonly opts: { timeoutMs?: number } = {}) {}
+  async get(url: string, headers?: Record<string, string>): Promise<{ status: number; json: any }> {
+    const controller = new AbortController();
+    const t = setTimeout(() => controller.abort(), this.opts.timeoutMs ?? 15000);
+    try {
+      const res = await fetch(url, { headers, signal: controller.signal });
+      let json: any = null;
+      try {
+        json = await res.json();
+      } catch {
+        json = null;
+      }
+      return { status: res.status, json };
+    } finally {
+      clearTimeout(t);
+    }
+  }
+}
+
 /** Dev/test fetcher: returns a deterministic page so discovery runs with no network. */
 export class DeterministicFetcher implements HttpFetcher {
   readonly kind = "deterministic";

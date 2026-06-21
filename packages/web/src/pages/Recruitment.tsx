@@ -2,6 +2,14 @@ import { useState } from "react";
 import { api, num } from "../api";
 import { useApi, Card, Spinner, ErrorBanner, PageHeader, Badge, EmptyState } from "../ui";
 
+interface Evidence {
+  affiliateLinks?: { url: string; network: string; confidence: string; verified?: boolean }[];
+  competitorPromoted?: string | null;
+  contactSource?: string | null;
+  contactEmails?: { email: string; source: string }[];
+  pageUrl?: string | null;
+}
+
 interface Prospect {
   id: string;
   identity: string;
@@ -12,7 +20,10 @@ interface Prospect {
   state: string;
   score: number | null;
   tier: "A" | "B" | "C" | null;
-  scoreBreakdown: { explanation?: string[]; breakdown?: { factor: string; contribution: number; note: string }[] } | null;
+  synthetic: boolean;
+  confidence: number | null;
+  evidence: Evidence | null;
+  scoreBreakdown: { explanation?: string[]; breakdown?: { factor: string; contribution: number; note: string }[]; unknownFactors?: string[] } | null;
 }
 
 export function Recruitment() {
@@ -26,8 +37,9 @@ export function Recruitment() {
     setBusy(true);
     setMsg(null);
     try {
-      const res = await api.post<{ discovered: number; scored: number; byTier: Record<string, number> }>("/recruitment/source", { limit: 12 });
-      setMsg(`Sourced ${res.discovered}, scored ${res.scored} — A:${res.byTier.A ?? 0} B:${res.byTier.B ?? 0} C:${res.byTier.C ?? 0}`);
+      const res = await api.post<{ discovered: number; scored: number; byTier: Record<string, number>; real: number; synthetic: number }>("/recruitment/source", { limit: 12 });
+      const demoNote = res.synthetic > 0 ? ` · ${res.real} real, ${res.synthetic} demo` : "";
+      setMsg(`Sourced ${res.discovered}, scored ${res.scored} — A:${res.byTier.A ?? 0} B:${res.byTier.B ?? 0} C:${res.byTier.C ?? 0}${demoNote}`);
       prospects.reload();
     } catch (e: any) {
       setMsg(e?.message ?? "failed");
@@ -48,6 +60,7 @@ export function Recruitment() {
 
   if (prospects.loading) return <Spinner />;
   const items = prospects.data?.items ?? [];
+  const syntheticCount = items.filter((p) => p.synthetic).length;
 
   return (
     <>
@@ -63,6 +76,14 @@ export function Recruitment() {
       />
 
       {msg && <div className="err-banner" style={{ background: "var(--acc-glow)", borderColor: "var(--acc-dim)", color: "var(--acc)" }}>{msg}</div>}
+      {syntheticCount > 0 && (
+        <div
+          className="err-banner"
+          style={{ background: "rgba(245, 180, 60, 0.10)", borderColor: "rgba(245, 180, 60, 0.45)", color: "#f5b43c", marginBottom: 14 }}
+        >
+          ⚠ {syntheticCount} of {items.length} prospects are <strong>demo data</strong> from deterministic generators (no SERP/email keys wired). Sourced/verified/tier counts that include them are illustrative, not real affiliates. Set <span className="mono">SERPAPI_KEY</span> + <span className="mono">HUNTER_API_KEY</span> for live discovery.
+        </div>
+      )}
       {icp.data && (
         <div className="row gap-8" style={{ marginBottom: 18 }}>
           <Badge>niche: {icp.data.niche ?? "unset"}</Badge>
@@ -93,7 +114,10 @@ export function Recruitment() {
                   {items.map((p) => (
                     <tr key={p.id} style={{ cursor: "pointer" }} onClick={() => setSelected(p)}>
                       <td>
-                        <div style={{ fontWeight: 600 }}>{p.identity}</div>
+                        <div style={{ fontWeight: 600 }} className="row gap-8">
+                          {p.identity}
+                          {p.synthetic && <Badge kind="warn">demo</Badge>}
+                        </div>
                         <div className="faint mono" style={{ fontSize: 11 }}>{p.email ?? "no email"}</div>
                       </td>
                       <td className="muted" style={{ fontSize: 12 }}>{p.source.replace(/_/g, " ")}</td>
@@ -112,14 +136,28 @@ export function Recruitment() {
             ) : (
               <div>
                 <div className="row between" style={{ marginBottom: 4 }}>
-                  <h3 style={{ fontSize: 18 }}>{selected.identity}</h3>
+                  <h3 style={{ fontSize: 18 }} className="row gap-8">
+                    {selected.identity}
+                    {selected.synthetic && <Badge kind="warn">demo data</Badge>}
+                  </h3>
                   {selected.tier && <Badge kind={`tier-${selected.tier}`}>Tier {selected.tier} · {selected.score}</Badge>}
                 </div>
-                <div className="faint mono" style={{ fontSize: 12, marginBottom: 16 }}>
-                  {selected.siteUrl ?? selected.channelUrl ?? "—"}
+                <div className="row gap-8" style={{ marginBottom: 16 }}>
+                  <span className="faint mono" style={{ fontSize: 12 }}>{selected.siteUrl ?? selected.channelUrl ?? "—"}</span>
+                  {selected.confidence != null && (
+                    <Badge kind={selected.confidence >= 0.66 ? "pos" : selected.confidence >= 0.4 ? "info" : "warn"}>
+                      {Math.round(selected.confidence * 100)}% confidence
+                    </Badge>
+                  )}
                 </div>
 
-                {selected.scoreBreakdown?.breakdown?.map((b) => (
+                {selected.synthetic && (
+                  <div className="err-banner" style={{ background: "rgba(245, 180, 60, 0.10)", borderColor: "rgba(245, 180, 60, 0.4)", color: "#f5b43c", fontSize: 12, marginBottom: 14 }}>
+                    Synthetic demo prospect — generated offline, not a real person. Wire a SERP/email provider for live discovery.
+                  </div>
+                )}
+
+                {selected.scoreBreakdown?.breakdown?.filter((b) => b.contribution > 0).map((b) => (
                   <div className="factor-row" key={b.factor}>
                     <span className="muted" style={{ fontSize: 12.5 }}>{b.factor}</span>
                     <div className="scorebar">
@@ -133,7 +171,48 @@ export function Recruitment() {
                   {(selected.scoreBreakdown?.explanation ?? []).slice(0, 4).map((e, i) => (
                     <div key={i} className="muted" style={{ fontSize: 12.5, marginBottom: 6 }}>• {e}</div>
                   ))}
+                  {selected.scoreBreakdown?.unknownFactors?.length ? (
+                    <div className="faint" style={{ fontSize: 11.5, marginTop: 8 }}>
+                      Unknown (no data provider): {selected.scoreBreakdown.unknownFactors.join(", ")} — excluded from the score, not invented.
+                    </div>
+                  ) : null}
                 </div>
+
+                {selected.evidence && (
+                  <div className="card" style={{ background: "var(--ink-850)", marginTop: 12, padding: 14 }}>
+                    <div className="faint" style={{ fontSize: 11, letterSpacing: 0.4, textTransform: "uppercase", marginBottom: 8 }}>Evidence</div>
+                    {selected.evidence.competitorPromoted ? (
+                      <div className="muted" style={{ fontSize: 12.5, marginBottom: 6 }}>
+                        Promotes competitor: <span className="acc mono">{selected.evidence.competitorPromoted}</span>
+                      </div>
+                    ) : null}
+                    {selected.evidence.pageUrl ? (
+                      <div className="muted" style={{ fontSize: 12.5, marginBottom: 6 }}>
+                        Found on: <a href={selected.evidence.pageUrl} target="_blank" rel="noreferrer" className="mono" style={{ color: "var(--acc)" }}>{selected.evidence.pageUrl}</a>
+                      </div>
+                    ) : null}
+                    {selected.evidence.contactSource ? (
+                      <div className="muted" style={{ fontSize: 12.5, marginBottom: 6 }}>
+                        Contact via: <span className="mono">{selected.evidence.contactSource}</span>
+                        {selected.evidence.contactSource === "pattern-guess" && <span className="faint"> (guessed pattern — lower trust)</span>}
+                      </div>
+                    ) : null}
+                    {selected.evidence.affiliateLinks?.length ? (
+                      <div style={{ marginTop: 6 }}>
+                        <div className="muted" style={{ fontSize: 12.5, marginBottom: 4 }}>Affiliate links detected ({selected.evidence.affiliateLinks.length}):</div>
+                        {selected.evidence.affiliateLinks.slice(0, 4).map((l, i) => (
+                          <div key={i} className="row gap-8" style={{ marginBottom: 3 }}>
+                            <Badge kind={l.confidence === "high" ? "ok" : "warn"}>{l.confidence}</Badge>
+                            <span className="mono faint" style={{ fontSize: 11, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: 220 }}>{l.network}: {l.url}</span>
+                            {l.verified && <Badge kind="info">resolved</Badge>}
+                          </div>
+                        ))}
+                      </div>
+                    ) : (
+                      <div className="faint" style={{ fontSize: 12 }}>No affiliate links detected on the page.</div>
+                    )}
+                  </div>
+                )}
 
                 <div className="row gap-8 mt-16">
                   <button className="btn primary sm" onClick={() => approve(selected)} disabled={!selected.email}>

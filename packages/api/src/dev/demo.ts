@@ -45,9 +45,13 @@ async function main() {
   line();
 
   const funnel = await recruitmentFunnel(ctx, merchantId);
+  const allProspects = await ctx.db.prospects.find((p) => p.merchantId === merchantId);
+  const demoCount = allProspects.filter((p) => p.synthetic).length;
   line("  RECRUITMENT FUNNEL (the wedge)");
   line(`    sourced ${funnel.sourced} → contacted ${funnel.contacted} → replied ${funnel.replied} → converted ${funnel.converted}`);
   line(`    tiers: ${JSON.stringify(funnel.byTier)}`);
+  if (demoCount > 0)
+    line(`    ⚠ ${demoCount}/${allProspects.length} are DEMO DATA (no SERP/email keys wired — set SERPAPI_KEY + HUNTER_API_KEY for real discovery)`);
   line();
 
   const auto = await getAutomationState(ctx, merchantId);

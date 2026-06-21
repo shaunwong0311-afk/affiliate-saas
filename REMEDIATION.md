@@ -1,7 +1,7 @@
 # Security & correctness remediation
 
 In response to a security/correctness review. Each item links to the fix and, where
-applicable, a regression test. 99 tests pass; full monorepo typechecks; the
+applicable, a regression test. 121 tests pass; full monorepo typechecks; the
 reviewer's own double-pay probe now reports the correct total.
 
 ## Critical — fixed
@@ -36,6 +36,29 @@ reviewer's own double-pay probe now reports the correct total.
 - SPA API base is build-time configurable (`VITE_API_BASE`). [`api.ts`](packages/web/src/api.ts)
 - JWT secret must be set in production (boot fails on the dev default); basic per-IP rate limiting on auth + public webhook routes; entitlement enforcement wired on the metered sourcing route.
 
+## Second review — data-acquisition honesty (affiliate finding)
+
+The second review found the affiliate-finding feature "does not currently find real
+affiliates — the demo's prospects are mostly synthetic," and asked that we either make
+it genuinely useful **or** label it honestly. Both, now:
+
+| Finding | Fix | Test |
+|---|---|---|
+| **Fabricated affiliate links on failed/short fetch** (`discovery-real.ts:86`) — created false positives even with real SERP. | The SERP source runs the **real** detector over actually-fetched HTML; a failed/short fetch records **zero** links and says "page not fetched" — never invents them. [`discovery-real.ts`](packages/integrations/src/discovery-real.ts) | `web-evidence.test.ts` (no-fabrication) |
+| **Synthetic prospects indistinguishable from real** | Every candidate carries a `synthetic` flag; it flows to `Prospect.synthetic`; sourcing/cycle summaries report `real` vs `synthetic`; the dashboard + CLI label **DEMO DATA**. Synthetic generators are **gated off in production** (`allowSyntheticDiscovery`, default off in prod). [`ports.ts`](packages/integrations/src/ports.ts), [`config.ts`](packages/api/src/config.ts), [`context.ts`](packages/api/src/context.ts), [`Recruitment.tsx`](packages/web/src/pages/Recruitment.tsx) | `honesty.test.ts` |
+| **Generic `?ref=`/`?via=` treated as affiliate / competitor proof** (`affiliate-detection.ts:21`) | Signals now carry **confidence** (named network = high, generic = low). "Runs affiliate links" requires a **high-confidence** signature. Competitor promotion counts only when the destination is **known**: a link **directly** to the competitor's domain, or a third-party redirector **resolved** to it — never assumed. [`affiliate-detection.ts`](packages/core/src/recruitment/affiliate-detection.ts) | `recruitment.test.ts` (direct vs redirector) |
+| **Invented DA / engagement / reach / overlap → untrustworthy A/B/C** | Those signals are `number \| null`; **null = unknown** (no provider). The scorer **excludes** unknowns, renormalizes over what's known, and returns a **confidence** (share of weight backed by real signals) + `unknownFactors`. Enrichment no longer estimates DA/engagement from the domain string. [`scoring.ts`](packages/core/src/recruitment/scoring.ts), [`pipeline.ts`](packages/recruitment/src/pipeline.ts) | `recruitment.test.ts` (unknown-signal scoring) |
+| **Email enrichment = pattern-guess + hashed "75% verified"** (`enrichment.ts:19`) | Enrichment **prefers real contact extraction** from the page (mailto: + visible addresses, junk-filtered) and verifies with a real **MX** check; pattern-guessing is a labeled fallback (`contactSource: "pattern-guess"`). [`web-evidence.ts`](packages/integrations/src/web-evidence.ts), [`pipeline.ts`](packages/recruitment/src/pipeline.ts) | `web-evidence.test.ts`, `honesty.test.ts` |
+| **Real SERP/Hunter/proxy adapters never wired** (`context.ts:61`) | `createContext` wires them by env: `SERPAPI_KEY` → real SERP + page fetcher, `PROXY_URL` → rotating proxy, `HUNTER_API_KEY` → Hunter, plus `FetchRedirectResolver` + `MxEmailVerifier` whenever real discovery is on. No key → deterministic providers that self-label synthetic. [`context.ts`](packages/api/src/context.ts) | — |
+| **Review UX didn't show the proof** | The prospect panel shows confidence, the exact competitor promoted, the page it was found on, each detected affiliate link (network + high/low + "resolved"), and the contact source — plus an explicit "unknown (no provider)" line. [`Recruitment.tsx`](packages/web/src/pages/Recruitment.tsx) | — |
+
+**What still needs live keys** (cannot be exercised here): real SERP results, Hunter
+lookups, MX/SMTP deliverability at scale, and proxy-routed scraping all require the
+corresponding API keys/proxies. The code paths, adapters, and gating are in place and
+unit-tested with mocks/deterministic providers; with keys set they run end-to-end with
+no pipeline change. Backlink/competitor-backlink mining remains an honest empty result
+until a backlink API (`BACKLINK_API_KEY`) is wired.
+
 ## Knowingly still open (not yet addressed)
 
 Honest list — these were lower-severity or need infra:
@@ -44,4 +67,5 @@ Honest list — these were lower-severity or need infra:
 - **Cloudflare KV sync / Queue consumption** remain skeletons (the Node edge path shares Postgres; the Workers KV/Queue production wiring is documented but not implemented).
 - **Real provider adapters** (Stripe/PayPal/Gmail/calendar/billing) are still skeletons; the dev mocks report success by design. Production must wire and fail-closed each one.
 - **Datacenter/VPN IP detection** is inactive (needs an IP-intelligence provider).
+- **Real SERP/Hunter/proxy/backlink discovery** needs API keys (see above); without them discovery runs in deterministic/demo mode (clearly labeled) or returns empty.
 - **No Postgres-backed integration tests, lint config, or UI tests** yet.

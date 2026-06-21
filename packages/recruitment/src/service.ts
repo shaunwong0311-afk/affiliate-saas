@@ -14,6 +14,10 @@ export interface SourcingSummary {
   enriched: number;
   scored: number;
   byTier: Record<string, number>;
+  /** Of the discovered prospects, how many came from REAL sources vs synthetic demo
+   * generators. `synthetic` prospects must be labeled "demo data" in the UI. */
+  real: number;
+  synthetic: number;
 }
 
 /** Run sourcing → enrich → score for a merchant (the discovery half of the wedge). */
@@ -25,8 +29,10 @@ export async function runSourcing(
   const created = await discover(deps, merchantId, opts);
   let enriched = 0;
   let scored = 0;
+  let synthetic = 0;
   const byTier: Record<string, number> = { A: 0, B: 0, C: 0 };
   for (const prospect of created) {
+    if (prospect.synthetic) synthetic++;
     await enrich(deps, prospect.id);
     enriched++;
     const finished = await score(deps, prospect.id);
@@ -35,7 +41,7 @@ export async function runSourcing(
       byTier[finished.tier] = (byTier[finished.tier] ?? 0) + 1;
     }
   }
-  return { discovered: created.length, enriched, scored, byTier };
+  return { discovered: created.length, enriched, scored, byTier, real: created.length - synthetic, synthetic };
 }
 
 /** Re-process any prospects stuck in discovered/enriched (idempotent). */

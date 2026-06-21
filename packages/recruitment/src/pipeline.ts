@@ -3,12 +3,13 @@ import {
   scoreProspect as scoreSignals,
   detectAffiliateUrl,
   promotesCompetitor as detectPromotesCompetitor,
+  hasProvenAffiliateSignal,
   canTransition,
   type ScoringSignals,
   type AffiliateSignal,
 } from "@affiliate/core";
 import type { Prospect, ProspectSignal, OutreachCampaign, OutreachMessage, Reply } from "@affiliate/db";
-import { renderTemplate, classifyReply, type DiscoveryQuery } from "@affiliate/integrations";
+import { renderTemplate, classifyReply, extractEmailsFromHtml, type DiscoveryQuery, type RedirectResolver } from "@affiliate/integrations";
 import type { RecruitmentDeps } from "./deps.js";
 import { isSuppressed, suppress } from "./suppression.js";
 import { firstStep, personalizationDepth } from "./sequencing.js";
@@ -56,9 +57,21 @@ export async function discover(
       if (dupe) continue;
 
       const now = deps.clock.now().toISOString();
-      const signals: AffiliateSignal[] = cand.outboundLinks.flatMap((l) => detectAffiliateUrl(l));
-      const isAffiliate = signals.length > 0;
+      let signals: AffiliateSignal[] = cand.outboundLinks.flatMap((l) => detectAffiliateUrl(l));
+      // Resolve LOW-confidence generic links (?ref=, ?via=, /go/) to their final
+      // host so they can be trusted as competitor evidence. Named-network links are
+      // already high-confidence and need no resolution. Only spend network calls on
+      // REAL candidates (never on demo data) and only when a resolver is wired.
+      if (deps.redirectResolver && !cand.synthetic) {
+        signals = await resolveLowConfidenceSignals(deps.redirectResolver, signals);
+      }
+      // "Runs affiliate links" = a PROVEN monetizer: at least one HIGH-confidence
+      // named-network signature. A bare generic `?ref=` is NOT proof on its own.
+      const isAffiliate = hasProvenAffiliateSignal(signals);
       const promotesComp = detectPromotesCompetitor(signals, merchant.competitors);
+      const competitorPromoted = firstPromotedCompetitor(signals, merchant.competitors);
+      // Real contact extraction from the fetched page (mailto: first). Never guessed.
+      const contactEmails = cand.pageHtml ? extractEmailsFromHtml(cand.pageHtml).slice(0, 5) : [];
 
       const prospect: Prospect = {
         id: newId("prosp"),
@@ -75,6 +88,15 @@ export async function discover(
         language: null,
         suppressionStatus: "none",
         scoreBreakdown: null,
+        synthetic: cand.synthetic,
+        confidence: null,
+        evidence: {
+          affiliateLinks: signals.map((s) => ({ url: s.url, network: s.network, confidence: s.confidence, verified: s.verified })),
+          competitorPromoted,
+          contactSource: null,
+          contactEmails,
+          pageUrl: cand.evidenceUrl,
+        },
         createdAt: now,
         updatedAt: now,
       };
@@ -91,14 +113,17 @@ export async function discover(
         id: newId("psig"),
         prospectId: prospect.id,
         relevance: 0,
-        reach: cand.reachHint ?? 0,
-        da: 0,
-        engagement: 0,
         isAffiliate,
         promotesCompetitor: promotesComp,
         intent: /review|best|vs|compare/i.test(cand.evidenceSummary ?? "") ? 0.8 : 0.3,
         verifiedEmail: false,
-        audienceOverlap: 0.5,
+        // Provider-backed signals are UNKNOWN at discovery — no SEO/audience/creator
+        // provider has run. reachHint is a real-ish proxy only for customer mining
+        // (lifetime spend); a real SERP hit has no reach until a provider is wired.
+        reach: cand.reachHint ?? null,
+        da: null,
+        engagement: null,
+        audienceOverlap: null,
       });
       created.push(prospect);
     }
@@ -112,28 +137,57 @@ export async function enrich(deps: RecruitmentDeps, prospectId: string): Promise
   if (!canTransition(prospect.state, "enriched")) return prospect;
 
   const domain = hostOf(prospect.siteUrl ?? prospect.channelUrl);
-  const candidates = await deps.emailFinder.find({ fullName: prospect.identity, domain: domain ?? undefined, siteUrl: prospect.siteUrl ?? undefined });
+  // Deliverability check: a wired EmailVerifier (real MX/SMTP) wins; otherwise the
+  // EmailFinder's own verify(). We never mark an unverified address deliverable.
+  const verify = (email: string) =>
+    deps.emailVerifier ? deps.emailVerifier.verify(email) : deps.emailFinder.verify(email);
+
   let chosenEmail: string | null = null;
-  for (const c of candidates.sort((a, b) => b.confidence - a.confidence)) {
-    const verify = await deps.emailFinder.verify(c.email);
-    if (verify.deliverable) {
+  let contactSource: string | null = null;
+
+  // 1) PREFER emails actually extracted from the fetched page (real contact path).
+  const extracted = prospect.evidence?.contactEmails ?? [];
+  for (const c of extracted) {
+    const v = await verify(c.email).catch(() => ({ deliverable: false, reason: "verify error" }));
+    if (v.deliverable) {
       chosenEmail = c.email;
+      contactSource = `page:${c.source}`;
       break;
+    }
+  }
+
+  // 2) FALL BACK to the EmailFinder (Hunter in prod; pattern-guessing stub in dev).
+  //    Pattern-guessed addresses are clearly labeled so the UI can flag them.
+  if (!chosenEmail) {
+    const candidates = await deps.emailFinder
+      .find({ fullName: prospect.identity, domain: domain ?? undefined, siteUrl: prospect.siteUrl ?? undefined })
+      .catch(() => []);
+    for (const c of candidates.sort((a, b) => b.confidence - a.confidence)) {
+      const v = await verify(c.email).catch(() => ({ deliverable: false, reason: "verify error" }));
+      if (v.deliverable) {
+        chosenEmail = c.email;
+        contactSource = c.source === "stub-finder" ? "pattern-guess" : c.source;
+        break;
+      }
     }
   }
 
   const signal = await deps.db.prospectSignals.findOne((s) => s.prospectId === prospectId);
   if (signal) {
-    await deps.db.prospectSignals.update(signal.id, {
-      verifiedEmail: !!chosenEmail,
-      da: estimateDomainAuthority(domain),
-      engagement: 0.02 + (signal.reach > 0 ? Math.min(0.08, 100_000 / signal.reach) : 0.02),
-    } as Partial<ProspectSignal>);
+    // Only the verified-email signal is updated here. DA / engagement / audience
+    // stay UNKNOWN (null) unless a real SEO/creator-analytics provider is wired —
+    // they are never estimated from the domain string.
+    await deps.db.prospectSignals.update(signal.id, { verifiedEmail: !!chosenEmail } as Partial<ProspectSignal>);
   }
 
   const ts = deps.clock.now().toISOString();
   await deps.db.usageEvents.insert({ id: newId("use"), merchantId: prospect.merchantId, kind: "enrichment", quantity: 1, sourceId: prospectId, ts });
-  return deps.db.prospects.update(prospectId, { email: chosenEmail, state: "enriched", updatedAt: ts });
+  return deps.db.prospects.update(prospectId, {
+    email: chosenEmail,
+    evidence: { ...(prospect.evidence ?? {}), contactSource },
+    state: "enriched",
+    updatedAt: ts,
+  });
 }
 
 // ---- 3. Score ---------------------------------------------------------------
@@ -168,7 +222,8 @@ export async function score(deps: RecruitmentDeps, prospectId: string): Promise<
   return deps.db.prospects.update(prospectId, {
     score: result.score,
     tier: result.tier,
-    scoreBreakdown: { breakdown: result.breakdown, explanation: result.explanation },
+    confidence: result.confidence,
+    scoreBreakdown: { breakdown: result.breakdown, explanation: result.explanation, confidence: result.confidence, unknownFactors: result.unknownFactors },
     state: "scored",
     updatedAt: deps.clock.now().toISOString(),
   });
@@ -303,6 +358,42 @@ function hostOf(url: string | null): string | null {
   }
 }
 
+/**
+ * Follow the redirect of each LOW-confidence generic link (`?ref=`, `?via=`, `/go/`)
+ * and stamp the resolved final host onto the signal. High-confidence named-network
+ * links are left untouched. A signal only becomes `verified` if the redirect was
+ * actually followed — so unresolved generics never count as competitor evidence.
+ */
+async function resolveLowConfidenceSignals(resolver: RedirectResolver, signals: AffiliateSignal[]): Promise<AffiliateSignal[]> {
+  const out: AffiliateSignal[] = [];
+  for (const s of signals) {
+    if (s.confidence === "low" && !s.verified) {
+      const resolved = await resolver.resolve(s.url).catch(() => null);
+      if (resolved) {
+        out.push({ ...s, verified: true, resolvedHost: resolved.finalHost });
+        continue;
+      }
+    }
+    out.push(s);
+  }
+  return out;
+}
+
+/** The first competitor domain a link is KNOWN to point at (direct host or resolved). */
+function firstPromotedCompetitor(signals: AffiliateSignal[], competitorDomains: string[]): string | null {
+  const comps = competitorDomains.map((d) => d.toLowerCase().replace(/^www\./, ""));
+  const match = (host: string | undefined): string | null => {
+    if (!host) return null;
+    const target = host.toLowerCase().replace(/^www\./, "");
+    return comps.find((c) => target === c || target.endsWith(`.${c}`)) ?? null;
+  };
+  for (const s of signals) {
+    const m = match(s.targetHost) ?? match(s.resolvedHost);
+    if (m) return m;
+  }
+  return null;
+}
+
 /** EU + Canada — cold B2B email is restricted (GDPR/ePrivacy) or consent-based (CASL). */
 const GEO_GATED: ReadonlySet<string> = new Set([
   "AT", "BE", "BG", "HR", "CY", "CZ", "DK", "EE", "FI", "FR", "DE", "GR", "HU", "IE", "IT", "LV",
@@ -313,12 +404,4 @@ function unsubscribeLink(merchantId: string, email: string): string {
   // Points at the API's real public unsubscribe endpoint (GET /track/unsubscribe).
   const base = process.env.PUBLIC_API_URL ?? "http://localhost:8787";
   return `${base}/track/unsubscribe?m=${encodeURIComponent(merchantId)}&e=${encodeURIComponent(email)}`;
-}
-
-function estimateDomainAuthority(domain: string | null): number {
-  if (!domain) return 0;
-  // Deterministic pseudo-DA from the domain string (stub for a real DA provider).
-  let h = 0;
-  for (const ch of domain) h = (h * 31 + ch.charCodeAt(0)) % 100;
-  return 20 + (h % 60);
 }

@@ -277,6 +277,24 @@ export interface Prospect {
   language: string | null;
   suppressionStatus: "none" | "suppressed" | "bounced";
   scoreBreakdown: unknown | null;
+  /**
+   * TRUE when this prospect was produced by a deterministic/synthetic source
+   * (no real web data). The dashboard must label these as demo data and they are
+   * excluded from "real" counts.
+   */
+  synthetic: boolean;
+  /** Score confidence 0..1 — share of scoring weight backed by real signals. */
+  confidence: number | null;
+  /** Evidence: the affiliate links found, the competitor promoted, contact source. */
+  evidence: {
+    affiliateLinks?: { url: string; network: string; confidence: string; verified?: boolean }[];
+    competitorPromoted?: string | null;
+    /** How the email was obtained: "page:mailto" | "page" | "pattern-guess" | null. */
+    contactSource?: string | null;
+    /** Contact emails extracted from the real fetched page (unverified candidates). */
+    contactEmails?: { email: string; source: string }[];
+    pageUrl?: string | null;
+  } | null;
   createdAt: Timestamp;
   updatedAt: Timestamp;
 }
@@ -293,15 +311,22 @@ export interface ProspectSource {
 export interface ProspectSignal {
   id: Id;
   prospectId: Id;
+  /** Topical relevance 0..1 (embedding similarity). Real-ish. */
   relevance: number;
-  reach: number;
-  da: number;
-  engagement: number;
+  /** Has a HIGH-confidence (named-network) affiliate link. */
   isAffiliate: boolean;
+  /** Promotes a competitor with a TRUSTWORTHY (verified/high-confidence) link. */
   promotesCompetitor: boolean;
+  /** Commercial-intent score 0..1 from real page text. */
   intent: number;
+  /** Verified deliverable email on file. */
   verifiedEmail: boolean;
-  audienceOverlap: number;
+  // ---- Provider-required signals. null = UNKNOWN (no provider wired). Never
+  // invented; excluded from scoring and lowering confidence when null. ----------
+  reach: number | null;
+  da: number | null;
+  engagement: number | null;
+  audienceOverlap: number | null;
 }
 
 export interface OutreachCampaign {

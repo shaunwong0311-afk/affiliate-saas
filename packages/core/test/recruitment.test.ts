@@ -10,6 +10,7 @@ import {
   IllegalTransitionError,
   detectAffiliateUrl,
   detectAffiliateLinksInHtml,
+  hasProvenAffiliateSignal,
   promotesCompetitor,
   assessFraud,
   hasSponsorCycle,
@@ -56,6 +57,52 @@ describe("scoring", () => {
   });
 });
 
+describe("scoring with unknown (un-provided) signals", () => {
+  // reach / domainAuthority / engagement / audienceOverlap are null — no SEO,
+  // creator-analytics, or audience provider is wired. They must be EXCLUDED, not
+  // invented, and confidence must drop accordingly.
+  const partial: ScoringSignals = {
+    relevance: 0.8,
+    runsAffiliateLinks: true,
+    promotesCompetitor: true,
+    commercialIntent: 0.7,
+    contactable: true,
+    reach: null,
+    domainAuthority: null,
+    engagementRate: null,
+    audienceOverlap: null,
+  };
+
+  it("reports the unknown factors and lowers confidence below 1", () => {
+    const res = scoreProspect(partial);
+    expect(res.unknownFactors).toEqual(expect.arrayContaining(["reach", "quality", "audienceOverlap"]));
+    expect(res.confidence).toBeGreaterThan(0);
+    expect(res.confidence).toBeLessThan(1);
+  });
+
+  it("never invents values — unknown factors contribute exactly 0 points", () => {
+    const res = scoreProspect(partial);
+    const unknownPts = res.breakdown
+      .filter((b) => ["reach", "quality", "audienceOverlap"].includes(b.factor))
+      .reduce((s, b) => s + b.contribution, 0);
+    expect(unknownPts).toBe(0);
+  });
+
+  it("still ranks a strong prospect well on the KNOWN signals alone", () => {
+    // High relevance + competitor promotion + intent + contactable should clear B-tier
+    // even with all provider signals missing.
+    const res = scoreProspect(partial);
+    expect(res.score).toBeGreaterThan(0);
+    expect(["A", "B"]).toContain(res.tier);
+  });
+
+  it("reaches full confidence only when every signal is known", () => {
+    const res = scoreProspect({ ...partial, reach: 100_000, domainAuthority: 60, engagementRate: 0.05, audienceOverlap: 0.7 });
+    expect(res.confidence).toBe(1);
+    expect(res.unknownFactors).toEqual([]);
+  });
+});
+
 describe("prospect state machine", () => {
   it("allows the happy path", () => {
     expect(canTransition("discovered", "enriched")).toBe(true);
@@ -85,9 +132,16 @@ describe("affiliate-link detection", () => {
     expect(s[0]!.network).toBe("Amazon Associates");
   });
 
-  it("detects generic ?ref= params", () => {
+  it("detects generic ?ref= params but marks them LOW confidence", () => {
     const s = detectAffiliateUrl("https://competitor.com/buy?ref=joe123");
     expect(s.some((x) => x.network.includes("Generic"))).toBe(true);
+    expect(s.every((x) => x.confidence === "low")).toBe(true);
+  });
+
+  it("marks named networks HIGH confidence", () => {
+    const s = detectAffiliateUrl("https://amzn.to/3abc?tag=mysite-20");
+    expect(s[0]!.confidence).toBe("high");
+    expect(hasProvenAffiliateSignal(s)).toBe(true);
   });
 
   it("detects ShareASale and Impact", () => {
@@ -95,12 +149,25 @@ describe("affiliate-link detection", () => {
     expect(detectAffiliateUrl("https://goto.7eer.net/c/123/456/789").length).toBeGreaterThan(0);
   });
 
-  it("extracts and classifies links in HTML and matches competitors", () => {
+  it("counts a link that points DIRECTLY at the competitor's domain", () => {
+    // The destination is in the URL — no redirect ambiguity — so it counts even
+    // though the ?ref= itself is low confidence.
     const html = `<a href="https://www.competitor.com/p?ref=abc">buy</a><a href="https://example.com">x</a>`;
     const signals = detectAffiliateLinksInHtml(html);
     expect(signals.length).toBeGreaterThan(0);
     expect(promotesCompetitor(signals, ["competitor.com"])).toBe(true);
     expect(promotesCompetitor(signals, ["other.com"])).toBe(false);
+  });
+
+  it("does NOT assume a THIRD-PARTY redirector lands on the competitor (no false positive)", () => {
+    // A generic ?ref= on someone else's tracking domain — we don't know where it
+    // lands. It must NOT count until a redirect resolver confirms the destination.
+    const [sig] = detectAffiliateUrl("https://link.tracker.io/go/deal?ref=abc");
+    expect(sig!.confidence).toBe("low");
+    expect(promotesCompetitor([sig!], ["competitor.com"])).toBe(false);
+    // After the redirect resolver confirms the final host → counted.
+    const resolved = { ...sig!, verified: true, resolvedHost: "competitor.com" };
+    expect(promotesCompetitor([resolved], ["competitor.com"])).toBe(true);
   });
 });
 

@@ -67,17 +67,6 @@ function safeHost(url: string): string | null {
   }
 }
 
-/** Build a deterministic page whose outbound links carry affiliate signatures. */
-function syntheticPage(host: string, competitors: string[]): string {
-  const comp = competitors[0] ?? "competitor.com";
-  const links = [
-    `<a href="https://${comp}/buy?ref=${host.split(".")[0]}">check price</a>`,
-    `<a href="https://amzn.to/3xyz?tag=${host.split(".")[0]}-20">on Amazon</a>`,
-    `<a href="https://shareasale.com/r.cfm?u=111&m=222&urllink=${comp}">deal</a>`,
-  ].join("\n");
-  return `<html><body><h1>Best picks</h1>${links}</body></html>`;
-}
-
 /**
  * SERP discovery: buyer-intent queries → result pages → affiliate-link detection.
  * This is the headline "find from scratch" source. Real in production (SERP API +
@@ -85,10 +74,14 @@ function syntheticPage(host: string, competitors: string[]): string {
  */
 export class SerpDiscoverySource implements DiscoverySource {
   readonly sourceType = "serp_mining";
+  /** True when wired with deterministic providers (no real web data). */
+  readonly synthetic: boolean;
   constructor(
     private readonly serp: SerpProvider = new DeterministicSerpProvider(),
     private readonly fetcher: HttpFetcher = new DeterministicFetcher(),
-  ) {}
+  ) {
+    this.synthetic = serp.kind === "deterministic-serp" || fetcher.kind === "deterministic";
+  }
 
   async discover(query: DiscoveryQuery): Promise<RawCandidate[]> {
     const niche = query.niche || "products";
@@ -118,18 +111,21 @@ export class SerpDiscoverySource implements DiscoverySource {
         if (!host || seen.has(host)) continue;
         seen.add(host);
 
-        // Fetch the page and run the REAL affiliate-link detector over it.
+        // Fetch the page and run the REAL affiliate-link detector over it. On a
+        // failed/short fetch we record ZERO affiliate links — we never fabricate
+        // them (fabrication would create false positives even with a real SERP).
         let signals: AffiliateSignal[] = [];
-        let outboundLinks: string[] = [];
+        let pageHtml: string | null = null;
+        let fetched = false;
         try {
           const page = await this.fetcher.get(hit.url);
-          const html = page.html && page.html.length > 60 ? page.html : syntheticPage(host, competitors);
-          signals = detectAffiliateLinksInHtml(html);
-          outboundLinks = signals.map((s) => s.url);
+          if (page.status >= 200 && page.status < 300 && page.html && page.html.length > 200) {
+            pageHtml = page.html;
+            signals = detectAffiliateLinksInHtml(page.html);
+            fetched = true;
+          }
         } catch {
-          const html = syntheticPage(host, competitors);
-          signals = detectAffiliateLinksInHtml(html);
-          outboundLinks = signals.map((s) => s.url);
+          /* leave fetched=false, no links */
         }
 
         out.push({
@@ -138,8 +134,12 @@ export class SerpDiscoverySource implements DiscoverySource {
           channelUrl: null,
           sourceType: this.sourceType,
           evidenceUrl: hit.url,
-          evidenceSummary: `Ranks for "${q}"; ${signals.length} affiliate link(s) detected on page. ${hit.snippet}`,
-          outboundLinks,
+          evidenceSummary: fetched
+            ? `Ranks for "${q}"; ${signals.length} affiliate link(s) detected on page. ${hit.snippet}`
+            : `Ranks for "${q}" — page not fetched (no affiliate evidence collected). ${hit.snippet}`,
+          outboundLinks: signals.map((s) => s.url),
+          pageHtml,
+          synthetic: this.synthetic,
         });
       }
     }
@@ -200,6 +200,7 @@ export class DbCustomerMiningSource implements DiscoverySource {
         evidenceSummary: `Repeat buyer: ${agg.count} orders, $${(agg.spendCents / 100).toFixed(0)} lifetime spend — high product affinity.`,
         outboundLinks: [],
         reachHint: Math.min(50_000, agg.spendCents),
+        synthetic: false, // real first-party order data
       });
     }
     return out;

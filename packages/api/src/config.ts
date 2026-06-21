@@ -11,6 +11,13 @@ export interface AppConfig {
   isProduction: boolean;
   /** Outside production, magic-link tokens are returned in the response for dev convenience. */
   exposeMagicLink: boolean;
+  /**
+   * Whether deterministic/synthetic discovery sources (which fabricate demo
+   * prospects) are allowed to run. Default: true outside production, FALSE in
+   * production — so a deployed instance never invents affiliates. Can be forced on
+   * with ALLOW_SYNTHETIC_DISCOVERY=true (e.g. a sales demo) or off in dev.
+   */
+  allowSyntheticDiscovery: boolean;
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
@@ -29,5 +36,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     corsOrigins: (env.CORS_ORIGINS ?? "http://localhost:5173").split(","),
     isProduction,
     exposeMagicLink: !isProduction,
+    allowSyntheticDiscovery:
+      env.ALLOW_SYNTHETIC_DISCOVERY != null ? env.ALLOW_SYNTHETIC_DISCOVERY === "true" : !isProduction,
   };
 }

@@ -16,18 +16,21 @@ export interface ScoringSignals {
   runsAffiliateLinks: boolean;
   /** Already promotes a DIRECT competitor — the strongest predictor. */
   promotesCompetitor: boolean;
-  /** Audience size (raw count; log-normalized internally). */
-  reach: number;
-  /** Domain authority 0..100. */
-  domainAuthority: number;
-  /** Engagement rate 0..1 (weighted over raw follower count). */
-  engagementRate: number;
   /** Produces reviews / comparisons / "best of" — high commercial intent (0..1). */
   commercialIntent: number;
   /** Verified email or a clear contact path. */
   contactable: boolean;
-  /** Geo / language / demographic alignment with the merchant's customers (0..1). */
-  audienceOverlap: number;
+  // ---- Signals that REQUIRE a real data provider. `null` = unknown (a provider
+  // isn't wired). Unknown signals are EXCLUDED from the score and lower confidence
+  // — they are never invented. ----------------------------------------------
+  /** Audience size (raw count; log-normalized internally). null if unknown. */
+  reach: number | null;
+  /** Domain authority 0..100. null if no SEO provider (Ahrefs/Similarweb) is wired. */
+  domainAuthority: number | null;
+  /** Engagement rate 0..1. null if no creator-analytics provider is wired. */
+  engagementRate: number | null;
+  /** Geo / language / demographic alignment 0..1. null if no audience data. */
+  audienceOverlap: number | null;
 }
 
 export interface ScoringWeights {
@@ -60,11 +63,19 @@ export interface ScoreContribution {
 }
 
 export interface ScoreResult {
-  score: number; // 0..100
+  score: number; // 0..100, computed over the KNOWN signals only
   tier: Tier;
   breakdown: ScoreContribution[];
   /** Human-readable reasons for the explainability UX (Section 8.8). */
   explanation: string[];
+  /**
+   * 0..1 — share of the scoring weight backed by REAL signals (not unknown). Low
+   * confidence means most signals are missing (no SEO/audience data wired), so the
+   * tier is provisional. The UI should surface this, not just the tier.
+   */
+  confidence: number;
+  /** Factors that could not be scored because their data provider isn't wired. */
+  unknownFactors: string[];
 }
 
 export interface TierThresholds {
@@ -96,37 +107,52 @@ export function scoreProspect(
   thresholds: TierThresholds = defaultTierThresholds,
 ): ScoreResult {
   const propensity = affiliatePropensity(signals);
-  const quality = clamp01((clamp01(signals.domainAuthority / 100) + clamp01(signals.engagementRate)) / 2);
 
-  const factors: Array<{ factor: string; weight: number; normalized: number; note: string }> = [
+  // `normalized: null` means the signal is UNKNOWN (no provider). Unknown factors
+  // are dropped from the weighted sum and the weights renormalized over what's
+  // known — the score is never inflated by invented data.
+  const da = signals.domainAuthority;
+  const eng = signals.engagementRate;
+  const quality =
+    da == null && eng == null
+      ? null
+      : clamp01(((da != null ? clamp01(da / 100) : 0) + (eng != null ? clamp01(eng) : 0)) / ((da != null ? 1 : 0) + (eng != null ? 1 : 0)));
+
+  const factors: Array<{ factor: string; weight: number; normalized: number | null; note: string }> = [
     { factor: "relevance", weight: weights.relevance, normalized: clamp01(signals.relevance), note: "topical match (embedding similarity)" },
     { factor: "affiliatePropensity", weight: weights.affiliatePropensity, normalized: propensity.value, note: propensity.note },
-    { factor: "reach", weight: weights.reach, normalized: normalizeReach(signals.reach), note: `audience ≈ ${signals.reach.toLocaleString()}` },
-    { factor: "quality", weight: weights.quality, normalized: quality, note: `DA ${signals.domainAuthority}, engagement ${(signals.engagementRate * 100).toFixed(0)}%` },
+    { factor: "reach", weight: weights.reach, normalized: signals.reach == null ? null : normalizeReach(signals.reach), note: signals.reach == null ? "reach unknown (no provider)" : `audience ≈ ${signals.reach.toLocaleString()}` },
+    { factor: "quality", weight: weights.quality, normalized: quality, note: quality == null ? "DA/engagement unknown (no provider)" : `DA ${da ?? "?"}, engagement ${eng != null ? (eng * 100).toFixed(0) + "%" : "?"}` },
     { factor: "commercialIntent", weight: weights.commercialIntent, normalized: clamp01(signals.commercialIntent), note: "produces reviews/comparisons/best-of" },
     { factor: "contactability", weight: weights.contactability, normalized: signals.contactable ? 1 : 0, note: signals.contactable ? "verified contact path" : "no verified contact" },
-    { factor: "audienceOverlap", weight: weights.audienceOverlap, normalized: clamp01(signals.audienceOverlap), note: "geo/language/demographic alignment" },
+    { factor: "audienceOverlap", weight: weights.audienceOverlap, normalized: signals.audienceOverlap == null ? null : clamp01(signals.audienceOverlap), note: signals.audienceOverlap == null ? "audience overlap unknown (no provider)" : "geo/language/demographic alignment" },
   ];
 
-  const weightSum = factors.reduce((s, f) => s + f.weight, 0) || 1;
+  const known = factors.filter((f) => f.normalized != null);
+  const knownWeight = known.reduce((s, f) => s + f.weight, 0) || 1;
+  const totalWeight = factors.reduce((s, f) => s + f.weight, 0) || 1;
+
   const breakdown: ScoreContribution[] = factors.map((f) => {
-    const contribution = (f.weight / weightSum) * f.normalized * 100;
-    return { factor: f.factor, weight: f.weight, normalized: f.normalized, contribution, note: f.note };
+    const contribution = f.normalized == null ? 0 : (f.weight / knownWeight) * f.normalized * 100;
+    return { factor: f.factor, weight: f.weight, normalized: f.normalized ?? 0, contribution, note: f.note };
   });
 
-  let score = Math.round(breakdown.reduce((s, b) => s + b.contribution, 0));
+  const score = Math.round(breakdown.reduce((s, b) => s + b.contribution, 0));
+  const confidence = knownWeight / totalWeight;
 
   // Contactability gate: an un-contactable prospect cannot be reached, so it can
   // never be A-tier regardless of fit.
   let tier: Tier = score >= thresholds.a ? "A" : score >= thresholds.b ? "B" : "C";
   if (!signals.contactable && tier === "A") tier = "B";
 
+  const unknownFactors = factors.filter((f) => f.normalized == null).map((f) => f.factor);
   const explanation = breakdown
     .filter((b) => b.contribution > 0)
     .sort((a, b) => b.contribution - a.contribution)
     .map((b) => `${b.factor}: ${b.note} (+${b.contribution.toFixed(1)})`);
+  if (unknownFactors.length) explanation.push(`unknown (no data provider): ${unknownFactors.join(", ")}`);
 
-  return { score, tier, breakdown, explanation };
+  return { score, tier, breakdown, explanation, confidence, unknownFactors };
 }
 
 /**

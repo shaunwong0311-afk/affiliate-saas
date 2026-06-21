@@ -47,6 +47,9 @@ export interface CycleSummary {
   status: string;
   sourced: number;
   scored: number;
+  /** Of `sourced`, how many came from real vs synthetic (demo) sources. */
+  real: number;
+  synthetic: number;
   autoSent: number;
   followUpsSent: number;
   heldForReview: number;
@@ -58,7 +61,7 @@ export interface CycleSummary {
 export async function autonomousCycle(deps: RecruitmentDeps, merchantId: string): Promise<CycleSummary> {
   const state = await getAutomationState(deps, merchantId);
   const now = deps.clock.now();
-  const empty: CycleSummary = { status: state.status, sourced: 0, scored: 0, autoSent: 0, followUpsSent: 0, heldForReview: 0, circuitOpen: false, prunedSources: [] };
+  const empty: CycleSummary = { status: state.status, sourced: 0, scored: 0, real: 0, synthetic: 0, autoSent: 0, followUpsSent: 0, heldForReview: 0, circuitOpen: false, prunedSources: [] };
   if (state.status !== "running") return empty;
 
   const pruned = await lowYieldSources(deps, merchantId);
@@ -101,6 +104,8 @@ export async function autonomousCycle(deps: RecruitmentDeps, merchantId: string)
     status: state.status,
     sourced: sourcing.discovered,
     scored: sourcing.scored,
+    real: sourcing.real,
+    synthetic: sourcing.synthetic,
     autoSent,
     followUpsSent,
     heldForReview,

@@ -55,6 +55,7 @@ export class CompetitorAffiliateSource implements DiscoverySource {
         evidenceSummary: `Ranks for "best ${query.niche}" and "${competitor} review"; outbound affiliate links to ${competitor}.`,
         outboundLinks: links,
         reachHint: Math.floor(2000 + rand() * 400_000),
+        synthetic: true,
       });
     }
     return out;
@@ -81,6 +82,7 @@ export class CreatorDiscoverySource implements DiscoverySource {
         evidenceSummary: `Covers ${query.niche}; description ${promotes ? "contains affiliate links" : "lists a business email"}.`,
         outboundLinks: promotes ? [`https://${slug}.com/recommends/gear?ref=yt`] : [],
         reachHint: Math.floor(500 + rand() * 200_000),
+        synthetic: true,
       });
     }
     return out;
@@ -105,6 +107,7 @@ export class CustomerMiningSource implements DiscoverySource {
         evidenceSummary: `Repeat buyer, high NPS; ${rand() > 0.5 ? "runs a niche blog" : "active on social"}.`,
         outboundLinks: [],
         reachHint: Math.floor(100 + rand() * 20_000),
+        synthetic: true,
       });
     }
     return out;
