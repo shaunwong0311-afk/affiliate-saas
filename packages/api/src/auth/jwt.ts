@@ -6,7 +6,7 @@ import { createHmac, timingSafeEqual, randomBytes, scryptSync } from "node:crypt
  * `affiliate` portal tokens, discriminated by the `kind` claim.
  */
 
-export type PrincipalKind = "user" | "affiliate";
+export type PrincipalKind = "user" | "affiliate" | "affiliate_magic";
 
 export interface JwtClaims {
   sub: string; // user id or affiliate id

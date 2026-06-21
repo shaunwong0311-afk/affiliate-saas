@@ -116,10 +116,22 @@ function safeDestination(to: string | null, link: ResolvedLink): string | null {
     return null;
   }
   if (url.protocol !== "https:" && url.protocol !== "http:") return null;
+  const host = url.hostname.replace(/^www\./, "");
   const allowed = link.allowedHosts;
   if (allowed && allowed.length > 0) {
-    const host = url.hostname.replace(/^www\./, "");
+    // Explicit allowlist configured — must match it.
     if (!allowed.some((h) => host === h || host.endsWith(`.${h}`))) return null;
+    return url.toString();
   }
-  return url.toString();
+  // No allowlist: closed by default — only permit a deep link on the SAME host as
+  // the link's own destination. Otherwise it's an open redirect.
+  const destHost = (() => {
+    try {
+      return new URL(link.destinationUrl).hostname.replace(/^www\./, "");
+    } catch {
+      return null;
+    }
+  })();
+  if (destHost && (host === destHost || host.endsWith(`.${destHost}`))) return url.toString();
+  return null;
 }

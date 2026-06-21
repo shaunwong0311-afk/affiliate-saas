@@ -4,9 +4,10 @@ import type { ApiKey, WebhookSubscription } from "@affiliate/db";
 import type { RouteModule } from "./helpers.js";
 import { parseBody, ok } from "./helpers.js";
 import { requireMerchant } from "../auth/middleware.js";
-import { notFound } from "../errors.js";
+import { notFound, badRequest } from "../errors.js";
 import { generateApiKey } from "../auth/jwt.js";
 import { writeAudit } from "../services/audit.js";
+import { isPublicWebhookUrl } from "../services/webhooks.js";
 
 /**
  * Section 9 — Developer surface: scoped API keys and outbound webhook
@@ -95,6 +96,8 @@ export const developerRoutes: RouteModule = (app, ctx) => {
       }),
       request,
     );
+    // SSRF: reject internal/private webhook targets at creation time.
+    if (!isPublicWebhookUrl(body.url)) throw badRequest("webhook url must be a public http(s) endpoint");
     const sub: WebhookSubscription = {
       id: newId("whs"),
       merchantId,

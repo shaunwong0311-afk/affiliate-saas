@@ -77,8 +77,14 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }
 
   async function affiliateLogin(email: string) {
-    const res = await api.post<{ token: string }>("/auth/affiliate/token", { email });
-    setToken(res.token);
+    // Secure flow: request a magic link delivered to the affiliate's inbox. In dev
+    // the API returns the token so the demo completes without a real mailbox.
+    const res = await api.post<{ sent: boolean; devToken?: string }>("/auth/affiliate/request-link", { email });
+    if (!res.devToken) {
+      throw new Error("Check your email for a sign-in link (expires in 15 min).");
+    }
+    const verified = await api.post<{ token: string }>("/auth/affiliate/verify", { token: res.devToken });
+    setToken(verified.token);
     setMerchant(null);
     setActive(null);
     await refresh();

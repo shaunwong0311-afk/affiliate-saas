@@ -1,5 +1,6 @@
 import { z } from "zod";
-import { signPostback, type PostbackPayload } from "@affiliate/core";
+import { newId, signPostback, type PostbackPayload } from "@affiliate/core";
+import type { Suppression } from "@affiliate/db";
 import type { RouteModule } from "./helpers.js";
 import { parseBody, ok } from "./helpers.js";
 import { requireMerchant } from "../auth/middleware.js";
@@ -8,6 +9,33 @@ import { ingestOrder, mintClickId, writeClick, resolveTrackingCode } from "../se
 import { reverseOrder } from "../services/reversal.js";
 
 export const ingestionRoutes: RouteModule = (app, ctx) => {
+  // ---- Public one-click unsubscribe (the link in every outreach email) ------
+  // Honored globally across all merchants, per CAN-SPAM / bulk-sender rules.
+  app.get("/track/unsubscribe", async (request, reply) => {
+    const q = request.query as { e?: string; m?: string };
+    const email = (q.e ?? "").toLowerCase();
+    if (!email || !email.includes("@")) {
+      return reply.type("text/html").send("<p>Invalid unsubscribe link.</p>");
+    }
+    const existing = await ctx.db.suppressions.findOne((s) => s.scope === "global" && s.email?.toLowerCase() === email);
+    if (!existing) {
+      const supp: Suppression = {
+        id: newId("supp"),
+        merchantId: null,
+        email,
+        domain: null,
+        reason: "unsubscribe",
+        scope: "global",
+        ts: ctx.clock.now().toISOString(),
+      };
+      await ctx.db.suppressions.insert(supp);
+    }
+    // Also flip any matching prospect to suppressed.
+    const prospects = await ctx.db.prospects.find((p) => p.email?.toLowerCase() === email);
+    for (const p of prospects) await ctx.db.prospects.update(p.id, { state: "suppressed", suppressionStatus: "suppressed" });
+    return reply.type("text/html").send(`<p>You've been unsubscribed. You won't receive further emails.</p>`);
+  });
+
   // ---- Public signed S2S postback (Section 6) -------------------------------
   // The robust conversion path: HMAC-signed with the per-merchant secret.
   app.post("/track/postback/:merchantId", async (request, reply) => {

@@ -181,23 +181,44 @@ export const integrationRoutes: RouteModule = (app, ctx) => {
     return ok(reply, domain, 201);
   });
 
+  // REAL DNS verification — fails closed. We perform actual TXT lookups and only
+  // mark a record verified when it genuinely exists; we never claim "verified"
+  // without checking. (DKIM needs a selector to look up, so it stays pending until
+  // a selector is configured.)
   app.post("/sending-domains/:id/verify", async (request, reply) => {
     const { merchantId } = await requireMerchant(ctx, request, "admin");
     const id = (request.params as { id: string }).id;
     const domain = await ctx.db.sendingDomains.get(id);
     if (!domain || domain.merchantId !== merchantId) throw notFound("sending domain");
+
+    const spfOk = await hasTxtRecord(domain.domain, (v) => v.toLowerCase().startsWith("v=spf1"));
+    const dmarcOk = await hasTxtRecord(`_dmarc.${domain.domain}`, (v) => v.toLowerCase().startsWith("v=dmarc1"));
+
     const updated = await ctx.db.sendingDomains.update(id, {
-      spfStatus: "verified",
-      dkimStatus: "verified",
-      dmarcStatus: "verified",
+      spfStatus: spfOk ? "verified" : "failed",
+      dmarcStatus: dmarcOk ? "verified" : "failed",
+      // DKIM verification requires the selector; not configured → remains pending.
+      dkimStatus: "pending",
     });
     await writeAudit(ctx, {
       merchantId,
       actorId: null,
-      action: "sending_domain.verified",
+      action: "sending_domain.verify_attempted",
       subjectType: "sending_domain",
       subjectId: id,
+      metadata: { spfOk, dmarcOk },
     });
     return ok(reply, updated);
   });
 };
+
+/** Real DNS TXT lookup. Returns false on any error (fail closed). */
+async function hasTxtRecord(host: string, predicate: (value: string) => boolean): Promise<boolean> {
+  try {
+    const dns = await import("node:dns/promises");
+    const records = await dns.resolveTxt(host);
+    return records.some((chunks) => predicate(chunks.join("")));
+  } catch {
+    return false;
+  }
+}

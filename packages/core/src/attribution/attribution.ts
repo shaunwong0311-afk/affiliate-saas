@@ -90,10 +90,16 @@ export function resolveAttribution(inputs: AttributionInputs): AttributionResult
 
   if (chosen === "code" && code) {
     const rel = code.match.relationship;
+    // Pick an active offer in the RELATIONSHIP's program (not the merchant's first
+    // offer) so multi-program merchants attribute the code to the correct program.
+    const offerId = offerInProgram(inputs, rel.programId);
+    if (!offerId) {
+      return { attribution: null, reason: "code matched but no offer in its program" };
+    }
     return {
       attribution: {
         affiliateId: rel.affiliateId,
-        offerId: firstActiveOfferId(inputs) ?? rel.programId,
+        offerId,
         mechanism: "code",
         clickId: null,
         codeId: code.match.code.id,
@@ -155,9 +161,13 @@ function withinWindow(click: Click, orderTs: number, offersById: Map<Id, Offer>)
   return orderTs - clickTs <= windowMs;
 }
 
-function firstActiveOfferId(inputs: AttributionInputs): Id | null {
+/** Select an active offer belonging to a specific program (for code attribution). */
+function offerInProgram(inputs: AttributionInputs, programId: Id): Id | null {
+  let fallback: Id | null = null;
   for (const offer of inputs.offersById.values()) {
+    if (offer.programId !== programId) continue;
     if (offer.status === "active") return offer.id;
+    fallback ??= offer.id;
   }
-  return inputs.offersById.size > 0 ? [...inputs.offersById.values()][0]!.id : null;
+  return fallback;
 }

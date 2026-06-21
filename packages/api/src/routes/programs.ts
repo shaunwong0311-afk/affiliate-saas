@@ -16,9 +16,11 @@ const programSchema = z.object({
   holdDays: z.number().int().min(0).max(180).default(14),
 });
 
-const offerSchema = z.object({
+const offerBaseSchema = z.object({
   name: z.string().min(1),
-  engine: z.enum(["affiliate", "mlm"]).default("affiliate"),
+  // The MLM engine is a deliberate stub (it produces no commissions). Reject
+  // creating MLM offers rather than silently generating zero commissions.
+  engine: z.literal("affiliate").default("affiliate"),
   payoutType: z.enum(["percentage", "flat"]),
   payoutValue: z.number().min(0),
   currency: z.string().length(3).default("USD"),
@@ -28,6 +30,16 @@ const offerSchema = z.object({
   bonuses: z.array(z.any()).default([]),
   overridePolicy: z.any().nullish(),
 });
+
+const offerSchema = offerBaseSchema
+  .refine((o) => o.payoutType !== "percentage" || (o.payoutValue > 0 && o.payoutValue <= 1), {
+    message: "percentage payoutValue must be a decimal in (0, 1] — e.g. 0.2 for 20%",
+    path: ["payoutValue"],
+  })
+  .refine((o) => o.payoutType !== "flat" || Number.isInteger(o.payoutValue), {
+    message: "flat payoutValue must be an integer number of cents",
+    path: ["payoutValue"],
+  });
 
 export const programRoutes: RouteModule = (app, ctx) => {
   app.get("/programs", async (request, reply) => {
@@ -114,7 +126,7 @@ export const programRoutes: RouteModule = (app, ctx) => {
     const offerId = (request.params as { offerId: string }).offerId;
     const offer = await ctx.db.offers.get(offerId);
     if (!offer || offer.merchantId !== merchantId) throw notFound("offer");
-    const body = parseBody(offerSchema.partial().extend({ status: z.enum(["active", "paused"]).optional() }), request);
+    const body = parseBody(offerBaseSchema.partial().extend({ status: z.enum(["active", "paused"]).optional() }), request);
     const updated = await ctx.db.offers.update(offerId, body as Partial<Offer>);
     return ok(reply, updated);
   });

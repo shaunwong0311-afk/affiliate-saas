@@ -3,10 +3,11 @@ import { newId } from "@affiliate/core";
 import { randomBytes } from "node:crypto";
 import type { RouteModule } from "./helpers.js";
 import { parseBody, ok } from "./helpers.js";
-import { signJwt, hashPassword, verifyPassword } from "../auth/jwt.js";
+import { signJwt, verifyJwt, hashPassword, verifyPassword } from "../auth/jwt.js";
 import { requirePrincipal } from "../auth/middleware.js";
 import { badRequest, unauthorized, conflict } from "../errors.js";
 import { writeAudit } from "../services/audit.js";
+import { publicUser } from "../sanitize.js";
 
 const signupSchema = z.object({
   email: z.string().email(),
@@ -86,11 +87,53 @@ export const authRoutes: RouteModule = (app, ctx) => {
     });
   });
 
-  // ---- Affiliate portal token (demo: email-based; prod uses magic link) -----
-  app.post("/auth/affiliate/token", async (request, reply) => {
+  // ---- Accept a team invite (password-less invitee sets a password) ---------
+  app.post("/auth/accept-invite", async (request, reply) => {
+    const body = parseBody(loginSchema.extend({ password: z.string().min(8) }), request);
+    const user = await ctx.db.users.findOne((u) => u.email.toLowerCase() === body.email.toLowerCase());
+    if (!user) throw unauthorized("no pending invite for that email");
+    if (user.passwordHash !== "") throw conflict("account already active — use sign in");
+    await ctx.db.users.update(user.id, { passwordHash: hashPassword(body.password) });
+    // Activate any invited memberships.
+    const invited = await ctx.db.merchantUsers.find((m) => m.userId === user.id && m.status === "invited");
+    for (const m of invited) await ctx.db.merchantUsers.update(m.id, { status: "active" });
+    const token = signJwt({ sub: user.id, kind: "user", email: user.email }, ctx.config.jwtSecret);
+    return ok(reply, { token, user: publicUser({ ...user, passwordHash: "" }), merchants: invited.map((m) => ({ merchantId: m.merchantId, role: m.role })) });
+  });
+
+  // ---- Affiliate portal login: MAGIC LINK (not email-only) ------------------
+  // Knowing an affiliate's email must NOT grant a session. We email a short-lived,
+  // single-purpose link to the affiliate's own inbox; only someone who controls
+  // that inbox can complete login. Always returns 200 (no account enumeration).
+  app.post("/auth/affiliate/request-link", async (request, reply) => {
     const body = parseBody(z.object({ email: z.string().email() }), request);
     const affiliate = await ctx.db.affiliates.findOne((a) => a.primaryEmail.toLowerCase() === body.email.toLowerCase());
-    if (!affiliate) throw unauthorized("no affiliate with that email");
+    if (affiliate) {
+      // 15-minute, magic-only token — rejected by the session resolver.
+      const magic = signJwt({ sub: affiliate.id, kind: "affiliate_magic", email: affiliate.primaryEmail }, ctx.config.jwtSecret, 900);
+      const link = `${ctx.config.corsOrigins[0] ?? "http://localhost:5173"}/#/portal/verify?token=${magic}`;
+      await ctx.transactionalMailer.send({
+        from: "no-reply@vantage.dev",
+        to: affiliate.primaryEmail,
+        subject: "Your Vantage sign-in link",
+        text: `Sign in to your affiliate portal: ${link}\n\nThis link expires in 15 minutes.`,
+      });
+      // Dev only: return the token so the demo can complete login without a real
+      // inbox. Never exposed in production.
+      if (ctx.config.exposeMagicLink) {
+        return ok(reply, { sent: true, devToken: magic });
+      }
+    }
+    return ok(reply, { sent: true });
+  });
+
+  // Exchange a magic-link token for a real portal session token.
+  app.post("/auth/affiliate/verify", async (request, reply) => {
+    const body = parseBody(z.object({ token: z.string() }), request);
+    const claims = verifyJwt(body.token, ctx.config.jwtSecret);
+    if (!claims || claims.kind !== "affiliate_magic") throw unauthorized("invalid or expired link");
+    const affiliate = await ctx.db.affiliates.get(claims.sub);
+    if (!affiliate) throw unauthorized("invalid link");
     const token = signJwt({ sub: affiliate.id, kind: "affiliate", email: affiliate.primaryEmail }, ctx.config.jwtSecret);
     return ok(reply, { token, affiliate: { id: affiliate.id, name: affiliate.name } });
   });
@@ -101,7 +144,8 @@ export const authRoutes: RouteModule = (app, ctx) => {
     if (principal.kind === "user") {
       const user = await ctx.db.users.get(principal.userId!);
       const memberships = await ctx.db.merchantUsers.find((m) => m.userId === principal.userId && m.status === "active");
-      return ok(reply, { kind: "user", user, merchants: memberships.map((m) => ({ merchantId: m.merchantId, role: m.role })) });
+      // Never return passwordHash.
+      return ok(reply, { kind: "user", user: user ? publicUser(user) : null, merchants: memberships.map((m) => ({ merchantId: m.merchantId, role: m.role })) });
     }
     if (principal.kind === "affiliate") {
       const affiliate = await ctx.db.affiliates.get(principal.affiliateId!);

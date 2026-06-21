@@ -310,7 +310,9 @@ const GEO_GATED: ReadonlySet<string> = new Set([
 ]);
 
 function unsubscribeLink(merchantId: string, email: string): string {
-  return `https://track.vantage.dev/u/${merchantId.slice(-6)}?e=${encodeURIComponent(email)}`;
+  // Points at the API's real public unsubscribe endpoint (GET /track/unsubscribe).
+  const base = process.env.PUBLIC_API_URL ?? "http://localhost:8787";
+  return `${base}/track/unsubscribe?m=${encodeURIComponent(merchantId)}&e=${encodeURIComponent(email)}`;
 }
 
 function estimateDomainAuthority(domain: string | null): number {

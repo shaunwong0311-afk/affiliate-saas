@@ -23,7 +23,10 @@ export async function reverseOrder(ctx: AppContext, orderId: string, reason: str
   if (!conversion) return null;
 
   const originalEntries = await db.ledger.find((e) => e.conversionId === conversion.id && e.type !== "reversal");
-  const engine = ctx.engines.get(await offerEngineFor(ctx, conversion.affiliateId, order.merchantId));
+  // Route to the engine of the OFFER that produced this conversion (not the
+  // merchant's first offer) — correct for multi-program / multi-engine merchants.
+  const offer = await db.offers.get(conversion.offerId);
+  const engine = ctx.engines.get(offer?.engine ?? "affiliate");
 
   const reversalEvents = engine.onReversal({ order, originalEntries, reason, now });
 
@@ -43,14 +46,6 @@ export async function reverseOrder(ctx: AppContext, orderId: string, reason: str
   await emitWebhook(ctx, order.merchantId, "conversion.reversed", { conversionId: conversion.id, reason });
 
   return { conversionId: conversion.id, reversedEntries: reversedCount, reason };
-}
-
-async function offerEngineFor(ctx: AppContext, _affiliateId: string, merchantId: string): Promise<string> {
-  // In practice the engine is read from the offer that produced the conversion.
-  // Conversions don't store the offer directly here, so default to the merchant's
-  // first offer engine (affiliate). The engine seam makes this swap trivial.
-  const offer = await ctx.db.offers.findOne((o) => o.merchantId === merchantId);
-  return offer?.engine ?? "affiliate";
 }
 
 /** Approve a pending conversion out of the review queue and release its ledger entries. */

@@ -12,6 +12,9 @@
   "dependencies": {
     "@affiliate/core": "*"
   },
+  "optionalDependencies": {
+    "pg": "^8.13.1"
+  },
   "scripts": {
     "typecheck": "tsc -b"
   }

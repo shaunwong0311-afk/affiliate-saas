@@ -9,10 +9,11 @@ import {
   handleReply,
 } from "@affiliate/recruitment";
 import { parseInboundWebhook } from "@affiliate/integrations";
+import { verifyHmacSignature } from "@affiliate/core";
 import type { RouteModule } from "./helpers.js";
 import { parseBody, ok } from "./helpers.js";
 import { requireMerchant } from "../auth/middleware.js";
-import { notFound, badRequest } from "../errors.js";
+import { notFound, badRequest, unauthorized } from "../errors.js";
 import { writeAudit } from "../services/audit.js";
 
 const tier = z.enum(["A", "B", "C"]);
@@ -105,6 +106,12 @@ export const automationRoutes: RouteModule = (app, ctx) => {
     const merchantId = (request.params as { merchantId: string }).merchantId;
     const merchant = await ctx.db.merchants.get(merchantId);
     if (!merchant) throw notFound("merchant");
+    // Signed: HMAC-SHA256 of the raw body with the merchant's secret. Without this
+    // anyone could forge replies, globally suppress prospects, or create meetings.
+    const signature = (request.headers["x-vantage-signature"] as string) ?? null;
+    if (!verifyHmacSignature(request.rawBody ?? "", signature, merchant.postbackSecret)) {
+      throw unauthorized("invalid webhook signature");
+    }
     const inbound = parseInboundWebhook(request.body);
     if (!inbound) throw badRequest("unparseable reply payload");
     const prospect = await ctx.db.prospects.findOne(

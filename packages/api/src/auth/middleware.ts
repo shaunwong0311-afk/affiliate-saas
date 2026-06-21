@@ -44,7 +44,9 @@ export async function resolvePrincipal(ctx: AppContext, request: FastifyRequest)
   const claims = verifyJwt(token, ctx.config.jwtSecret);
   if (!claims) return null;
   if (claims.kind === "affiliate") return { kind: "affiliate", affiliateId: claims.sub, email: claims.email };
-  return { kind: "user", userId: claims.sub, email: claims.email };
+  if (claims.kind === "user") return { kind: "user", userId: claims.sub, email: claims.email };
+  // Any other kind (e.g. a single-use magic-link token) is NOT a valid session.
+  return null;
 }
 
 export function requirePrincipal(request: FastifyRequest): AuthPrincipal {

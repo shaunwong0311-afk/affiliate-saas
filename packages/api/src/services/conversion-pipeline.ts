@@ -1,8 +1,10 @@
+import { createHash } from "node:crypto";
 import {
   newId,
   resolveAttribution,
   assessFraud,
   hasSponsorCycle,
+  ipClickVelocity,
   commissionEventToEntry,
   type Attribution,
   type Click,
@@ -39,7 +41,21 @@ export interface IngestResult {
   fraud?: { score: number; decision: string; reasons: string[] };
 }
 
+/**
+ * Public entry: the entire order→conversion→ledger→overrides write set runs in ONE
+ * transaction, so a mid-pipeline failure can't leave partial financial state
+ * (order without ledger, override without commission, etc.). On Postgres this is a
+ * real BEGIN/COMMIT/ROLLBACK; the in-memory adapter is a passthrough.
+ *
+ * Note: dedup on (merchant, txn_id) is enforced by a unique index in the
+ * production schema (schema.sql) — the in-pipeline check is a fast path; the
+ * constraint is the race-safe backstop.
+ */
 export async function ingestNormalizedOrder(ctx: AppContext, normalized: NormalizedOrder): Promise<IngestResult> {
+  return ctx.db.transaction((db) => ingestImpl({ ...ctx, db }, normalized));
+}
+
+async function ingestImpl(ctx: AppContext, normalized: NormalizedOrder): Promise<IngestResult> {
   const { db, clock } = ctx;
   const now = clock.now();
   const incoming = normalized.order;
@@ -103,6 +119,7 @@ export async function ingestNormalizedOrder(ctx: AppContext, normalized: Normali
     clickId: attribution.clickId,
     orderId: order.id,
     affiliateId: attribution.affiliateId,
+    offerId: attribution.offerId, // route reversals to the right engine
     codeId: attribution.codeId,
     amountCents: order.amountCents,
     currency: order.currency,
@@ -209,10 +226,22 @@ async function persistCustomerAndOrder(ctx: AppContext, normalized: NormalizedOr
 }
 
 async function recentClicks(ctx: AppContext, order: Order): Promise<Click[]> {
-  // Fallback last-click pool: merchant clicks within the widest offer window.
-  const clicks = await ctx.db.clicks.find((c) => c.merchantId === order.merchantId);
+  // Last-click fallback must be scoped to THIS customer's clicks, never the whole
+  // merchant — crediting an unrelated customer's order to the merchant's most
+  // recent click is wrong attribution. We only have a reliable customer→click link
+  // when the click recorded the same customer ref, so scope to that. If there is
+  // no customer linkage, there is no safe fallback: attribution then relies on the
+  // deterministic click_id (carried through the funnel) or the code used at
+  // checkout — both of which are unambiguous.
+  if (!order.customerId) return [];
+  const customer = await ctx.db.customers.get(order.customerId);
+  const ref = customer?.externalCustomerId;
+  if (!ref) return [];
   const orderTs = new Date(order.ts).getTime();
-  return clicks.filter((c) => new Date(c.ts).getTime() <= orderTs).slice(-200);
+  const clicks = await ctx.db.clicks.find(
+    (c) => c.merchantId === order.merchantId && (c.sub1 === ref || c.sub2 === ref || c.sub3 === ref || c.sub4 === ref || c.sub5 === ref),
+  );
+  return clicks.filter((c) => new Date(c.ts).getTime() <= orderTs).slice(-50);
 }
 
 async function matchCodes(ctx: AppContext, order: Order): Promise<CodeMatch[]> {
@@ -336,21 +365,38 @@ async function assessOrderFraud(
   const byAffiliate = new Map(all.map((r) => [r.affiliateId, r]));
   const isCircular = hasSponsorCycle(relationship.affiliateId, (id) => byAffiliate.get(id)?.sponsorAffiliateId ?? null);
 
-  const reviewRule = order.country; // placeholder for geo-based review; not used directly
-  void reviewRule;
+  // Real self-referral: the converting affiliate is the buyer. Compare the
+  // affiliate's email hash to the customer's hashed email.
+  let isSelfReferral = false;
+  if (order.customerId) {
+    const customer = await ctx.db.customers.get(order.customerId);
+    const affiliate = await ctx.db.affiliates.get(attribution.affiliateId);
+    if (customer?.emailHash && affiliate?.primaryEmail) {
+      isSelfReferral = customer.emailHash === sha256Hex(affiliate.primaryEmail.trim().toLowerCase());
+    }
+  }
+
+  // IP velocity over a WINDOW (last hour), not all history.
+  const windowMs = 60 * 60 * 1000;
+  const ipClickCountInWindow = click?.ip ? ipClickVelocity(allClicks, click.ip, windowMs, ctx.clock.now()) : 0;
+
   const manualReviewOver = findManualReviewThreshold(ctx, attribution.offerId);
 
   const signals: FraudSignals = {
-    ipClickCountInWindow: click?.ip ? allClicks.filter((c) => c.ip === click.ip).length : 0,
-    ipIsDatacenter: false,
+    ipClickCountInWindow,
+    ipIsDatacenter: false, // requires an IP-intelligence provider (not configured)
     clickToConversionSeconds,
     affiliateReversalRate: reversalRate,
-    isSelfReferral: false,
+    isSelfReferral,
     isCircularSponsorship: isCircular,
     amountCents: order.amountCents,
     manualReviewOverCents: await manualReviewOver,
   };
   return assessFraud(signals);
+}
+
+function sha256Hex(value: string): string {
+  return createHash("sha256").update(value).digest("hex");
 }
 
 async function findManualReviewThreshold(ctx: AppContext, offerId: string): Promise<number | null> {

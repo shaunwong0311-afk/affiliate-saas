@@ -73,3 +73,14 @@ function constantTimeEqualHex(a: string, b: string): boolean {
     return false;
   }
 }
+
+/** HMAC-SHA256 of an arbitrary raw body (hex). Used to sign/verify inbound webhooks. */
+export function hmacHex(rawBody: string, secret: string): string {
+  return createHmac("sha256", secret).update(rawBody, "utf8").digest("hex");
+}
+
+/** Constant-time verification of a hex HMAC signature over a raw request body. */
+export function verifyHmacSignature(rawBody: string, signature: string | null | undefined, secret: string): boolean {
+  if (!signature) return false;
+  return constantTimeEqualHex(hmacHex(rawBody, secret), signature);
+}

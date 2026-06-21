@@ -3,7 +3,9 @@
  * merchant in localStorage and attaches them to every request. In dev, Vite
  * proxies `/api` → the origin API (Section 11 topology).
  */
-const BASE = "/api";
+// Configurable at build time. Dev uses the Vite proxy ("/api"); a Cloudflare
+// Pages / static deploy sets VITE_API_BASE to the API origin (e.g. https://api.you.com).
+const BASE = (import.meta.env.VITE_API_BASE as string | undefined) ?? "/api";
 
 export interface ApiError {
   message: string;

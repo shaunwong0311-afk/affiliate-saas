@@ -11,8 +11,13 @@ export type LedgerEntryType =
 /**
  * Ledger lifecycle. The ledger is append-only — balances are never mutated.
  * A reversal is a new entry that cancels a prior one (Section 4).
+ *
+ * `processing` means the entry has been claimed by a payout batch and is in
+ * flight to the rail — it is reserved out of the available balance so it cannot
+ * be claimed by a second batch (preventing double payment). On disburse success
+ * it becomes `paid`; on failure it returns to `approved`.
  */
-export type LedgerStatus = "pending" | "approved" | "paid" | "reversed";
+export type LedgerStatus = "pending" | "approved" | "processing" | "paid" | "reversed";
 
 export interface LedgerEntry {
   readonly id: Id;

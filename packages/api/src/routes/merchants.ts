@@ -7,6 +7,7 @@ import { requireMerchant, requirePrincipal } from "../auth/middleware.js";
 import { ROLE_RANK } from "../auth/rbac.js";
 import { notFound, forbidden } from "../errors.js";
 import { writeAudit } from "../services/audit.js";
+import { publicMerchant } from "../sanitize.js";
 import type { MerchantRole } from "@affiliate/db";
 
 /** A caller may never grant a role above their own rank (no privilege escalation). */
@@ -48,15 +49,23 @@ export const merchantRoutes: RouteModule = (app, ctx) => {
       const merchant = await ctx.db.merchants.get(m.merchantId);
       if (merchant) merchants.push(merchant);
     }
-    return ok(reply, merchants);
+    return ok(reply, merchants.map(publicMerchant));
   });
 
-  // ---- Single merchant ------------------------------------------------------
+  // ---- Single merchant (postbackSecret redacted) ----------------------------
   app.get("/merchants/:merchantId", async (request, reply) => {
     const { merchantId } = await requireMerchant(ctx, request, "read");
     const merchant = await ctx.db.merchants.get(merchantId);
     if (!merchant) throw notFound("merchant");
-    return ok(reply, merchant);
+    return ok(reply, publicMerchant(merchant));
+  });
+
+  // The postback secret is sensitive — only admins+ can reveal it.
+  app.get("/merchants/:merchantId/postback-secret", async (request, reply) => {
+    const { merchantId } = await requireMerchant(ctx, request, "admin");
+    const merchant = await ctx.db.merchants.get(merchantId);
+    if (!merchant) throw notFound("merchant");
+    return ok(reply, { postbackSecret: merchant.postbackSecret });
   });
 
   app.patch("/merchants/:merchantId", async (request, reply) => {
@@ -79,7 +88,7 @@ export const merchantRoutes: RouteModule = (app, ctx) => {
       subjectId: merchantId,
       metadata: patch,
     });
-    return ok(reply, updated);
+    return ok(reply, publicMerchant(updated));
   });
 
   // ---- Rotate postback secret -----------------------------------------------
@@ -115,17 +124,22 @@ export const merchantRoutes: RouteModule = (app, ctx) => {
     const email = body.email.toLowerCase();
 
     let user = await ctx.db.users.findOne((u) => u.email === email);
+    const isNewUser = !user;
     if (!user) {
       const created: User = {
         id: newId("user"),
         email,
         name: body.name,
-        passwordHash: "",
+        passwordHash: "", // set when the invitee accepts via /auth/accept-invite
         createdAt: ctx.clock.now().toISOString(),
       };
       await ctx.db.users.insert(created);
       user = created;
     }
+
+    // A brand-new (password-less) invitee is `invited` until they accept and set a
+    // password; an existing real user is added as `active`.
+    const memberStatus: MerchantUser["status"] = isNewUser && user.passwordHash === "" ? "invited" : "active";
 
     let membership = await ctx.db.merchantUsers.findOne(
       (m) => m.merchantId === merchantId && m.userId === user!.id,
@@ -133,7 +147,7 @@ export const merchantRoutes: RouteModule = (app, ctx) => {
     if (membership) {
       membership = await ctx.db.merchantUsers.update(membership.id, {
         role: body.role,
-        status: "active",
+        status: memberStatus,
         name: body.name,
         email,
       });
@@ -145,7 +159,7 @@ export const merchantRoutes: RouteModule = (app, ctx) => {
         email,
         name: body.name,
         role: body.role,
-        status: "active",
+        status: memberStatus,
       };
       await ctx.db.merchantUsers.insert(newMembership);
       membership = newMembership;

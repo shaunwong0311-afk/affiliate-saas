@@ -75,6 +75,8 @@ export interface Conversion {
   clickId: Id | null;
   orderId: Id;
   affiliateId: Id;
+  /** The offer that priced this conversion — so reversals route to the right engine. */
+  offerId: Id;
   codeId: Id | null;
   amountCents: number;
   currency: CurrencyCode;

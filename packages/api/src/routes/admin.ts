@@ -100,22 +100,38 @@ export const adminRoutes: RouteModule = (app, ctx) => {
     const body = parseBody(z.object({ affiliateId: z.string().min(1) }), request);
     const affiliate = await ctx.db.affiliates.get(body.affiliateId);
     if (!affiliate) throw notFound("affiliate");
-    const relationship = await ctx.db.relationships.findOne(
-      (r) => r.affiliateId === body.affiliateId && r.merchantId === merchantId,
-    );
-    if (!relationship) throw notFound("affiliate");
-    await ctx.db.affiliates.update(body.affiliateId, {
-      name: "[deleted]",
-      primaryEmail: "deleted+" + body.affiliateId + "@redacted.invalid",
-      status: "banned",
-    } as Partial<Affiliate>);
+    const relationships = await ctx.db.relationships.find((r) => r.affiliateId === body.affiliateId);
+    const mine = relationships.filter((r) => r.merchantId === merchantId);
+    if (mine.length === 0) throw notFound("affiliate");
+
+    // Remove THIS merchant's relationships + per-merchant CRM data for the affiliate.
+    for (const rel of mine) {
+      for (const n of await ctx.db.affiliateNotes.find((x) => x.relationshipId === rel.id)) await ctx.db.affiliateNotes.delete(n.id);
+      for (const t of await ctx.db.affiliateTasks.find((x) => x.relationshipId === rel.id)) await ctx.db.affiliateTasks.delete(t.id);
+      for (const m of await ctx.db.affiliateMessages.find((x) => x.relationshipId === rel.id)) await ctx.db.affiliateMessages.delete(m.id);
+      await ctx.db.relationships.delete(rel.id);
+    }
+
+    // The affiliate is a GLOBAL identity. Only redact the shared profile when no
+    // OTHER merchant still has a relationship with them — otherwise redacting would
+    // corrupt other tenants' data.
+    const others = relationships.filter((r) => r.merchantId !== merchantId);
+    const globallyRedacted = others.length === 0;
+    if (globallyRedacted) {
+      await ctx.db.affiliates.update(body.affiliateId, {
+        name: "[deleted]",
+        primaryEmail: "deleted+" + body.affiliateId + "@redacted.invalid",
+        status: "banned",
+      } as Partial<Affiliate>);
+    }
     await writeAudit(ctx, {
       merchantId,
       actorId: null,
       action: "affiliate.data_deleted",
       subjectType: "affiliate",
       subjectId: body.affiliateId,
+      metadata: { globallyRedacted, relationshipsRemoved: mine.length },
     });
-    return ok(reply, { deleted: true });
+    return ok(reply, { deleted: true, globallyRedacted });
   });
 };

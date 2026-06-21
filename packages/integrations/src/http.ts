@@ -54,13 +54,31 @@ export class ProxyHttpFetcher implements HttpFetcher {
   async get(url: string): Promise<FetchResult> {
     const ua = UAS[this.uaIndex++ % UAS.length]!;
     const proxy = this.pool.next();
-    // The proxy is applied via an undici ProxyAgent dispatcher when running on
-    // Node with proxies configured; omitted here to avoid a hard dependency. The
-    // header rotation + the pool selection are the real, swappable parts.
-    void proxy;
-    const res = await fetch(url, { headers: { "User-Agent": ua, Accept: "text/html" } });
+    // Actually route through the rotating proxy (undici ProxyAgent dispatcher) so
+    // scraping never originates from the box IP. If undici/ProxyAgent isn't
+    // available, fall back to a direct fetch.
+    const init: Record<string, unknown> = { headers: { "User-Agent": ua, Accept: "text/html" } };
+    if (proxy) {
+      const dispatcher = await proxyDispatcher(proxy);
+      if (dispatcher) init.dispatcher = dispatcher;
+    }
+    const res = await fetch(url, init as RequestInit);
     const html = await res.text();
     return { status: res.status, url, html };
+  }
+}
+
+const dispatcherCache = new Map<string, unknown>();
+async function proxyDispatcher(proxyUrl: string): Promise<unknown | null> {
+  if (dispatcherCache.has(proxyUrl)) return dispatcherCache.get(proxyUrl) ?? null;
+  try {
+    const undici: any = await import("undici" as string);
+    const agent = new undici.ProxyAgent(proxyUrl);
+    dispatcherCache.set(proxyUrl, agent);
+    return agent;
+  } catch {
+    dispatcherCache.set(proxyUrl, null);
+    return null;
   }
 }
 

@@ -11,9 +11,33 @@ import { allRouteModules } from "./routes/index.js";
  */
 export async function buildApp(ctxOverride?: Partial<AppContext>): Promise<FastifyInstance> {
   const ctx = createContext(ctxOverride);
-  const app = Fastify({ logger: false });
+  const app = Fastify({ logger: false, bodyLimit: 1_048_576 });
 
   await app.register(cors, { origin: ctx.config.corsOrigins, credentials: true });
+
+  // Capture the raw JSON body (for HMAC verification of signed webhooks) while
+  // still parsing it normally.
+  app.addContentTypeParser("application/json", { parseAs: "string" }, (req, body, done) => {
+    (req as { rawBody?: string }).rawBody = typeof body === "string" ? body : "";
+    try {
+      done(null, body && (body as string).length ? JSON.parse(body as string) : {});
+    } catch (err) {
+      done(err as Error, undefined);
+    }
+  });
+
+  // Basic per-IP rate limit on auth + public webhook routes (brute-force / abuse
+  // guard). In-memory per process; production fronts this with a shared store.
+  const limiter = createRateLimiter({ windowMs: 60_000, max: 30 });
+  app.addHook("onRequest", async (request, reply) => {
+    const url = request.url.split("?")[0] ?? "";
+    if (url.startsWith("/auth/") || url.includes("/reply-webhook/") || url.includes("/track/postback/")) {
+      const ip = (request.headers["x-forwarded-for"] as string)?.split(",")[0]?.trim() || request.ip || "unknown";
+      if (!limiter.allow(`${ip}:${url}`)) {
+        return reply.status(429).send({ error: { message: "too many requests", code: "rate_limited" } });
+      }
+    }
+  });
 
   // Resolve the principal for every request (routes enforce their own scope).
   app.addHook("preHandler", async (request) => {
@@ -46,4 +70,24 @@ declare module "fastify" {
   interface FastifyInstance {
     appContext: AppContext;
   }
+  interface FastifyRequest {
+    rawBody?: string;
+  }
+}
+
+/** Tiny fixed-window in-memory rate limiter. */
+function createRateLimiter(opts: { windowMs: number; max: number }) {
+  const hits = new Map<string, { count: number; resetAt: number }>();
+  return {
+    allow(key: string): boolean {
+      const now = Date.now();
+      const e = hits.get(key);
+      if (!e || now > e.resetAt) {
+        hits.set(key, { count: 1, resetAt: now + opts.windowMs });
+        return true;
+      }
+      e.count += 1;
+      return e.count <= opts.max;
+    },
+  };
 }

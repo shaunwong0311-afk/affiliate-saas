@@ -1,7 +1,7 @@
 import { createServer } from "node:http";
 import { fileURLToPath } from "node:url";
 import { resolve } from "node:path";
-import { createMemoryDatabase, type Database } from "@affiliate/db";
+import { createDatabaseFromEnv, type Database } from "@affiliate/db";
 import { createRedirectHandler, type RedirectInput } from "./handler.js";
 import { DbLinkResolver, DbClickSink } from "./adapters.js";
 
@@ -51,9 +51,18 @@ export function createEdgeServer(db: Database, opts: { defaultDestination?: stri
 const isEntrypoint = process.argv[1] ? resolve(process.argv[1]) === fileURLToPath(import.meta.url) : false;
 if (isEntrypoint) {
   const port = Number(process.env.EDGE_PORT ?? 8788);
-  const db = createMemoryDatabase();
-  createEdgeServer(db, { defaultDestination: process.env.EDGE_DEFAULT_DEST ?? "https://example.com/" }).listen(port, () => {
-    // eslint-disable-next-line no-console
-    console.log(`tracking edge listening on http://localhost:${port}/c/:code`);
-  });
+  // Share the SAME persistence as the API/worker (Postgres when configured) so the
+  // edge's click writes are visible to the conversion pipeline.
+  createDatabaseFromEnv()
+    .then((db) => {
+      createEdgeServer(db, { defaultDestination: process.env.EDGE_DEFAULT_DEST ?? "https://example.com/" }).listen(port, () => {
+        // eslint-disable-next-line no-console
+        console.log(`tracking edge listening on http://localhost:${port}/c/:code`);
+      });
+    })
+    .catch((err) => {
+      // eslint-disable-next-line no-console
+      console.error(err);
+      process.exit(1);
+    });
 }

@@ -4,7 +4,7 @@ import type { Affiliate, AffiliateRelationship } from "@affiliate/db";
 import type { RouteModule } from "./helpers.js";
 import { parseBody, parseQuery, ok, paginationSchema, paginate } from "./helpers.js";
 import { requireMerchant } from "../auth/middleware.js";
-import { notFound } from "../errors.js";
+import { notFound, badRequest } from "../errors.js";
 import { writeAudit } from "../services/audit.js";
 
 const roleEnum = z.enum(["seller", "recruiter", "both"]);
@@ -63,6 +63,16 @@ export const affiliateRoutes: RouteModule = (app, ctx) => {
       }),
       request,
     );
+    // The program must belong to THIS merchant.
+    const program = await ctx.db.programs.get(body.programId);
+    if (!program || program.merchantId !== merchantId) throw notFound("program");
+    // A sponsor, if given, must already be an affiliate of this merchant.
+    if (body.sponsorAffiliateId) {
+      const sponsorRel = await ctx.db.relationships.findOne(
+        (r) => r.affiliateId === body.sponsorAffiliateId && r.merchantId === merchantId,
+      );
+      if (!sponsorRel) throw badRequest("sponsor is not an affiliate of this merchant");
+    }
     const affiliate = await upsertAffiliate(ctx, body.email, body.name);
     const relationship: AffiliateRelationship = {
       id: newId("rel"),
@@ -181,6 +191,10 @@ export const affiliateRoutes: RouteModule = (app, ctx) => {
     const programId = (request.params as { programId: string }).programId;
     const program = await ctx.db.programs.get(programId);
     if (!program) throw notFound("program");
+    // Public applications are only accepted for ACTIVE, openly-joinable programs —
+    // not draft/archived, and not invite-only.
+    if (program.status !== "active") throw badRequest("program is not accepting applications");
+    if (program.approvalMode === "invite_only") throw badRequest("program is invite-only");
     const body = parseBody(
       z.object({
         name: z.string().min(1),

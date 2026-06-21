@@ -137,9 +137,17 @@ export class PayoutRailRegistry {
   register(rail: PayoutRail): void {
     this.rails.set(rail.rail, rail);
   }
+  /**
+   * Resolve a rail by name. Fails closed: an unknown/unconfigured rail throws
+   * rather than silently disbursing through the mock rail (which would mark real
+   * money "paid" without moving it). Money must never fall back to a stub.
+   */
   get(rail: string): PayoutRail {
-    const r = this.rails.get(rail) ?? this.rails.get("mock");
-    if (!r) throw new Error(`no payout rail "${rail}" and no mock fallback`);
+    const r = this.rails.get(rail);
+    if (!r) throw new Error(`payout rail "${rail}" is not configured`);
     return r;
+  }
+  has(rail: string): boolean {
+    return this.rails.has(rail);
   }
 }

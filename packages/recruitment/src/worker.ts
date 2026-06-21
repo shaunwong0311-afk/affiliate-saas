@@ -1,3 +1,19 @@
+import { fileURLToPath } from "node:url";
+import { resolve } from "node:path";
+import { systemClock } from "@affiliate/core";
+import { createDatabaseFromEnv } from "@affiliate/db";
+import {
+  HashingEmbedder,
+  DeterministicLlm,
+  AnthropicLlmClient,
+  StubEmailFinder,
+  MockMailboxSender,
+  StubCalendarBooking,
+  SerpDiscoverySource,
+  CompetitorAffiliateSource,
+  CreatorDiscoverySource,
+  DbCustomerMiningSource,
+} from "@affiliate/integrations";
 import { InMemoryQueue, type JobQueue } from "./queue.js";
 import type { RecruitmentDeps } from "./deps.js";
 import { enrich, score, send } from "./pipeline.js";
@@ -69,4 +85,46 @@ export function runScheduler(deps: RecruitmentDeps, intervalMs = 60_000): Schedu
       clearTimeout(timer);
     },
   };
+}
+
+/** Build the full recruitment dependency set from the environment (worker entrypoint). */
+export async function buildDepsFromEnv(): Promise<RecruitmentDeps> {
+  const db = await createDatabaseFromEnv();
+  const llm = process.env.ANTHROPIC_API_KEY ? new AnthropicLlmClient({ apiKey: process.env.ANTHROPIC_API_KEY }) : new DeterministicLlm();
+  return {
+    db,
+    embedder: new HashingEmbedder(),
+    llm,
+    emailFinder: new StubEmailFinder(),
+    mailer: new MockMailboxSender(),
+    discoverySources: [new SerpDiscoverySource(), new CompetitorAffiliateSource(), new CreatorDiscoverySource(), new DbCustomerMiningSource(db)],
+    calendar: new StubCalendarBooking(),
+    clock: systemClock,
+  };
+}
+
+// ---- Standalone worker entrypoint (`npm run worker`) ------------------------
+const isEntrypoint = process.argv[1] ? resolve(process.argv[1]) === fileURLToPath(import.meta.url) : false;
+if (isEntrypoint) {
+  buildDepsFromEnv()
+    .then((deps) => {
+      const queue = buildQueue();
+      registerWorkers(queue, deps);
+      const handle = runScheduler(deps, Number(process.env.SCHEDULER_INTERVAL_MS ?? 60_000));
+      const drain = setInterval(() => void queue.drain().catch(() => {}), 5_000);
+      // eslint-disable-next-line no-console
+      console.log("recruitment worker running (scheduler + stage queue)");
+      const shutdown = () => {
+        handle.stop();
+        clearInterval(drain);
+        process.exit(0);
+      };
+      process.on("SIGTERM", shutdown);
+      process.on("SIGINT", shutdown);
+    })
+    .catch((err) => {
+      // eslint-disable-next-line no-console
+      console.error(err);
+      process.exit(1);
+    });
 }

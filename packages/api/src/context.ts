@@ -18,6 +18,7 @@ import {
   SerpDiscoverySource,
   DbCustomerMiningSource,
   StubCalendarBooking,
+  ConsoleTransactionalMailer,
   type MailboxSender,
   type EmailFinder,
   type Embedder,
@@ -25,6 +26,7 @@ import {
   type SecretStore,
   type DiscoverySource,
   type CalendarBooking,
+  type TransactionalMailer,
 } from "@affiliate/integrations";
 import { loadConfig, type AppConfig } from "./config.js";
 
@@ -48,6 +50,8 @@ export interface AppContext {
   secrets: SecretStore;
   discoverySources: DiscoverySource[];
   calendar: CalendarBooking;
+  /** Transactional mail (magic links, payout notices) — routed via an ESP, never the box IP. */
+  transactionalMailer: TransactionalMailer;
   clock: Clock;
 }
 
@@ -83,6 +87,7 @@ export function createContext(overrides: Partial<AppContext> = {}): AppContext {
     secrets: overrides.secrets ?? new InMemorySecretStore(),
     discoverySources,
     calendar: overrides.calendar ?? new StubCalendarBooking(),
+    transactionalMailer: overrides.transactionalMailer ?? new ConsoleTransactionalMailer(),
     clock: overrides.clock ?? systemClock,
   };
 }

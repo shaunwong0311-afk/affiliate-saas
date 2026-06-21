@@ -22,9 +22,11 @@
     "web:dev": "npm run dev -w @affiliate/web",
     "lint": "tsc -b --noEmit"
   },
+  "dependencies": {
+    "tsx": "^4.19.2"
+  },
   "devDependencies": {
     "@types/node": "^22.10.0",
-    "tsx": "^4.19.2",
     "typescript": "^5.7.2",
     "vitest": "^2.1.8"
   }

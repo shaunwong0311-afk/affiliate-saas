@@ -1,6 +1,7 @@
 import { newId, computeBalances, type Balance, type LedgerEntry } from "@affiliate/core";
 import type { PayoutBatch, Payout } from "@affiliate/db";
 import type { AppContext } from "../context.js";
+import { conflict, notFound } from "../errors.js";
 import { writeAudit } from "./audit.js";
 import { emitWebhook } from "./webhooks.js";
 
@@ -83,78 +84,109 @@ export interface BatchResult {
   skipped: PayableLine[];
 }
 
-/** Create a draft payout batch from currently-eligible payable lines. */
+/**
+ * Create a draft payout batch and RESERVE the claimed ledger entries.
+ *
+ * Reservation is what makes payouts safe: each affiliate's available `approved`
+ * entries are moved to `processing` and stamped with the payout id. They drop out
+ * of the available balance immediately, so a second `createPayoutBatch` for the
+ * same merchant sees zero — no double payment. On disburse success they become
+ * `paid`; on failure they are released back to `approved`.
+ *
+ * The whole claim runs inside a transaction so a mid-claim failure can't leave a
+ * partially-reserved balance.
+ */
 export async function createPayoutBatch(
   ctx: AppContext,
   merchantId: string,
   currency: string,
   minPayoutCents: number,
 ): Promise<BatchResult> {
-  const { db, clock } = ctx;
-  const lines = (await computePayableLines(ctx, merchantId, minPayoutCents)).filter((l) => l.currency === currency);
-  const eligible = lines.filter((l) => l.eligible);
-  const skipped = lines.filter((l) => !l.eligible);
+  const { clock } = ctx;
+  return ctx.db.transaction(async (db) => {
+    const txCtx = { ...ctx, db };
+    const lines = (await computePayableLines(txCtx, merchantId, minPayoutCents)).filter((l) => l.currency === currency);
+    const eligible = lines.filter((l) => l.eligible);
+    const skipped = lines.filter((l) => !l.eligible);
 
-  const batch: PayoutBatch = {
-    id: newId("batch"),
-    merchantId,
-    rail: eligible[0]?.rail ?? "mock",
-    currency,
-    status: "draft",
-    approvedBy: null,
-    ts: clock.now().toISOString(),
-  };
-  await db.payoutBatches.insert(batch);
-
-  const payouts: Payout[] = [];
-  for (const line of eligible) {
-    const payout: Payout = {
-      id: newId("pay"),
-      batchId: batch.id,
+    const batch: PayoutBatch = {
+      id: newId("batch"),
       merchantId,
-      affiliateId: line.affiliateId,
-      amountCents: line.availableCents,
+      rail: "mixed", // each payout disburses through its own affiliate's rail
       currency,
-      method: line.rail ?? "mock",
-      status: "pending",
-      failureReason: null,
+      status: "draft",
+      approvedBy: null,
       ts: clock.now().toISOString(),
     };
-    await db.payouts.insert(payout);
-    payouts.push(payout);
-  }
-  return { batch, payouts, skipped };
+    await db.payoutBatches.insert(batch);
+
+    const payouts: Payout[] = [];
+    for (const line of eligible) {
+      const payout: Payout = {
+        id: newId("pay"),
+        batchId: batch.id,
+        merchantId,
+        affiliateId: line.affiliateId,
+        amountCents: line.availableCents,
+        currency,
+        method: line.rail ?? "mock",
+        status: "pending",
+        failureReason: null,
+        ts: clock.now().toISOString(),
+      };
+      await db.payouts.insert(payout);
+      // Reserve the exact entries that fund this payout.
+      await reserveEntries(txCtx, payout);
+      payouts.push(payout);
+    }
+    return { batch, payouts, skipped };
+  });
 }
 
-/** Merchant approves a batch, then disburse through the rail (Section 4). */
-export async function approveAndDisburse(ctx: AppContext, batchId: string, approverId: string): Promise<Payout[]> {
+/** Move an affiliate's available approved entries to `processing`, stamped with the payout id. */
+async function reserveEntries(ctx: AppContext, payout: Payout): Promise<void> {
   const { db, clock } = ctx;
-  const batch = await db.payoutBatches.require(batchId);
+  const now = clock.now();
+  const entries = (
+    await db.ledger.find(
+      (e) =>
+        e.affiliateId === payout.affiliateId &&
+        e.merchantId === payout.merchantId &&
+        e.currency === payout.currency &&
+        e.status === "approved",
+    )
+  )
+    .filter((e) => !e.availableAt || new Date(e.availableAt).getTime() <= now.getTime())
+    .sort((a, b) => new Date(a.ts).getTime() - new Date(b.ts).getTime());
+
+  let remaining = payout.amountCents;
+  for (const entry of entries) {
+    if (remaining <= 0) break;
+    await db.ledger.update(entry.id, { status: "processing", metadata: { ...entry.metadata, payoutId: payout.id } });
+    remaining -= entry.amountCents;
+  }
+}
+
+/**
+ * Merchant approves a batch, then disburses. State-guarded (a batch can only be
+ * disbursed once, from `draft`) and disburses each payout through ITS OWN
+ * affiliate's rail — mixed methods never share a rail.
+ */
+export async function approveAndDisburse(ctx: AppContext, batchId: string, approverId: string): Promise<Payout[]> {
+  const { db } = ctx;
+  const batch = await db.payoutBatches.get(batchId);
+  if (!batch) throw notFound("payout batch");
+  // Idempotency / double-spend guard: only a draft batch can be disbursed.
+  if (batch.status !== "draft") throw conflict(`batch is ${batch.status}, not draft`);
   await db.payoutBatches.update(batchId, { status: "processing", approvedBy: approverId });
   await writeAudit(ctx, { merchantId: batch.merchantId, actorId: approverId, action: "payout.batch.approved", subjectType: "payout_batch", subjectId: batchId });
 
   const payouts = await db.payouts.find((p) => p.batchId === batchId);
-  const rail = ctx.rails.get(batch.rail);
   const results: Payout[] = [];
 
   for (const payout of payouts) {
-    const account = await db.payoutAccounts.findOne((a) => a.affiliateId === payout.affiliateId && a.currency === payout.currency);
-    const result = await rail.disburse({
-      payoutId: payout.id,
-      affiliateId: payout.affiliateId,
-      accountRef: account?.accountRef ?? "unknown",
-      amountCents: payout.amountCents,
-      currency: payout.currency,
-      idempotencyKey: payout.id,
-    });
-    const updated = await db.payouts.update(payout.id, { status: result.status, failureReason: result.failureReason });
+    const updated = await disburseOne(ctx, payout, payout.id);
     results.push(updated);
-
-    // On success, mark the affiliate's available ledger entries as paid.
-    if (result.status === "paid") {
-      await markEntriesPaid(ctx, payout.affiliateId, payout.merchantId, payout.currency, payout.amountCents);
-      await emitWebhook(ctx, batch.merchantId, "payout.paid", { payoutId: payout.id, affiliateId: payout.affiliateId, amountCents: payout.amountCents });
-    }
   }
 
   const anyFailed = results.some((p) => p.status === "failed");
@@ -162,40 +194,64 @@ export async function approveAndDisburse(ctx: AppContext, batchId: string, appro
   return results;
 }
 
-/** Retry a single failed payout (Section 9). */
+/** Disburse one payout through its affiliate's rail. Idempotency key is stable per payout. */
+async function disburseOne(ctx: AppContext, payout: Payout, idempotencyKey: string): Promise<Payout> {
+  const { db } = ctx;
+  const account = await db.payoutAccounts.findOne((a) => a.affiliateId === payout.affiliateId && a.currency === payout.currency);
+  if (!account) {
+    await releaseReservation(ctx, payout.id);
+    return db.payouts.update(payout.id, { status: "failed", failureReason: "no payout account" });
+  }
+
+  let result;
+  try {
+    // Use the affiliate's OWN rail; unknown/unconfigured rails throw (fail closed),
+    // they are NOT silently sent through the mock rail.
+    const rail = ctx.rails.get(account.rail);
+    result = await rail.disburse({
+      payoutId: payout.id,
+      affiliateId: payout.affiliateId,
+      accountRef: account.accountRef,
+      amountCents: payout.amountCents,
+      currency: payout.currency,
+      idempotencyKey,
+    });
+  } catch (err) {
+    await releaseReservation(ctx, payout.id);
+    return db.payouts.update(payout.id, { status: "failed", failureReason: (err as Error).message });
+  }
+
+  if (result.status === "paid") {
+    await settleReservation(ctx, payout.id);
+    await emitWebhook(ctx, payout.merchantId, "payout.paid", { payoutId: payout.id, affiliateId: payout.affiliateId, amountCents: payout.amountCents });
+  } else if (result.status === "failed") {
+    await releaseReservation(ctx, payout.id);
+  }
+  return db.payouts.update(payout.id, { status: result.status, failureReason: result.failureReason });
+}
+
+/** Reserved entries for a payout → paid. */
+async function settleReservation(ctx: AppContext, payoutId: string): Promise<void> {
+  const entries = await ctx.db.ledger.find((e) => e.status === "processing" && e.metadata?.["payoutId"] === payoutId);
+  for (const e of entries) await ctx.db.ledger.update(e.id, { status: "paid" });
+}
+
+/** Reserved entries for a payout → back to approved (claim released). */
+async function releaseReservation(ctx: AppContext, payoutId: string): Promise<void> {
+  const entries = await ctx.db.ledger.find((e) => e.status === "processing" && e.metadata?.["payoutId"] === payoutId);
+  for (const e of entries) await ctx.db.ledger.update(e.id, { status: "approved" });
+}
+
+/** Retry a single failed payout (Section 9). Re-reserves, then retries with a STABLE key. */
 export async function retryPayout(ctx: AppContext, payoutId: string): Promise<Payout> {
   const { db } = ctx;
   const payout = await db.payouts.require(payoutId);
-  if (payout.status !== "failed") return payout;
-  const account = await db.payoutAccounts.findOne((a) => a.affiliateId === payout.affiliateId && a.currency === payout.currency);
-  const rail = ctx.rails.get(payout.method);
-  const result = await rail.disburse({
-    payoutId: payout.id,
-    affiliateId: payout.affiliateId,
-    accountRef: account?.accountRef ?? "unknown",
-    amountCents: payout.amountCents,
-    currency: payout.currency,
-    idempotencyKey: `${payout.id}_retry`,
-  });
-  if (result.status === "paid") {
-    await markEntriesPaid(ctx, payout.affiliateId, payout.merchantId, payout.currency, payout.amountCents);
-  }
-  return db.payouts.update(payoutId, { status: result.status, failureReason: result.failureReason });
-}
-
-async function markEntriesPaid(ctx: AppContext, affiliateId: string, merchantId: string, currency: string, amountCents: number): Promise<void> {
-  const { db, clock } = ctx;
-  const now = clock.now();
-  const entries = (await db.ledger.find(
-    (e) => e.affiliateId === affiliateId && e.merchantId === merchantId && e.currency === currency && e.status === "approved",
-  )).filter((e) => !e.availableAt || new Date(e.availableAt).getTime() <= now.getTime());
-
-  let remaining = amountCents;
-  for (const entry of entries.sort((a, b) => new Date(a.ts).getTime() - new Date(b.ts).getTime())) {
-    if (remaining <= 0) break;
-    await db.ledger.update(entry.id, { status: "paid" });
-    remaining -= entry.amountCents;
-  }
+  if (payout.status !== "failed") throw conflict(`payout is ${payout.status}, not failed`);
+  // Re-reserve the entries this payout funds (they were released on failure).
+  await reserveEntries(ctx, payout);
+  // Stable idempotency key (the payout id) so an ambiguous prior response cannot
+  // produce a duplicate transfer at the rail.
+  return disburseOne(ctx, payout, payout.id);
 }
 
 /** Manual adjustment (bonus, correction, negative-balance write-off) — Section 9. */

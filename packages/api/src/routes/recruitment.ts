@@ -7,6 +7,7 @@ import { parseBody, parseQuery, ok, paginationSchema, paginate } from "./helpers
 import { requireMerchant } from "../auth/middleware.js";
 import { badRequest, notFound } from "../errors.js";
 import { writeAudit } from "../services/audit.js";
+import { assertWithinEntitlement, recordUsage } from "../services/entitlements.js";
 
 const outcomeLabel = z.enum([
   "bad_fit",
@@ -66,7 +67,10 @@ export const recruitmentRoutes: RouteModule = (app, ctx) => {
   app.post("/recruitment/source", async (request, reply) => {
     const { merchantId } = await requireMerchant(ctx, request, "write");
     const body = parseBody(z.object({ limit: z.number().int().min(1).max(500).default(10) }), request);
+    // Enforce the recruitment-credits entitlement before spending on sourcing.
+    await assertWithinEntitlement(ctx, merchantId, "recruitment_credits", "recruitment_credit", body.limit);
     const result = await runSourcing(ctx, merchantId, { limit: body.limit });
+    await recordUsage(ctx, merchantId, "recruitment_credit", result.discovered);
     return ok(reply, result);
   });
 
@@ -260,7 +264,9 @@ export const recruitmentRoutes: RouteModule = (app, ctx) => {
   // ---- Suppressions ---------------------------------------------------------
   app.get("/recruitment/suppressions", async (request, reply) => {
     const { merchantId } = await requireMerchant(ctx, request, "read");
-    const suppressions = await ctx.db.suppressions.find((s) => s.merchantId === merchantId || s.scope === "global");
+    // Only this merchant's own suppressions — global rows (other tenants' emails /
+    // domains) are NOT enumerable here. They still apply via isSuppressed.
+    const suppressions = await ctx.db.suppressions.find((s) => s.merchantId === merchantId);
     return ok(reply, suppressions);
   });
 
