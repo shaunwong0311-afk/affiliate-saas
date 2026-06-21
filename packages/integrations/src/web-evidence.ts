@@ -76,28 +76,86 @@ export class NoopEmailVerifier implements EmailVerifier {
 const EMAIL_RE = /[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/gi;
 
 /**
- * Extract contact emails from page HTML — mailto: links first (highest signal),
- * then visible addresses. Filters out asset/tracking junk. This is REAL contact
- * extraction, not pattern-guessing.
+ * Obfuscated-email pattern: `local <at> domain <dot> tld`, where <at>/<dot> are
+ * bracketed words (`[at]`, `(dot)`), bare UPPERCASE words (`AT`, `DOT` — the
+ * deliberate-obfuscation signal), or spaced punctuation (` @ `, ` . `). Case-
+ * SENSITIVE on purpose so prose like "look at the dot-com era" doesn't match —
+ * the bare-word forms must be uppercase. The domain group is greedy so multi-part
+ * domains (`sub.example DOT com`) reconstruct correctly.
  */
-export function extractEmailsFromHtml(html: string): { email: string; source: "mailto" | "page" }[] {
-  const out: { email: string; source: "mailto" | "page" }[] = [];
+const OBFUSCATED_RE = new RegExp(
+  String.raw`([a-zA-Z0-9._%+-]+)` +
+    String.raw`(?:\s*[\[\(\{]\s*[aA][tT]\s*[\]\)\}]\s*|\s+AT\s+|\s+@\s+)` +
+    String.raw`([a-zA-Z0-9.-]+)` +
+    String.raw`(?:\s*[\[\(\{]\s*[dD][oO][tT]\s*[\]\)\}]\s*|\s+DOT\s+|\s+\.\s+)` +
+    String.raw`([a-zA-Z]{2,})`,
+  "g",
+);
+
+export type EmailSource = "mailto" | "page" | "obfuscated" | "cfemail";
+
+/**
+ * Extract contact emails from page HTML. Reads what a human could find: mailto:
+ * links, visible addresses, HTML-entity-encoded addresses, Cloudflare-protected
+ * addresses (`data-cfemail`), and human-readable obfuscations (`name [at] site
+ * [dot] com`). Filters out asset/tracking junk. REAL extraction, never guessing —
+ * if nothing is on the page, it returns nothing. JS-assembled addresses (built at
+ * runtime by scripts) need a headless-browser fetcher to render first; those are
+ * out of scope for static HTML.
+ */
+export function extractEmailsFromHtml(html: string): { email: string; source: EmailSource }[] {
+  const out: { email: string; source: EmailSource }[] = [];
   const seen = new Set<string>();
-  for (const m of html.matchAll(/mailto:([^"'?>\s]+)/gi)) {
-    const e = m[1]!.toLowerCase();
+  const add = (raw: string, source: EmailSource) => {
+    const e = raw.replace(/\s+/g, "").toLowerCase();
     if (isPlausibleEmail(e) && !seen.has(e)) {
       seen.add(e);
-      out.push({ email: e, source: "mailto" });
+      out.push({ email: e, source });
     }
+  };
+
+  // 1) Cloudflare email protection — decode the XOR-encoded hex from the raw HTML.
+  for (const m of html.matchAll(/data-cfemail=["']([0-9a-fA-F]{4,})["']/g)) {
+    const decoded = decodeCfEmail(m[1]!);
+    if (decoded) add(decoded, "cfemail");
   }
-  for (const m of html.matchAll(EMAIL_RE)) {
-    const e = m[0].toLowerCase();
-    if (isPlausibleEmail(e) && !seen.has(e)) {
-      seen.add(e);
-      out.push({ email: e, source: "page" });
-    }
-  }
+
+  // Decode HTML entities so fully entity-encoded addresses (&#106;&#64;…) read back.
+  const text = decodeHtmlEntities(html);
+
+  // 2) mailto: links (highest intent). 3) visible addresses. 4) obfuscations.
+  for (const m of text.matchAll(/mailto:([^"'?>\s]+)/gi)) add(m[1]!, "mailto");
+  for (const m of text.matchAll(EMAIL_RE)) add(m[0], "page");
+  for (const m of text.matchAll(OBFUSCATED_RE)) add(`${m[1]}@${m[2]}.${m[3]}`, "obfuscated");
+
   return out;
+}
+
+/** Decode numeric/hex HTML entities (covers entity-encoded email obfuscation). */
+function decodeHtmlEntities(s: string): string {
+  return s
+    .replace(/&#x([0-9a-fA-F]+);/g, (_, h) => safeFromCode(parseInt(h, 16)))
+    .replace(/&#(\d+);/g, (_, d) => safeFromCode(parseInt(d, 10)))
+    .replace(/&(?:commat|#0*64);/gi, "@")
+    .replace(/&(?:period|dot);/gi, ".");
+}
+
+function safeFromCode(code: number): string {
+  return code > 0 && code < 0x110000 ? String.fromCodePoint(code) : "";
+}
+
+/**
+ * Decode a Cloudflare-obfuscated email. CF stores the address as hex where the
+ * first byte is an XOR key and every subsequent byte is the key XOR the character.
+ */
+function decodeCfEmail(hex: string): string {
+  if (hex.length < 4 || hex.length % 2 !== 0) return "";
+  const key = parseInt(hex.slice(0, 2), 16);
+  let email = "";
+  for (let i = 2; i < hex.length; i += 2) {
+    email += String.fromCharCode(parseInt(hex.slice(i, i + 2), 16) ^ key);
+  }
+  return email;
 }
 
 function isPlausibleEmail(e: string): boolean {

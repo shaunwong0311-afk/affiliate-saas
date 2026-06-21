@@ -41,6 +41,42 @@ describe("extractEmailsFromHtml", () => {
   });
 });
 
+describe("extractEmailsFromHtml — obfuscation handling", () => {
+  const emailsIn = (html: string) => extractEmailsFromHtml(html).map((e) => e.email);
+
+  it("reads bracketed at/dot obfuscation", () => {
+    expect(emailsIn("contact me: joe [at] gmail [dot] com")).toContain("joe@gmail.com");
+    expect(emailsIn("partnerships (at) brandsite (dot) co")).toContain("partnerships@brandsite.co");
+  });
+
+  it("reads UPPERCASE bare at/dot obfuscation", () => {
+    expect(emailsIn("reach jane AT creator DOT co")).toContain("jane@creator.co");
+  });
+
+  it("reads spaced-punctuation obfuscation", () => {
+    expect(emailsIn("hello @ brandsite . com for inquiries")).toContain("hello@brandsite.com");
+  });
+
+  it("reconstructs multi-part domains", () => {
+    expect(emailsIn("team [at] mail.brand [dot] co")).toContain("team@mail.brand.co");
+  });
+
+  it("decodes HTML-entity-encoded addresses", () => {
+    // j o e @ creator . com, fully numeric-entity encoded
+    expect(emailsIn("&#106;&#111;&#101;&#64;creator&#46;com")).toContain("joe@creator.com");
+  });
+
+  it("decodes Cloudflare data-cfemail protection", () => {
+    const html = `<a class="__cf_email__" data-cfemail="403225212c0023322521342f326e232f2d">[email protected]</a>`;
+    const found = extractEmailsFromHtml(html);
+    expect(found).toEqual([{ email: "real@creator.com", source: "cfemail" }]);
+  });
+
+  it("does NOT false-positive on ordinary prose (lowercase at/dot)", () => {
+    expect(emailsIn("Look at the best dot com sites and meet me at the cafe.")).toEqual([]);
+  });
+});
+
 describe("FetchRedirectResolver", () => {
   it("returns the final host after following redirects", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => ({ url: "https://competitor.com/product/123" })) as unknown as typeof fetch);
