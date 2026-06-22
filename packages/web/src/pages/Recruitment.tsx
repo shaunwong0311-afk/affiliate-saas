@@ -2,6 +2,19 @@ import { useState } from "react";
 import { api, num } from "../api";
 import { useApi, Card, Spinner, ErrorBanner, PageHeader, Badge, EmptyState } from "../ui";
 
+interface Account {
+  platform: string;
+  handle: string | null;
+  url: string;
+  provenance: string;
+  confidence: number;
+}
+interface Profile {
+  primary: Account | null;
+  accounts: Account[];
+  audience: { reach: number | null; primaryGeo: string | null; language: string | null; engagementRate: number | null; source: string | null };
+  identityConfidence: number;
+}
 interface Evidence {
   affiliateLinks?: { url: string; network: string; confidence: string; verified?: boolean }[];
   competitorPromoted?: string | null;
@@ -10,6 +23,7 @@ interface Evidence {
   contactUrls?: { url: string; kind: string }[];
   contactForm?: boolean;
   contactFormUrl?: string | null;
+  profile?: Profile | null;
   pageUrl?: string | null;
 }
 
@@ -27,6 +41,14 @@ interface Prospect {
   confidence: number | null;
   evidence: Evidence | null;
   scoreBreakdown: { explanation?: string[]; breakdown?: { factor: string; contribution: number; note: string }[]; unknownFactors?: string[] } | null;
+}
+
+const PLATFORM_ICONS: Record<string, string> = {
+  youtube: "▶", twitter: "𝕏", instagram: "◙", tiktok: "♪", substack: "✉", beehiiv: "🐝",
+  podcast: "🎙", linktree: "🌳", website: "🌐", unknown: "•",
+};
+function platformIcon(platform: string): string {
+  return PLATFORM_ICONS[platform] ?? "•";
 }
 
 export function Recruitment() {
@@ -229,6 +251,34 @@ export function Recruitment() {
                     ) : (
                       <div className="faint" style={{ fontSize: 12 }}>No affiliate links detected on the page.</div>
                     )}
+                  </div>
+                )}
+
+                {selected.evidence?.profile && selected.evidence.profile.accounts.length > 1 && (
+                  <div className="card" style={{ background: "var(--ink-850)", marginTop: 12, padding: 14 }}>
+                    <div className="row between" style={{ marginBottom: 8 }}>
+                      <span className="faint" style={{ fontSize: 11, letterSpacing: 0.4, textTransform: "uppercase" }}>Identity graph</span>
+                      <span className="faint" style={{ fontSize: 11 }}>{Math.round(selected.evidence.profile.identityConfidence * 100)}% linked</span>
+                    </div>
+                    <div className="row wrap gap-8">
+                      {selected.evidence.profile.accounts.map((a, i) => (
+                        <a
+                          key={i}
+                          href={a.url}
+                          target="_blank"
+                          rel="noreferrer"
+                          title={`${a.provenance.replace(/_/g, " ")} · ${Math.round(a.confidence * 100)}% confidence`}
+                          style={{ textDecoration: "none" }}
+                        >
+                          <Badge kind={a.provenance === "seed" ? "info" : a.confidence >= 0.85 ? "pos" : ""}>
+                            {platformIcon(a.platform)} {a.handle ?? a.platform}
+                          </Badge>
+                        </a>
+                      ))}
+                    </div>
+                    <div className="faint" style={{ fontSize: 11, marginTop: 8 }}>
+                      Surfaces this creator owns, unified from the links they published. Audience demographics (geo/size) fill in once a provider is wired.
+                    </div>
                   </div>
                 )}
 

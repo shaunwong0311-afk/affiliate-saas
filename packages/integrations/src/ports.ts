@@ -139,6 +139,49 @@ export interface DiscoverySource {
   discover(query: DiscoveryQuery): Promise<RawCandidate[]>;
 }
 
+// ---- Creator identity graph + audience (profile-graph plan) ----------------
+/**
+ * A per-platform collector for the identity graph. Given a seed URL/handle it
+ * returns the account it describes plus cross-links to the creator's OTHER surfaces
+ * (so identity resolution can unify them) and any cheap audience signals. Phase 2+
+ * (e.g. a YouTube Data API adapter); deterministic stubs run offline.
+ */
+export interface ProfileFragment {
+  platform: string;
+  handle: string | null;
+  url: string;
+  /** Links to the creator's other platforms found on this surface. */
+  links: string[];
+  /** Cheap audience signals this source can provide (followers, geo, language). */
+  audience?: { reach?: number | null; primaryGeo?: string | null; language?: string | null; engagementRate?: number | null };
+  /** Contact emails this source exposed (e.g. a channel description). */
+  emails?: string[];
+}
+
+export interface ProfileSource {
+  readonly platform: string;
+  /** Whether this source can collect the given URL/handle. */
+  handles(url: string): boolean;
+  collect(url: string): Promise<ProfileFragment | null>;
+}
+
+/**
+ * Audience demographics (geo / age / interests). Phase 3 wires an INFERRED estimator
+ * (cheap proxies — creator geo, content language); Phase 4 can drop in a paid
+ * creator-intelligence provider (Modash/HypeAuditor) for A-tier prospects only. Both
+ * behind this seam; unknown stays null, never invented.
+ */
+export interface AudienceProvider {
+  readonly kind: string;
+  estimate(input: { platform: string; handle?: string | null; url: string }): Promise<{
+    reach: number | null;
+    primaryGeo: string | null;
+    language: string | null;
+    engagementRate: number | null;
+    source: "inferred" | "provider" | "creator_provided" | null;
+  } | null>;
+}
+
 // ---- LLM + embeddings (Section 8.3 / 8.4 / 8.5) ----------------------------
 export interface LlmClient {
   readonly model: string;

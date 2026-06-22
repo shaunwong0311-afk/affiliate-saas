@@ -151,6 +151,33 @@ describe("discovery honesty (pipeline)", () => {
     expect(p.evidence?.contactSource).toBe("bio_aggregator:mailto");
   });
 
+  it("builds a cross-platform identity graph from a linked Linktree", async () => {
+    const homepage = `<html><body><a href="https://linktr.ee/creator">all my links</a></body></html>`;
+    const linktree = `<a href="https://youtube.com/@creator">yt</a><a href="https://x.com/creator">x</a><a href="https://creator.substack.com">news</a>`.padEnd(
+      300,
+      " ",
+    );
+    const fetcher: HttpFetcher = {
+      kind: "mock",
+      async get(url: string): Promise<FetchResult> {
+        return { status: 200, url, html: url.includes("linktr.ee") ? linktree : "<html></html>" };
+      },
+    };
+    await runSourcing(
+      deps([new StaticSource([cand({ identity: "GraphCreator", siteUrl: "https://creator.com", pageHtml: homepage })])], { fetcher }),
+      "m1",
+      { limit: 5 },
+    );
+    const p = (await db.prospects.find((x) => x.merchantId === "m1"))[0]!;
+    const profile = p.evidence?.profile;
+    expect(profile).toBeTruthy();
+    const platforms = profile!.accounts.map((a) => a.platform);
+    expect(platforms).toEqual(expect.arrayContaining(["website", "youtube", "twitter", "substack"]));
+    // Accounts enumerated on the creator's own Linktree are high-confidence.
+    expect(profile!.accounts.find((a) => a.platform === "youtube")!.provenance).toBe("bio_aggregator");
+    expect(profile!.identityConfidence).toBeGreaterThanOrEqual(0.9);
+  });
+
   it("flags a contact-form-only prospect for the human gate (no email invented)", async () => {
     // No email on page, no finder hits → the prospect must be flagged form-only, not
     // assigned a fabricated address.

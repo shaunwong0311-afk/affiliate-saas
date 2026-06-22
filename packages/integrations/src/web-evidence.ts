@@ -186,6 +186,21 @@ export interface ContactUrl {
   kind: ContactUrlKind;
 }
 
+/** All href targets on a page, absolutized against the base URL (for the identity graph). */
+export function extractHrefs(html: string, baseUrl?: string | null): string[] {
+  const base = safeBase(baseUrl);
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const m of html.matchAll(/href\s*=\s*["']([^"']+)["']/gi)) {
+    const abs = absolutize(m[1]!, base);
+    if (abs && !seen.has(abs)) {
+      seen.add(abs);
+      out.push(abs);
+    }
+  }
+  return out;
+}
+
 function safeBase(b?: string | null): URL | null {
   if (!b) return null;
   try {

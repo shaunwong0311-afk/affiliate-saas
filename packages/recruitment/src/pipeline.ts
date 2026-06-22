@@ -5,15 +5,19 @@ import {
   promotesCompetitor as detectPromotesCompetitor,
   hasProvenAffiliateSignal,
   canTransition,
+  buildProfile,
+  addPageToProfile,
   type ScoringSignals,
   type AffiliateSignal,
   type Tier,
+  type Profile,
 } from "@affiliate/core";
 import type { Prospect, ProspectSignal, OutreachCampaign, OutreachMessage, Reply, Merchant } from "@affiliate/db";
 import {
   renderTemplate,
   classifyReply,
   extractEmailsFromHtml,
+  extractHrefs,
   discoverContactUrls,
   detectsContactForm,
   type DiscoveryQuery,
@@ -90,6 +94,13 @@ export async function discover(
         if (!contactUrls.some((u) => u.url === about)) contactUrls.push({ url: about, kind: "youtube_about" });
       }
       const hasContactForm = cand.pageHtml ? detectsContactForm(cand.pageHtml) : false;
+      // Identity graph: classify the surfaces this creator links from their page.
+      // The seed is their own URL; enrichment augments this from bio-aggregator pages.
+      const seedUrl = cand.siteUrl ?? cand.channelUrl;
+      const profile =
+        seedUrl || cand.pageHtml
+          ? buildProfile(seedUrl, cand.pageHtml ? [{ url: cand.evidenceUrl ?? seedUrl ?? cand.identity, links: extractHrefs(cand.pageHtml, seedUrl) }] : [])
+          : null;
 
       const prospect: Prospect = {
         id: newId("prosp"),
@@ -116,6 +127,7 @@ export async function discover(
           contactUrls,
           contactForm: hasContactForm,
           contactFormUrl: hasContactForm ? cand.evidenceUrl : null,
+          profile,
           pageUrl: cand.evidenceUrl,
         },
         createdAt: now,
@@ -178,9 +190,12 @@ export async function enrich(deps: RecruitmentDeps, prospectId: string): Promise
   }
 
   // 2) FOLLOW the contact-bearing pages the creator linked (Linktree, /contact,
-  //    YouTube About) and run the SAME real extraction over each. More free, real
-  //    emails — no finder spend. Only for real prospects with a fetcher wired.
-  if (!chosenEmail && deps.fetcher && !prospect.synthetic) {
+  //    YouTube About). Each fetched page does double duty: extract real emails AND
+  //    grow the identity graph (a Linktree enumerates all the creator's accounts —
+  //    the strongest cross-platform signal). Real prospects with a fetcher only.
+  let profile = (prospect.evidence?.profile as Profile | null) ?? null;
+  const seedUrl = prospect.siteUrl ?? prospect.channelUrl;
+  if (deps.fetcher && !prospect.synthetic) {
     for (const c of prospect.evidence?.contactUrls ?? []) {
       let html: string | null = null;
       try {
@@ -190,15 +205,20 @@ export async function enrich(deps: RecruitmentDeps, prospectId: string): Promise
         /* skip unreachable contact page */
       }
       if (!html) continue;
-      for (const f of extractEmailsFromHtml(html)) {
-        const v = await verify(f.email).catch(() => ({ deliverable: false, reason: "verify error" }));
-        if (v.deliverable) {
-          chosenEmail = f.email;
-          contactSource = `${c.kind}:${f.source}`;
-          break;
+      // Grow the graph from this page's links (bio aggregators are high-confidence).
+      const page = { url: c.url, links: extractHrefs(html, c.url), bioAggregator: c.kind === "bio_aggregator" };
+      profile = profile ? addPageToProfile(profile, page, seedUrl) : buildProfile(seedUrl, [page]);
+      // Mine it for a deliverable contact email if we don't have one yet.
+      if (!chosenEmail) {
+        for (const f of extractEmailsFromHtml(html)) {
+          const v = await verify(f.email).catch(() => ({ deliverable: false, reason: "verify error" }));
+          if (v.deliverable) {
+            chosenEmail = f.email;
+            contactSource = `${c.kind}:${f.source}`;
+            break;
+          }
         }
       }
-      if (chosenEmail) break;
     }
   }
 
@@ -230,7 +250,7 @@ export async function enrich(deps: RecruitmentDeps, prospectId: string): Promise
   await deps.db.usageEvents.insert({ id: newId("use"), merchantId: prospect.merchantId, kind: "enrichment", quantity: 1, sourceId: prospectId, ts });
   return deps.db.prospects.update(prospectId, {
     email: chosenEmail,
-    evidence: { ...(prospect.evidence ?? {}), contactSource },
+    evidence: { ...(prospect.evidence ?? {}), contactSource, profile },
     state: "enriched",
     updatedAt: ts,
   });

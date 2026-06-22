@@ -32,3 +32,6 @@ export * from "./security/postback.js";
 export * from "./recruitment/scoring.js";
 export * from "./recruitment/state-machine.js";
 export * from "./recruitment/affiliate-detection.js";
+
+// ---- Creator identity graph (profile-graph plan) ----------------------------
+export * from "./profile/identity.js";

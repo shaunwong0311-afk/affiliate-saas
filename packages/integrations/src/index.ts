@@ -21,6 +21,7 @@ export {
   MxEmailVerifier,
   NoopEmailVerifier,
   extractEmailsFromHtml,
+  extractHrefs,
   discoverContactUrls,
   detectsContactForm,
   type EmailSource,

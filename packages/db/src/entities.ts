@@ -299,6 +299,16 @@ export interface Prospect {
     contactForm?: boolean;
     /** The page URL carrying the contact form, for the operator to open. */
     contactFormUrl?: string | null;
+    /**
+     * Resolved creator identity graph: the surfaces this person owns across
+     * platforms, each with provenance + confidence (profile-graph plan, Phase 1).
+     */
+    profile?: {
+      primary: { platform: string; handle: string | null; url: string; provenance: string; confidence: number } | null;
+      accounts: { platform: string; handle: string | null; url: string; provenance: string; confidence: number }[];
+      audience: { reach: number | null; primaryGeo: string | null; language: string | null; engagementRate: number | null; source: string | null };
+      identityConfidence: number;
+    } | null;
     pageUrl?: string | null;
   } | null;
   createdAt: Timestamp;
