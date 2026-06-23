@@ -75,6 +75,11 @@ const PLATFORM_ICONS: Record<string, string> = {
 function platformIcon(platform: string): string {
   return PLATFORM_ICONS[platform] ?? "•";
 }
+function fmtReach(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`;
+  return `${n}`;
+}
 
 export function Recruitment() {
   const [busy, setBusy] = useState(false);
@@ -361,8 +366,20 @@ export function Recruitment() {
                         </a>
                       ))}
                     </div>
+                    {(() => {
+                      const a = selected.evidence.profile.audience;
+                      const has = a && (a.reach != null || a.engagementRate != null || a.primaryGeo);
+                      return has ? (
+                        <div className="row wrap gap-8" style={{ marginTop: 10 }}>
+                          {a.reach != null && <Badge kind="pos">{fmtReach(a.reach)} reach</Badge>}
+                          {a.engagementRate != null && <Badge kind="info">{(a.engagementRate * 100).toFixed(1)}% engagement</Badge>}
+                          {a.primaryGeo && <Badge>{a.primaryGeo}</Badge>}
+                          {a.source && <span className="faint" style={{ fontSize: 10.5, alignSelf: "center" }}>via {a.source}</span>}
+                        </div>
+                      ) : null;
+                    })()}
                     <div className="faint" style={{ fontSize: 11, marginTop: 8 }}>
-                      Surfaces this creator owns, unified from the links they published. Audience demographics (geo/size) fill in once a provider is wired.
+                      Surfaces this creator owns, unified from the links they published. Reach + engagement fill in per platform (free on YouTube); audience demographics need a provider.
                     </div>
                   </div>
                 )}

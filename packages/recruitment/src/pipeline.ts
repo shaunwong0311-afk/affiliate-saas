@@ -238,12 +238,37 @@ export async function enrich(deps: RecruitmentDeps, prospectId: string): Promise
     }
   }
 
+  // Fill reach + engagement from the cheapest source per platform (YouTube API,
+  // scrape-API for IG/TikTok/X, on-page for Substack). Real prospects only; we enrich
+  // the primary + high-confidence accounts and cap the work. Unknown stays null.
+  let audienceReach: number | null = null;
+  let audienceEngagement: number | null = null;
+  if (deps.enricher && profile && !prospect.synthetic) {
+    const targets = profile.accounts.filter((a) => a.provenance === "seed" || a.confidence >= 0.85).slice(0, 4);
+    for (const a of targets) {
+      if (!deps.enricher.supports(a.platform)) continue;
+      const m = await deps.enricher.enrich({ platform: a.platform, handle: a.handle, url: a.url }).catch(() => null);
+      if (!m) continue;
+      if (m.reach != null) audienceReach = Math.max(audienceReach ?? 0, m.reach);
+      if (m.engagementRate != null && audienceEngagement == null) audienceEngagement = m.engagementRate;
+      if (profile.audience.primaryGeo == null && m.primaryGeo) profile.audience.primaryGeo = m.primaryGeo;
+      if (profile.audience.language == null && m.language) profile.audience.language = m.language;
+      profile.audience.source = m.source;
+    }
+    if (audienceReach != null) profile.audience.reach = audienceReach;
+    if (audienceEngagement != null) profile.audience.engagementRate = audienceEngagement;
+  }
+
   const signal = await deps.db.prospectSignals.findOne((s) => s.prospectId === prospectId);
   if (signal) {
-    // Only the verified-email signal is updated here. DA / engagement / audience
-    // stay UNKNOWN (null) unless a real SEO/creator-analytics provider is wired —
-    // they are never estimated from the domain string.
-    await deps.db.prospectSignals.update(signal.id, { verifiedEmail: !!chosenEmail } as Partial<ProspectSignal>);
+    // verifiedEmail always; reach/engagement ONLY when a real enricher returned them.
+    // DA / audience-overlap stay null unless their own provider is wired — never
+    // estimated. The score's confidence reflects how much is real (scoring.ts).
+    await deps.db.prospectSignals.update(signal.id, {
+      verifiedEmail: !!chosenEmail,
+      ...(audienceReach != null ? { reach: audienceReach } : {}),
+      ...(audienceEngagement != null ? { engagement: audienceEngagement } : {}),
+    } as Partial<ProspectSignal>);
   }
 
   const ts = deps.clock.now().toISOString();

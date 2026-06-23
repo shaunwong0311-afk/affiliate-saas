@@ -1,6 +1,7 @@
 import type { Clock } from "@affiliate/core";
 import type { Database } from "@affiliate/db";
 import type {
+  AccountEnricher,
   DiscoverySource,
   EmailFinder,
   EmailVerifier,
@@ -43,6 +44,12 @@ export interface RecruitmentDeps {
    * enrichment uses only the primary page + the EmailFinder (no secondary fetches).
    */
   fetcher?: HttpFetcher;
+  /**
+   * Fills reach + engagement for the accounts in the identity graph (YouTube API,
+   * scraping-API for IG/TikTok/X, on-page for Substack). Optional — when absent,
+   * those signals stay unknown (null), never invented.
+   */
+  enricher?: AccountEnricher;
   /** Meeting booking for the managed (A-tier) track. Optional. */
   calendar?: CalendarBooking;
   clock: Clock;

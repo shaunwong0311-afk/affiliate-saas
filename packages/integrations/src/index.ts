@@ -28,6 +28,12 @@ export {
   type ContactUrl,
   type ContactUrlKind,
 } from "./web-evidence.js";
+export {
+  YouTubeEnricher,
+  ScrapeMetricsEnricher,
+  OnPageSubscriberEnricher,
+  EnricherRegistry,
+} from "./enrichers.js";
 export { HashingEmbedder, DeterministicLlm, classifyReply, renderTemplate } from "./llm.js";
 export { AnthropicLlmClient } from "./anthropic-llm.js";
 export { InMemorySecretStore, EnvSecretStore } from "./secrets.js";

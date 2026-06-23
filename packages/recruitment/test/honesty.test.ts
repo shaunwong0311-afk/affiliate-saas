@@ -12,6 +12,7 @@ import {
   type EmailVerifier,
   type HttpFetcher,
   type FetchResult,
+  type AccountEnricher,
 } from "@affiliate/integrations";
 import { systemClock } from "@affiliate/core";
 import { runSourcing, type RecruitmentDeps } from "../src/index.js";
@@ -176,6 +177,34 @@ describe("discovery honesty (pipeline)", () => {
     // Accounts enumerated on the creator's own Linktree are high-confidence.
     expect(profile!.accounts.find((a) => a.platform === "youtube")!.provenance).toBe("bio_aggregator");
     expect(profile!.identityConfidence).toBeGreaterThanOrEqual(0.9);
+  });
+
+  it("fills REAL reach + engagement from the enricher (was null without a provider)", async () => {
+    const enricher: AccountEnricher = {
+      kind: "mock",
+      supports: (p) => p === "youtube",
+      async enrich() {
+        return { reach: 200000, engagementRate: 0.05, primaryGeo: "US", language: "en", source: "api" };
+      },
+    };
+    await runSourcing(
+      deps([new StaticSource([cand({ identity: "YTCreator", siteUrl: null, channelUrl: "https://youtube.com/@creator" })])], { enricher }),
+      "m1",
+      { limit: 5 },
+    );
+    const sig = (await db.prospectSignals.all())[0]!;
+    expect(sig.reach).toBe(200000);
+    expect(sig.engagement).toBe(0.05);
+    const p = (await db.prospects.find((x) => x.merchantId === "m1"))[0]!;
+    expect(p.evidence?.profile?.audience.reach).toBe(200000);
+    expect(p.evidence?.profile?.audience.source).toBe("api");
+  });
+
+  it("leaves reach + engagement null when no enricher is wired (never invented)", async () => {
+    await runSourcing(deps([new StaticSource([cand({ identity: "NoProv2", channelUrl: "https://youtube.com/@x" })])]), "m1", { limit: 5 });
+    const sig = (await db.prospectSignals.all())[0]!;
+    expect(sig.reach).toBeNull();
+    expect(sig.engagement).toBeNull();
   });
 
   it("flags a contact-form-only prospect for the human gate (no email invented)", async () => {

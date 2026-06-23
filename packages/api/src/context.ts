@@ -27,6 +27,10 @@ import {
   staticProxyPool,
   FetchRedirectResolver,
   MxEmailVerifier,
+  YouTubeEnricher,
+  ScrapeMetricsEnricher,
+  OnPageSubscriberEnricher,
+  EnricherRegistry,
   StubCalendarBooking,
   ConsoleTransactionalMailer,
   type MailboxSender,
@@ -38,6 +42,7 @@ import {
   type DiscoverySource,
   type RedirectResolver,
   type HttpFetcher,
+  type AccountEnricher,
   type CalendarBooking,
   type TransactionalMailer,
 } from "@affiliate/integrations";
@@ -68,6 +73,8 @@ export interface AppContext {
   emailVerifier?: EmailVerifier;
   /** Page fetcher for following contact-bearing links during enrichment. Optional. */
   fetcher?: HttpFetcher;
+  /** Fills reach + engagement for identity-graph accounts (YouTube/scrape/on-page). Optional. */
+  enricher?: AccountEnricher;
   calendar: CalendarBooking;
   /** Transactional mail (magic links, payout notices) — routed via an ESP, never the box IP. */
   transactionalMailer: TransactionalMailer;
@@ -125,6 +132,16 @@ export function createContext(overrides: Partial<AppContext> = {}): AppContext {
   // so dev/test never make secondary network calls.
   const fetcher = overrides.fetcher ?? (realDiscovery ? pageFetcher : undefined);
 
+  // Audience enrichment: one registry, cheapest source per platform. YouTube is free
+  // (Data API); IG/TikTok/X use a scraping-API actor (public counts + engagement, no
+  // demographics); Substack reads its on-page subscriber count. Each is key-gated;
+  // an account with no matching wired enricher keeps reach/engagement null.
+  const enrichers: AccountEnricher[] = [];
+  if (process.env.YOUTUBE_API_KEY) enrichers.push(new YouTubeEnricher({ apiKey: process.env.YOUTUBE_API_KEY, http: jsonHttp }));
+  if (process.env.SCRAPE_API_URL) enrichers.push(new ScrapeMetricsEnricher({ endpoint: process.env.SCRAPE_API_URL, apiKey: process.env.SCRAPE_API_KEY, http: jsonHttp }));
+  if (fetcher) enrichers.push(new OnPageSubscriberEnricher(fetcher));
+  const enricher = overrides.enricher ?? (enrichers.length ? new EnricherRegistry(enrichers) : undefined);
+
   // Real LLM (AI-SDR + personalization) when an API key is present; deterministic
   // stub otherwise so the platform still runs with zero external services.
   const llm =
@@ -145,6 +162,7 @@ export function createContext(overrides: Partial<AppContext> = {}): AppContext {
     redirectResolver,
     emailVerifier,
     fetcher,
+    enricher,
     calendar: overrides.calendar ?? new StubCalendarBooking(),
     transactionalMailer: overrides.transactionalMailer ?? new ConsoleTransactionalMailer(),
     clock: overrides.clock ?? systemClock,

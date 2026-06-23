@@ -165,21 +165,29 @@ export interface ProfileSource {
   collect(url: string): Promise<ProfileFragment | null>;
 }
 
+/** Public, per-account metrics. `source` records how they were obtained. Unknown
+ * fields stay null — never invented. Demographics (audience geo/age) are a later,
+ * paid add (`source: "provider"`); this seam carries reach + engagement first. */
+export interface AccountMetrics {
+  reach: number | null; // followers / subscribers
+  engagementRate: number | null; // 0..1, from recent public posts
+  primaryGeo: string | null; // the CREATOR's country, when exposed (not audience geo)
+  language: string | null;
+  source: "api" | "scrape" | "page" | "provider";
+}
+
 /**
- * Audience demographics (geo / age / interests). Phase 3 wires an INFERRED estimator
- * (cheap proxies — creator geo, content language); Phase 4 can drop in a paid
- * creator-intelligence provider (Modash/HypeAuditor) for A-tier prospects only. Both
- * behind this seam; unknown stays null, never invented.
+ * Enriches one account in the identity graph with reach + engagement, from the
+ * cheapest source for that platform: a free API (YouTube), an on-page fetch
+ * (Substack), or a scraping-API actor (Instagram/TikTok/X — public counts only,
+ * no demographics). Each adapter declares which platforms it `supports`; the
+ * registry routes per account. Real adapters are key-gated; absent one, the
+ * account's metrics stay unknown (null), never invented.
  */
-export interface AudienceProvider {
+export interface AccountEnricher {
   readonly kind: string;
-  estimate(input: { platform: string; handle?: string | null; url: string }): Promise<{
-    reach: number | null;
-    primaryGeo: string | null;
-    language: string | null;
-    engagementRate: number | null;
-    source: "inferred" | "provider" | "creator_provided" | null;
-  } | null>;
+  supports(platform: string): boolean;
+  enrich(account: { platform: string; handle: string | null; url: string }): Promise<AccountMetrics | null>;
 }
 
 // ---- LLM + embeddings (Section 8.3 / 8.4 / 8.5) ----------------------------

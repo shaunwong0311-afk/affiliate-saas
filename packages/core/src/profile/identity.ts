@@ -47,12 +47,15 @@ export interface Account {
  * weight them. Filled cheaply by inference (Phase 3) and, later, a paid provider
  * (Phase 4) for A-tier prospects.
  */
+export type AudienceSource = "api" | "scrape" | "page" | "inferred" | "provider" | "creator_provided" | null;
+
 export interface AudienceEstimate {
   reach: number | null;
   primaryGeo: string | null;
   language: string | null;
   engagementRate: number | null;
-  source: "inferred" | "provider" | "creator_provided" | null;
+  /** How the figures were obtained — drives the confidence UX. */
+  source: AudienceSource;
 }
 
 export interface Profile {
