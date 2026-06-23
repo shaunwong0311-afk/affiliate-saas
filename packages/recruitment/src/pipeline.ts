@@ -47,7 +47,7 @@ export async function discover(
     niche: merchant.niche ?? "general",
     competitors: merchant.competitors,
     keywords: [`best ${merchant.niche ?? "products"}`, `${merchant.niche ?? "product"} review`],
-    channels: ["serp", "youtube", "blog", "community"],
+    channels: ["serp", "youtube", "blog", "newsletter", "podcast", "community"],
     limit: opts?.limit ?? 10,
   };
 
@@ -243,11 +243,18 @@ export async function enrich(deps: RecruitmentDeps, prospectId: string): Promise
   // the primary + high-confidence accounts and cap the work. Unknown stays null.
   let audienceReach: number | null = null;
   let audienceEngagement: number | null = null;
-  if (deps.enricher && profile && !prospect.synthetic) {
-    const targets = profile.accounts.filter((a) => a.provenance === "seed" || a.confidence >= 0.85).slice(0, 4);
+  const enricher = deps.enricher;
+  if (enricher && profile && !prospect.synthetic) {
+    // Filter to BILLABLE (enricher-supported) accounts FIRST, then cap by confidence —
+    // so the cap counts paid lookups, not graph nodes, and walled accounts aren't
+    // crowded out by website/linktree nodes.
+    const cap = deps.enrichmentMaxAccounts ?? 3;
+    const targets = profile.accounts
+      .filter((a) => (a.provenance === "seed" || a.confidence >= 0.85) && enricher.supports(a.platform))
+      .sort((a, b) => b.confidence - a.confidence)
+      .slice(0, cap);
     for (const a of targets) {
-      if (!deps.enricher.supports(a.platform)) continue;
-      const m = await deps.enricher.enrich({ platform: a.platform, handle: a.handle, url: a.url }).catch(() => null);
+      const m = await enricher.enrich({ platform: a.platform, handle: a.handle, url: a.url }).catch(() => null);
       if (!m) continue;
       if (m.reach != null) audienceReach = Math.max(audienceReach ?? 0, m.reach);
       if (m.engagementRate != null && audienceEngagement == null) audienceEngagement = m.engagementRate;

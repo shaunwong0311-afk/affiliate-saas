@@ -50,6 +50,12 @@ export interface RecruitmentDeps {
    * those signals stay unknown (null), never invented.
    */
   enricher?: AccountEnricher;
+  /**
+   * Max billable account lookups to spend per prospect during enrichment (cost
+   * control). We enrich the highest-confidence enricher-supported accounts up to
+   * this cap. Default 3. Set to 1 to enrich only the primary surface.
+   */
+  enrichmentMaxAccounts?: number;
   /** Meeting booking for the managed (A-tier) track. Optional. */
   calendar?: CalendarBooking;
   clock: Clock;

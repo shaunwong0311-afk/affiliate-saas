@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
-import { YouTubeEnricher, ScrapeMetricsEnricher, OnPageSubscriberEnricher, EnricherRegistry } from "../src/index.js";
-import type { FetchResult, HttpFetcher } from "../src/index.js";
+import { YouTubeEnricher, ScrapeMetricsEnricher, OnPageSubscriberEnricher, EnricherRegistry, CachingEnricher } from "../src/index.js";
+import type { FetchResult, HttpFetcher, AccountEnricher } from "../src/index.js";
 
 /** Mock YouTube Data API: channels → uploads playlist → video stats. */
 const ytHttp = {
@@ -64,5 +64,34 @@ describe("EnricherRegistry", () => {
     expect(reg.supports("tiktok")).toBe(false);
     expect((await reg.enrich({ platform: "youtube", handle: "@c", url: "x" }))?.reach).toBe(125000);
     expect(await reg.enrich({ platform: "tiktok", handle: "@c", url: "x" })).toBeNull();
+  });
+});
+
+describe("CachingEnricher", () => {
+  it("calls the inner enricher once per account, then serves from cache (saves credits)", async () => {
+    let calls = 0;
+    const inner: AccountEnricher = {
+      kind: "counting",
+      supports: () => true,
+      async enrich() {
+        calls++;
+        return { reach: 1000, engagementRate: 0.05, primaryGeo: null, language: null, source: "api" };
+      },
+    };
+    const c = new CachingEnricher(inner);
+    await c.enrich({ platform: "youtube", handle: "@a", url: "x" });
+    await c.enrich({ platform: "youtube", handle: "@a", url: "x" });
+    expect(calls).toBe(1); // second call served from cache
+    await c.enrich({ platform: "youtube", handle: "@b", url: "y" });
+    expect(calls).toBe(2); // different creator → one more call
+  });
+
+  it("caches misses too — a known-null isn't re-fetched", async () => {
+    let calls = 0;
+    const inner: AccountEnricher = { kind: "null", supports: () => true, async enrich() { calls++; return null; } };
+    const c = new CachingEnricher(inner);
+    await c.enrich({ platform: "tiktok", handle: "@a", url: "x" });
+    await c.enrich({ platform: "tiktok", handle: "@a", url: "x" });
+    expect(calls).toBe(1);
   });
 });

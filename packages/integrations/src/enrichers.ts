@@ -116,6 +116,34 @@ export class OnPageSubscriberEnricher implements AccountEnricher {
   }
 }
 
+/**
+ * Caches enricher results (including misses) by platform+handle for a TTL, so the
+ * same creator — seen across merchants or re-runs — is only paid for once per
+ * window. The single biggest credit saver once merchant niches overlap.
+ */
+export class CachingEnricher implements AccountEnricher {
+  readonly kind: string;
+  private readonly cache = new Map<string, { metrics: AccountMetrics | null; expiresAt: number }>();
+  constructor(
+    private readonly inner: AccountEnricher,
+    private readonly ttlMs: number = 24 * 60 * 60 * 1000,
+  ) {
+    this.kind = `cached:${inner.kind}`;
+  }
+  supports(platform: string): boolean {
+    return this.inner.supports(platform);
+  }
+  async enrich(account: { platform: string; handle: string | null; url: string }): Promise<AccountMetrics | null> {
+    const key = `${account.platform}:${(account.handle ?? account.url).toLowerCase()}`;
+    const now = Date.now();
+    const hit = this.cache.get(key);
+    if (hit && hit.expiresAt > now) return hit.metrics;
+    const metrics = await this.inner.enrich(account);
+    this.cache.set(key, { metrics, expiresAt: now + this.ttlMs });
+    return metrics;
+  }
+}
+
 /** Routes an account to the first enricher that supports its platform. */
 export class EnricherRegistry implements AccountEnricher {
   readonly kind = "registry";

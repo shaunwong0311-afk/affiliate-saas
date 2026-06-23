@@ -31,6 +31,7 @@ import {
   ScrapeMetricsEnricher,
   OnPageSubscriberEnricher,
   EnricherRegistry,
+  CachingEnricher,
   StubCalendarBooking,
   ConsoleTransactionalMailer,
   type MailboxSender,
@@ -140,7 +141,8 @@ export function createContext(overrides: Partial<AppContext> = {}): AppContext {
   if (process.env.YOUTUBE_API_KEY) enrichers.push(new YouTubeEnricher({ apiKey: process.env.YOUTUBE_API_KEY, http: jsonHttp }));
   if (process.env.SCRAPE_API_URL) enrichers.push(new ScrapeMetricsEnricher({ endpoint: process.env.SCRAPE_API_URL, apiKey: process.env.SCRAPE_API_KEY, http: jsonHttp }));
   if (fetcher) enrichers.push(new OnPageSubscriberEnricher(fetcher));
-  const enricher = overrides.enricher ?? (enrichers.length ? new EnricherRegistry(enrichers) : undefined);
+  // Cache results (incl. misses) so the same creator isn't paid for twice within the day.
+  const enricher = overrides.enricher ?? (enrichers.length ? new CachingEnricher(new EnricherRegistry(enrichers)) : undefined);
 
   // Real LLM (AI-SDR + personalization) when an API key is present; deterministic
   // stub otherwise so the platform still runs with zero external services.

@@ -3,6 +3,7 @@ import { detectAffiliateLinksInHtml, type AffiliateSignal } from "@affiliate/cor
 import type { Database } from "@affiliate/db";
 import type { DiscoveryQuery, DiscoverySource, RawCandidate } from "./ports.js";
 import { DeterministicFetcher, type HttpFetcher } from "./http.js";
+import { buildDiscoveryQueries } from "./query-strategy.js";
 
 /**
  * Production-shaped discovery sources (Section 8.1). These are the real "find
@@ -67,6 +68,39 @@ function safeHost(url: string): string | null {
   }
 }
 
+// Platforms whose identity lives in the PATH (or subdomain), so the host alone does
+// not identify a creator — dedup and seed URLs must keep the handle.
+const SOCIAL_HOSTS = ["youtube.com", "twitter.com", "x.com", "instagram.com", "tiktok.com"];
+const PATH_PLATFORM_HOSTS = [...SOCIAL_HOSTS, "medium.com", "reddit.com"];
+
+function cleanUrl(url: string): string {
+  try {
+    const u = new URL(url);
+    u.search = "";
+    u.hash = "";
+    return u.toString().replace(/\/$/, "");
+  } catch {
+    return url;
+  }
+}
+
+/**
+ * A stable identity key for dedup. For path-based platforms (youtube.com/@a vs
+ * youtube.com/@b) the first path segment is part of the key, so distinct creators on
+ * the same host are NOT collapsed; ordinary sites key on host.
+ */
+function candidateKey(url: string): string | null {
+  const host = safeHost(url);
+  if (!host) return null;
+  if (!PATH_PLATFORM_HOSTS.includes(host)) return host;
+  try {
+    const seg = new URL(url).pathname.split("/").filter(Boolean)[0];
+    return seg ? `${host}/${seg.toLowerCase()}` : host;
+  } catch {
+    return host;
+  }
+}
+
 /**
  * SERP discovery: buyer-intent queries → result pages → affiliate-link detection.
  * This is the headline "find from scratch" source. Real in production (SERP API +
@@ -79,37 +113,42 @@ export class SerpDiscoverySource implements DiscoverySource {
   constructor(
     private readonly serp: SerpProvider = new DeterministicSerpProvider(),
     private readonly fetcher: HttpFetcher = new DeterministicFetcher(),
+    private readonly opts: { maxQueries?: number } = {},
   ) {
     this.synthetic = serp.kind === "deterministic-serp" || fetcher.kind === "deterministic";
   }
 
   async discover(query: DiscoveryQuery): Promise<RawCandidate[]> {
-    const niche = query.niche || "products";
-    const competitors = query.competitors.length ? query.competitors : ["competitor.com"];
-    const queries = [
-      `best ${niche}`,
-      `${niche} review`,
-      ...competitors.slice(0, 2).map((c) => `${c} review`),
-      ...competitors.slice(0, 2).map((c) => `${c} alternative`),
-      `${niche} vs`,
-    ];
-
-    const perQuery = Math.max(1, Math.ceil(query.limit / queries.length));
+    // Prioritized, deduped, capped query set from the merchant ICP (competitor mining
+    // first, then buyer-intent, then platform-targeted creator discovery).
+    const plans = buildDiscoveryQueries(query, { max: this.opts.maxQueries });
+    const perQuery = Math.max(1, Math.ceil(query.limit / Math.max(1, plans.length)));
     const seen = new Set<string>();
     const out: RawCandidate[] = [];
 
-    for (const q of queries) {
+    for (const plan of plans) {
+      if (out.length >= query.limit) break;
       let hits: SerpHit[];
       try {
-        hits = await this.serp.search(q, perQuery);
+        hits = await this.serp.search(plan.q, perQuery);
       } catch {
         continue; // isolate source failures (Section 8.1)
       }
       for (const hit of hits) {
         if (out.length >= query.limit) break;
         const host = safeHost(hit.url);
-        if (!host || seen.has(host)) continue;
-        seen.add(host);
+        if (!host) continue;
+        const key = candidateKey(hit.url) ?? host;
+        if (seen.has(key)) continue; // platform-aware: distinct creators on a host survive
+        seen.add(key);
+
+        // For path-based platforms (youtube.com/@x, …) the profile URL — not the bare
+        // host — is the creator; social hits become channelUrl so the graph/enricher
+        // can resolve the handle.
+        const isSocial = SOCIAL_HOSTS.includes(host);
+        const isPathPlatform = PATH_PLATFORM_HOSTS.includes(host);
+        const siteUrl = isSocial ? null : isPathPlatform ? cleanUrl(hit.url) : `https://${host}`;
+        const channelUrl = isSocial ? cleanUrl(hit.url) : null;
 
         // Fetch the page and run the REAL affiliate-link detector over it. On a
         // failed/short fetch we record ZERO affiliate links — we never fabricate
@@ -130,13 +169,13 @@ export class SerpDiscoverySource implements DiscoverySource {
 
         out.push({
           identity: hit.title.replace(/ — .*/, "").slice(0, 80),
-          siteUrl: `https://${host}`,
-          channelUrl: null,
+          siteUrl,
+          channelUrl,
           sourceType: this.sourceType,
           evidenceUrl: hit.url,
           evidenceSummary: fetched
-            ? `Ranks for "${q}"; ${signals.length} affiliate link(s) detected on page. ${hit.snippet}`
-            : `Ranks for "${q}" — page not fetched (no affiliate evidence collected). ${hit.snippet}`,
+            ? `Ranks for "${plan.q}" [${plan.channel}]; ${signals.length} affiliate link(s) detected on page. ${hit.snippet}`
+            : `Ranks for "${plan.q}" [${plan.channel}] — page not fetched (no affiliate evidence collected). ${hit.snippet}`,
           outboundLinks: signals.map((s) => s.url),
           pageHtml,
           synthetic: this.synthetic,
