@@ -43,6 +43,31 @@ interface Prospect {
   scoreBreakdown: { explanation?: string[]; breakdown?: { factor: string; contribution: number; note: string }[]; unknownFactors?: string[] } | null;
 }
 
+interface OutreachMessage {
+  id: string;
+  step: number;
+  variant: string;
+  subject: string;
+  sentAt: string | null;
+  status: string; // queued | sent | bounced | failed
+}
+interface Reply {
+  id: string;
+  classification: string; // interested | question | not_interested | unsubscribe | auto_reply | other
+  ts: string;
+}
+
+// Map a prospect state to a compact outreach-status badge for the queue.
+const OUTREACH_STATE: Record<string, { label: string; kind: string }> = {
+  contacted: { label: "contacted", kind: "info" },
+  in_sequence: { label: "in sequence", kind: "info" },
+  replied: { label: "replied", kind: "pos" },
+  converted: { label: "converted", kind: "pos" },
+  bounced: { label: "bounced", kind: "neg" },
+  suppressed: { label: "suppressed", kind: "neg" },
+  dead: { label: "dead", kind: "" },
+};
+
 const PLATFORM_ICONS: Record<string, string> = {
   youtube: "▶", twitter: "𝕏", instagram: "◙", tiktok: "♪", substack: "✉", beehiiv: "🐝",
   podcast: "🎙", linktree: "🌳", website: "🌐", unknown: "•",
@@ -56,6 +81,7 @@ export function Recruitment() {
   const [msg, setMsg] = useState<string | null>(null);
   const [selected, setSelected] = useState<Prospect | null>(null);
   const [draft, setDraft] = useState<{ subject: string; body: string; formUrl: string | null } | null>(null);
+  const [activity, setActivity] = useState<{ messages: OutreachMessage[]; replies: Reply[] } | null>(null);
   const prospects = useApi<{ items: Prospect[]; total: number }>(() => api.get("/recruitment/prospects?limit=100"));
   const icp = useApi<{ niche: string | null; competitors: string[] }>(() => api.get("/recruitment/icp"));
 
@@ -87,6 +113,12 @@ export function Recruitment() {
   function select(p: Prospect) {
     setSelected(p);
     setDraft(null); // clear any stale contact-form draft
+    setActivity(null);
+    // Pull the full outreach history (touches + replies) for the timeline.
+    api
+      .get<{ messages: OutreachMessage[]; replies: Reply[] }>(`/recruitment/prospects/${p.id}`)
+      .then((d) => setActivity({ messages: d.messages ?? [], replies: d.replies ?? [] }))
+      .catch(() => setActivity({ messages: [], replies: [] }));
   }
 
   async function loadDraft(p: Prospect) {
@@ -157,6 +189,7 @@ export function Recruitment() {
                         <div style={{ fontWeight: 600 }} className="row gap-8">
                           {p.identity}
                           {p.synthetic && <Badge kind="warn">demo</Badge>}
+                          {OUTREACH_STATE[p.state] && <Badge kind={OUTREACH_STATE[p.state].kind}>{OUTREACH_STATE[p.state].label}</Badge>}
                         </div>
                         <div className="faint mono" style={{ fontSize: 11 }}>{p.email ?? "no email"}</div>
                       </td>
@@ -196,6 +229,58 @@ export function Recruitment() {
                     Synthetic demo prospect — generated offline, not a real person. Wire a SERP/email provider for live discovery.
                   </div>
                 )}
+
+                <div className="card" style={{ background: "var(--ink-850)", marginBottom: 14, padding: 14 }}>
+                  <div className="faint" style={{ fontSize: 11, letterSpacing: 0.4, textTransform: "uppercase", marginBottom: 8 }}>Outreach history</div>
+                  {!activity ? (
+                    <span className="faint" style={{ fontSize: 12 }}>loading…</span>
+                  ) : (
+                    (() => {
+                      const sent = activity.messages.filter((m) => m.status === "sent");
+                      const followUps = sent.filter((m) => m.step > 1).length;
+                      const bounced = activity.messages.some((m) => m.status === "bounced") || selected.state === "bounced";
+                      const lastSent = sent.map((m) => m.sentAt).filter(Boolean).sort().slice(-1)[0] ?? null;
+                      if (sent.length === 0 && activity.replies.length === 0) {
+                        return <div className="muted" style={{ fontSize: 12.5 }}>Not contacted yet — still in discovery/scoring.</div>;
+                      }
+                      const events = [
+                        ...activity.messages
+                          .filter((m) => m.sentAt || m.status !== "queued")
+                          .map((m) => ({ ts: m.sentAt ?? "", label: `Touch ${m.step} ${m.status}${m.variant ? ` · ${m.variant}` : ""}`, kind: m.status === "bounced" ? "neg" : m.status === "sent" ? "info" : "" })),
+                        ...activity.replies.map((r) => ({
+                          ts: r.ts,
+                          label: `Reply · ${r.classification.replace(/_/g, " ")}`,
+                          kind: r.classification === "interested" ? "pos" : r.classification === "unsubscribe" || r.classification === "not_interested" ? "neg" : "warn",
+                        })),
+                      ]
+                        .filter((e) => e.ts)
+                        .sort((a, b) => b.ts.localeCompare(a.ts));
+                      return (
+                        <>
+                          <div className="row wrap gap-8" style={{ marginBottom: 10 }}>
+                            <Badge kind="info">{sent.length} touch{sent.length === 1 ? "" : "es"} sent</Badge>
+                            {followUps > 0 && <Badge>{followUps} follow-up{followUps === 1 ? "" : "s"}</Badge>}
+                            {activity.replies.length > 0 ? (
+                              <Badge kind="pos">{activity.replies.length} repl{activity.replies.length === 1 ? "y" : "ies"}</Badge>
+                            ) : (
+                              <Badge>no reply yet</Badge>
+                            )}
+                            {bounced && <Badge kind="neg">bounced</Badge>}
+                            {lastSent && <span className="faint" style={{ fontSize: 11, alignSelf: "center" }}>last touch {new Date(lastSent).toLocaleDateString()}</span>}
+                          </div>
+                          <div style={{ borderLeft: "2px solid var(--line)", paddingLeft: 12 }}>
+                            {events.map((e, i) => (
+                              <div key={i} className="row gap-8" style={{ marginBottom: 6, alignItems: "baseline" }}>
+                                <span className="faint mono" style={{ fontSize: 11, minWidth: 74 }}>{new Date(e.ts).toLocaleDateString()}</span>
+                                <Badge kind={e.kind}>{e.label}</Badge>
+                              </div>
+                            ))}
+                          </div>
+                        </>
+                      );
+                    })()
+                  )}
+                </div>
 
                 {selected.scoreBreakdown?.breakdown?.filter((b) => b.contribution > 0).map((b) => (
                   <div className="factor-row" key={b.factor}>

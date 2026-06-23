@@ -98,7 +98,11 @@ export const recruitmentRoutes: RouteModule = (app, ctx) => {
     if (!prospect || prospect.merchantId !== merchantId) throw notFound("prospect");
     const sources = await ctx.db.prospectSources.find((s) => s.prospectId === id);
     const signals = await ctx.db.prospectSignals.find((s) => s.prospectId === id);
-    return ok(reply, { ...prospect, sources, signals, scoreBreakdown: prospect.scoreBreakdown });
+    // Outreach history: every touch we sent (+ status) and every reply we got, so
+    // the operator sees whether/how often we've reached out and what came back.
+    const messages = (await ctx.db.outreachMessages.find((m) => m.prospectId === id)).sort((a, b) => a.step - b.step);
+    const replies = (await ctx.db.replies.find((r) => r.prospectId === id)).sort((a, b) => a.ts.localeCompare(b.ts));
+    return ok(reply, { ...prospect, sources, signals, messages, replies, scoreBreakdown: prospect.scoreBreakdown });
   });
 
   app.post("/recruitment/prospects/:id/approve", async (request, reply) => {

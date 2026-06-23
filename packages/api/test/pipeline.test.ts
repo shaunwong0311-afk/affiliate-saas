@@ -158,5 +158,17 @@ describe("substrate end-to-end", () => {
     expect(prospects.data.items.length).toBeGreaterThan(0);
     const tiers = new Set(prospects.data.items.map((p: any) => p.tier));
     expect(tiers.size).toBeGreaterThan(0);
+
+    // The prospect detail exposes outreach history (touches + replies) for the timeline.
+    const first = prospects.data.items[0];
+    const detail = await call("GET", `/recruitment/prospects/${first.id}`);
+    expect(Array.isArray(detail.data.messages)).toBe(true);
+    expect(Array.isArray(detail.data.replies)).toBe(true);
+
+    // A logged reply shows up in the prospect's history.
+    await call("POST", `/recruitment/prospects/${first.id}/reply`, { raw: "This sounds interesting, tell me more!" });
+    const afterReply = await call("GET", `/recruitment/prospects/${first.id}`);
+    expect(afterReply.data.replies.length).toBeGreaterThan(0);
+    expect(afterReply.data.replies[0].classification).toBeTruthy();
   });
 });
