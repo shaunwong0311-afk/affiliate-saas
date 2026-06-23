@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
-import { buildDiscoveryQueries, SerpDiscoverySource } from "../src/index.js";
-import type { DiscoveryQuery, SerpProvider, SerpHit, HttpFetcher, FetchResult } from "../src/index.js";
+import { buildDiscoveryQueries, SerpDiscoverySource, BacklinkDiscoverySource } from "../src/index.js";
+import type { DiscoveryQuery, SerpProvider, SerpHit, HttpFetcher, FetchResult, BacklinkProvider, BacklinkRow } from "../src/index.js";
 
 const baseQuery: DiscoveryQuery = {
   merchantId: "m1",
@@ -68,5 +68,34 @@ describe("SerpDiscoverySource — platform-aware dedup", () => {
     expect(blog).toBeTruthy();
     expect(blog!.channelUrl).toBeNull();
     expect(cands.filter((c) => c.siteUrl?.includes("blogx.com")).length).toBe(1); // one per host
+  });
+});
+
+class FakeBacklinks implements BacklinkProvider {
+  readonly kind = "fake-backlink";
+  constructor(private readonly rows: BacklinkRow[]) {}
+  async referringLinks(): Promise<BacklinkRow[]> {
+    return this.rows;
+  }
+}
+
+describe("BacklinkDiscoverySource — competitor-affiliate mining", () => {
+  const q: DiscoveryQuery = { ...baseQuery, competitors: ["rival.com"], limit: 10 };
+
+  it("keeps only referring pages whose link to the competitor is an AFFILIATE link", async () => {
+    const rows: BacklinkRow[] = [
+      { urlFrom: "https://affiliateblog.com/review", urlTo: "https://rival.com/product?ref=joe", anchor: "buy rival" }, // affiliate → keep
+      { urlFrom: "https://newssite.com/article", urlTo: "https://rival.com/about", anchor: "rival" }, // plain mention → drop
+      { urlFrom: "https://affiliateblog.com/other", urlTo: "https://rival.com/x?ref=joe", anchor: "" }, // same referring domain → dedup
+    ];
+    const cands = await new BacklinkDiscoverySource(new FakeBacklinks(rows)).discover(q);
+    expect(cands.length).toBe(1);
+    expect(cands[0]!.identity).toBe("affiliateblog.com");
+    expect(cands[0]!.outboundLinks[0]).toContain("ref=joe");
+    expect(cands[0]!.evidenceSummary).toMatch(/proven affiliate/);
+  });
+
+  it("returns nothing when no provider is wired (honest empty, never fabricated)", async () => {
+    expect(await new BacklinkDiscoverySource().discover(q)).toEqual([]);
   });
 });

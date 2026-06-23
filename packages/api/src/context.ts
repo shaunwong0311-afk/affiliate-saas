@@ -20,6 +20,8 @@ import {
   SerpApiProvider,
   DeterministicSerpProvider,
   BacklinkDiscoverySource,
+  DataForSEOBacklinkProvider,
+  DeterministicBacklinkProvider,
   DbCustomerMiningSource,
   ProxyHttpFetcher,
   DeterministicFetcher,
@@ -109,14 +111,20 @@ export function createContext(overrides: Partial<AppContext> = {}): AppContext {
   const syntheticSources = config.allowSyntheticDiscovery
     ? [new CompetitorAffiliateSource(), new CreatorDiscoverySource()]
     : [];
+  // Competitor-affiliate mining — the warmest source. Real via DataForSEO (pay-as-you-go
+  // backlinks) when keyed; a deterministic generator in dev (labeled synthetic); nothing
+  // in production without a key (honest empty, never fabricated).
+  const backlinkProvider =
+    process.env.DATAFORSEO_LOGIN && process.env.DATAFORSEO_PASSWORD
+      ? new DataForSEOBacklinkProvider({ login: process.env.DATAFORSEO_LOGIN, password: process.env.DATAFORSEO_PASSWORD })
+      : config.allowSyntheticDiscovery
+        ? new DeterministicBacklinkProvider()
+        : undefined;
   const discoverySources: DiscoverySource[] = overrides.discoverySources ?? [
     serpSource,
     ...syntheticSources,
     new DbCustomerMiningSource(db),
-    new BacklinkDiscoverySource({
-      apiKey: process.env.BACKLINK_API_KEY,
-      http: process.env.BACKLINK_API_KEY ? jsonHttp : undefined,
-    }),
+    new BacklinkDiscoverySource(backlinkProvider),
   ];
 
   // Email finding: real Hunter.io when keyed, deterministic pattern stub otherwise.

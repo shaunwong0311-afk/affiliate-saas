@@ -45,9 +45,13 @@ export {
   DeterministicSerpProvider,
   SerpDiscoverySource,
   BacklinkDiscoverySource,
+  DataForSEOBacklinkProvider,
+  DeterministicBacklinkProvider,
   DbCustomerMiningSource,
   type SerpProvider,
   type SerpHit,
+  type BacklinkProvider,
+  type BacklinkRow,
 } from "./discovery-real.js";
 export {
   StubCalendarBooking,

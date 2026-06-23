@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { detectAffiliateLinksInHtml, type AffiliateSignal } from "@affiliate/core";
+import { detectAffiliateLinksInHtml, detectAffiliateUrl, type AffiliateSignal } from "@affiliate/core";
 import type { Database } from "@affiliate/db";
 import type { DiscoveryQuery, DiscoverySource, RawCandidate } from "./ports.js";
 import { DeterministicFetcher, type HttpFetcher } from "./http.js";
@@ -186,19 +186,123 @@ export class SerpDiscoverySource implements DiscoverySource {
   }
 }
 
-/** Backlink/competitor-affiliate mining (Ahrefs/SEMrush) — real-shape skeleton. */
+/** One referring link: a page (`urlFrom`) that links to a target (`urlTo`). */
+export interface BacklinkRow {
+  urlFrom: string;
+  urlTo: string;
+  anchor: string | null;
+}
+
+/** A backlink data provider — real (DataForSEO) or a deterministic generator. */
+export interface BacklinkProvider {
+  readonly kind: string;
+  /** Pages that link AT the target domain (i.e. who already links to the competitor). */
+  referringLinks(targetDomain: string, limit: number): Promise<BacklinkRow[]>;
+}
+
+interface PostJson {
+  post(url: string, body: unknown, headers: Record<string, string>): Promise<{ status: number; json: any }>;
+}
+
+async function postJson(url: string, body: unknown, headers: Record<string, string>): Promise<{ status: number; json: any }> {
+  const res = await fetch(url, { method: "POST", headers, body: JSON.stringify(body) });
+  let json: any = null;
+  try {
+    json = await res.json();
+  } catch {
+    json = null;
+  }
+  return { status: res.status, json };
+}
+
+/**
+ * DataForSEO Backlinks API adapter — pay-as-you-go, ~100× cheaper than Ahrefs.
+ * Basic-auth POST to the live backlinks endpoint; maps rows to {urlFrom,urlTo,anchor}.
+ */
+export class DataForSEOBacklinkProvider implements BacklinkProvider {
+  readonly kind = "dataforseo";
+  constructor(private readonly opts: { login: string; password: string; http?: PostJson }) {}
+  async referringLinks(target: string, limit: number): Promise<BacklinkRow[]> {
+    const auth = Buffer.from(`${this.opts.login}:${this.opts.password}`).toString("base64");
+    const url = "https://api.dataforseo.com/v3/backlinks/backlinks/live";
+    const body = [{ target, limit, mode: "as_is", backlinks_status_type: "live" }];
+    const headers = { Authorization: `Basic ${auth}`, "Content-Type": "application/json" };
+    const res = this.opts.http ? await this.opts.http.post(url, body, headers) : await postJson(url, body, headers);
+    const items = (res.json?.tasks?.[0]?.result?.[0]?.items ?? []) as Array<{ url_from?: string; url_to?: string; anchor?: string }>;
+    return items
+      .map((i) => ({ urlFrom: i.url_from ?? "", urlTo: i.url_to ?? "", anchor: i.anchor ?? null }))
+      .filter((r) => r.urlFrom && r.urlTo);
+  }
+}
+
+/** Deterministic backlink generator — affiliate links to the target, for offline/demo. */
+export class DeterministicBacklinkProvider implements BacklinkProvider {
+  readonly kind = "deterministic-backlink";
+  async referringLinks(target: string, limit: number): Promise<BacklinkRow[]> {
+    const seed = parseInt(createHash("md5").update(target).digest("hex").slice(0, 8), 16);
+    const base = target.split(".")[0] ?? "brand";
+    const out: BacklinkRow[] = [];
+    for (let i = 0; i < limit; i++) {
+      const slug = `${base}-fan${(seed + i) % 53}`;
+      out.push({ urlFrom: `https://${slug}.com/best-${base}`, urlTo: `https://${target}/product?ref=${slug}`, anchor: `check out ${target}` });
+    }
+    return out;
+  }
+}
+
+/**
+ * Backlink / competitor-affiliate mining (Section 8.1) — the WARMEST source. Pulls
+ * who already links to each competitor, then keeps only the referring pages whose
+ * link carries an AFFILIATE signature — that's what separates a proven affiliate
+ * (promoting a rival for commission) from a mere mention. With no provider wired it
+ * returns nothing rather than fabricate.
+ */
 export class BacklinkDiscoverySource implements DiscoverySource {
   readonly sourceType = "backlink_mining";
-  constructor(private readonly opts: { apiKey?: string; http?: { get(url: string): Promise<{ status: number; json: any }> } } = {}) {}
+  readonly synthetic: boolean;
+  constructor(private readonly provider?: BacklinkProvider) {
+    this.synthetic = provider ? provider.kind === "deterministic-backlink" : false;
+  }
   async discover(query: DiscoveryQuery): Promise<RawCandidate[]> {
-    if (!this.opts.http || !this.opts.apiKey) {
-      // No backlink API wired — defer to SERP mining; return nothing rather than fabricate.
-      void query;
-      return [];
+    if (!this.provider) return []; // not wired → honest empty
+    const competitors = query.competitors.map((c) => c.toLowerCase().replace(/^www\./, "")).filter(Boolean);
+    if (competitors.length === 0) return [];
+
+    const perCompetitor = Math.max(1, Math.ceil(query.limit / competitors.length));
+    const seen = new Set<string>();
+    const out: RawCandidate[] = [];
+
+    for (const competitor of competitors) {
+      if (out.length >= query.limit) break;
+      let rows: BacklinkRow[];
+      try {
+        rows = await this.provider.referringLinks(competitor, perCompetitor * 4); // over-fetch; most get filtered
+      } catch {
+        continue;
+      }
+      for (const row of rows) {
+        if (out.length >= query.limit) break;
+        // QUALITY FILTER: the link to the competitor must carry an affiliate signature.
+        if (detectAffiliateUrl(row.urlTo).length === 0) continue;
+        const targetHost = safeHost(row.urlTo);
+        if (!targetHost || !competitors.some((c) => targetHost === c || targetHost.endsWith(`.${c}`))) continue;
+        const host = safeHost(row.urlFrom);
+        if (!host || seen.has(host)) continue;
+        seen.add(host);
+        out.push({
+          identity: host,
+          siteUrl: `https://${host}`,
+          channelUrl: null,
+          sourceType: this.sourceType,
+          evidenceUrl: row.urlFrom,
+          evidenceSummary: `Promotes ${competitor} with an affiliate link${row.anchor ? ` (anchor: "${row.anchor.slice(0, 60)}")` : ""} — a proven affiliate in your niche.`,
+          outboundLinks: [row.urlTo],
+          pageHtml: null,
+          synthetic: this.synthetic,
+        });
+      }
     }
-    // Real impl: for each competitor domain, pull referring domains, filter to
-    // pages that link out with affiliate signatures, emit candidates.
-    return [];
+    return out;
   }
 }
 
