@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { buildDiscoveryQueries, SerpDiscoverySource, BacklinkDiscoverySource } from "../src/index.js";
+import { buildDiscoveryQueries, SerpDiscoverySource, BacklinkDiscoverySource, CompetitorProgramResolver } from "../src/index.js";
 import type { DiscoveryQuery, SerpProvider, SerpHit, HttpFetcher, FetchResult, BacklinkProvider, BacklinkRow } from "../src/index.js";
 
 const baseQuery: DiscoveryQuery = {
@@ -97,5 +97,53 @@ describe("BacklinkDiscoverySource — competitor-affiliate mining", () => {
 
   it("returns nothing when no provider is wired (honest empty, never fabricated)", async () => {
     expect(await new BacklinkDiscoverySource().discover(q)).toEqual([]);
+  });
+});
+
+class RecordingBacklinks implements BacklinkProvider {
+  readonly kind = "recording";
+  targets: string[] = [];
+  constructor(private readonly rows: BacklinkRow[]) {}
+  async referringLinks(target: string, _limit: number, opts?: { urlToContains?: string }): Promise<BacklinkRow[]> {
+    this.targets.push(opts?.urlToContains ? `${target}?${opts.urlToContains}` : target);
+    return this.rows;
+  }
+}
+
+describe("CompetitorProgramResolver", () => {
+  it("reads the competitor's site to find their affiliate program + merchant id", async () => {
+    const siteFetcher: HttpFetcher = {
+      kind: "mock",
+      async get(url: string): Promise<FetchResult> {
+        if (url === "https://acme.com") return { status: 200, url, html: `<a href="/affiliates">Become an affiliate</a>` };
+        if (url.endsWith("/affiliates")) return { status: 200, url, html: `<a href="https://shareasale.com/shareasale.cfm?merchantID=56789">Join on ShareASale</a>` };
+        return { status: 404, url, html: "" };
+      },
+    };
+    const programs = await new CompetitorProgramResolver({ fetcher: siteFetcher }).resolve("acme.com");
+    expect(programs).toContainEqual(expect.objectContaining({ network: "ShareASale", merchantId: "56789" }));
+  });
+
+  it("honors a manual override (and skips the crawl)", async () => {
+    const r = new CompetitorProgramResolver({ overrides: { "acme.com": [{ network: "Impact", kind: "vanity", merchantId: null, vanityHost: "acme.pxf.io" }] } });
+    expect(await r.resolve("acme.com")).toContainEqual(expect.objectContaining({ vanityHost: "acme.pxf.io" }));
+  });
+});
+
+describe("BacklinkDiscoverySource — resolved network targeting", () => {
+  it("queries the resolved vanity host and confirms the competitor", async () => {
+    const resolver = new CompetitorProgramResolver({ overrides: { "acme.com": [{ network: "Impact", kind: "vanity", merchantId: null, vanityHost: "acme.pxf.io" }] } });
+    const provider = new RecordingBacklinks([{ urlFrom: "https://affblog.com/review", urlTo: "https://acme.pxf.io/c/1/2", anchor: "x" }]);
+    const cands = await new BacklinkDiscoverySource(provider, resolver).discover({ ...baseQuery, competitors: ["acme.com"], limit: 5 });
+    expect(provider.targets.some((t) => t.startsWith("acme.pxf.io"))).toBe(true); // queried the vanity host, not the apex
+    expect(cands[0]!.confirmedCompetitor).toBe("acme.com");
+    expect(cands[0]!.identity).toBe("affblog.com");
+  });
+
+  it("filters the shared network by merchant id", async () => {
+    const resolver = new CompetitorProgramResolver({ overrides: { "acme.com": [{ network: "ShareASale", kind: "shared", merchantId: "56789", vanityHost: null }] } });
+    const provider = new RecordingBacklinks([{ urlFrom: "https://aff.com/x", urlTo: "https://shareasale.com/r.cfm?m=56789", anchor: "" }]);
+    await new BacklinkDiscoverySource(provider, resolver).discover({ ...baseQuery, competitors: ["acme.com"], limit: 5 });
+    expect(provider.targets).toContain("shareasale.com?m=56789"); // queried the network, filtered by id
   });
 });

@@ -47,6 +47,7 @@ export {
   BacklinkDiscoverySource,
   DataForSEOBacklinkProvider,
   DeterministicBacklinkProvider,
+  CompetitorProgramResolver,
   DbCustomerMiningSource,
   type SerpProvider,
   type SerpHit,

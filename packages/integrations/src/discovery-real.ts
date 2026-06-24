@@ -1,9 +1,17 @@
 import { createHash } from "node:crypto";
-import { detectAffiliateLinksInHtml, detectAffiliateUrl, type AffiliateSignal } from "@affiliate/core";
+import {
+  detectAffiliateLinksInHtml,
+  detectAffiliateUrl,
+  identifyProgram,
+  backlinkTargetsFor,
+  type AffiliateSignal,
+  type ResolvedProgram,
+} from "@affiliate/core";
 import type { Database } from "@affiliate/db";
 import type { DiscoveryQuery, DiscoverySource, RawCandidate } from "./ports.js";
 import { DeterministicFetcher, type HttpFetcher } from "./http.js";
 import { buildDiscoveryQueries } from "./query-strategy.js";
+import { extractHrefs } from "./web-evidence.js";
 
 /**
  * Production-shaped discovery sources (Section 8.1). These are the real "find
@@ -196,8 +204,12 @@ export interface BacklinkRow {
 /** A backlink data provider — real (DataForSEO) or a deterministic generator. */
 export interface BacklinkProvider {
   readonly kind: string;
-  /** Pages that link AT the target domain (i.e. who already links to the competitor). */
-  referringLinks(targetDomain: string, limit: number): Promise<BacklinkRow[]>;
+  /**
+   * Pages that link AT the target domain. `urlToContains` filters server-side to
+   * links whose destination contains a substring (e.g. a `m=56789` merchant id) — so
+   * we pull only the competitor's slice of a shared network domain, not all of it.
+   */
+  referringLinks(targetDomain: string, limit: number, opts?: { urlToContains?: string }): Promise<BacklinkRow[]>;
 }
 
 interface PostJson {
@@ -222,10 +234,12 @@ async function postJson(url: string, body: unknown, headers: Record<string, stri
 export class DataForSEOBacklinkProvider implements BacklinkProvider {
   readonly kind = "dataforseo";
   constructor(private readonly opts: { login: string; password: string; http?: PostJson }) {}
-  async referringLinks(target: string, limit: number): Promise<BacklinkRow[]> {
+  async referringLinks(target: string, limit: number, opts?: { urlToContains?: string }): Promise<BacklinkRow[]> {
     const auth = Buffer.from(`${this.opts.login}:${this.opts.password}`).toString("base64");
     const url = "https://api.dataforseo.com/v3/backlinks/backlinks/live";
-    const body = [{ target, limit, mode: "as_is", backlinks_status_type: "live" }];
+    const task: Record<string, unknown> = { target, limit, mode: "as_is", backlinks_status_type: "live" };
+    if (opts?.urlToContains) task.filters = [["url_to", "like", `%${opts.urlToContains}%`]];
+    const body = [task];
     const headers = { Authorization: `Basic ${auth}`, "Content-Type": "application/json" };
     const res = this.opts.http ? await this.opts.http.post(url, body, headers) : await postJson(url, body, headers);
     const items = (res.json?.tasks?.[0]?.result?.[0]?.items ?? []) as Array<{ url_from?: string; url_to?: string; anchor?: string }>;
@@ -238,7 +252,8 @@ export class DataForSEOBacklinkProvider implements BacklinkProvider {
 /** Deterministic backlink generator — affiliate links to the target, for offline/demo. */
 export class DeterministicBacklinkProvider implements BacklinkProvider {
   readonly kind = "deterministic-backlink";
-  async referringLinks(target: string, limit: number): Promise<BacklinkRow[]> {
+  async referringLinks(target: string, limit: number, _opts?: { urlToContains?: string }): Promise<BacklinkRow[]> {
+    void _opts;
     const seed = parseInt(createHash("md5").update(target).digest("hex").slice(0, 8), 16);
     const base = target.split(".")[0] ?? "brand";
     const out: BacklinkRow[] = [];
@@ -251,21 +266,93 @@ export class DeterministicBacklinkProvider implements BacklinkProvider {
 }
 
 /**
- * Backlink / competitor-affiliate mining (Section 8.1) — the WARMEST source. Pulls
- * who already links to each competitor, then keeps only the referring pages whose
- * link carries an AFFILIATE signature — that's what separates a proven affiliate
- * (promoting a rival for commission) from a mere mention. With no provider wired it
- * returns nothing rather than fabricate.
+ * Resolves a competitor domain to its affiliate program(s) — the network + merchant
+ * id (or vanity host) needed to query the RIGHT backlinks. Tries a manual override
+ * first, then reads the competitor's own site (their "Affiliates"/"Partners" page
+ * links into the network with the id baked in). Cached per competitor.
+ */
+export class CompetitorProgramResolver {
+  private readonly cache = new Map<string, ResolvedProgram[]>();
+  constructor(private readonly opts: { fetcher?: HttpFetcher; overrides?: Record<string, ResolvedProgram[]> } = {}) {}
+
+  async resolve(competitor: string): Promise<ResolvedProgram[]> {
+    const domain = safeHost(competitor) ?? competitor.toLowerCase();
+    const cached = this.cache.get(domain);
+    if (cached) return cached;
+    let programs = this.opts.overrides?.[domain] ?? [];
+    if (programs.length === 0 && this.opts.fetcher) programs = await this.fromSite(domain).catch(() => []);
+    const deduped = dedupePrograms(programs);
+    this.cache.set(domain, deduped);
+    return deduped;
+  }
+
+  private async fromSite(domain: string): Promise<ResolvedProgram[]> {
+    const found: ResolvedProgram[] = [];
+    const scan = async (url: string): Promise<string | null> => {
+      try {
+        const r = await this.opts.fetcher!.get(url);
+        if (r.status < 200 || r.status >= 300 || !r.html) return null;
+        for (const href of extractHrefs(r.html, url)) {
+          const p = identifyProgram(href);
+          if (p) found.push(p);
+        }
+        return r.html;
+      } catch {
+        return null;
+      }
+    };
+    const home = await scan(`https://${domain}`);
+    const PROGRAM_PATHS = ["/affiliates", "/affiliate", "/affiliate-program", "/partners", "/partner-program", "/referral", "/ambassadors"];
+    for (const path of PROGRAM_PATHS) {
+      if (found.length) break;
+      await scan(`https://${domain}${path}`);
+    }
+    // Follow an on-page "affiliate/partner" link if the common paths missed.
+    if (found.length === 0 && home) {
+      const links = extractHrefs(home, `https://${domain}`).filter((l) => /affiliate|partner|refer|ambassador/i.test(l) && safeHost(l) === domain);
+      for (const l of links.slice(0, 3)) {
+        if (found.length) break;
+        await scan(l);
+      }
+    }
+    return found;
+  }
+}
+
+function dedupePrograms(programs: ResolvedProgram[]): ResolvedProgram[] {
+  const seen = new Set<string>();
+  const out: ResolvedProgram[] = [];
+  for (const p of programs) {
+    const key = `${p.network}|${p.merchantId ?? p.vanityHost ?? p.merchantDomain ?? ""}`.toLowerCase();
+    if (!seen.has(key)) {
+      seen.add(key);
+      out.push(p);
+    }
+  }
+  return out;
+}
+
+/**
+ * Backlink / competitor-affiliate mining (Section 8.1) — the WARMEST source. For each
+ * competitor it resolves the affiliate program (network + merchant id / vanity host)
+ * and queries the RIGHT backlinks: the vanity host directly, or the network domain
+ * filtered by the merchant id. When a program can't be resolved it falls back to the
+ * competitor's apex (catches branded `?ref=` affiliates only). With no provider wired
+ * it returns nothing rather than fabricate.
  */
 export class BacklinkDiscoverySource implements DiscoverySource {
   readonly sourceType = "backlink_mining";
   readonly synthetic: boolean;
-  constructor(private readonly provider?: BacklinkProvider) {
+  constructor(
+    private readonly provider?: BacklinkProvider,
+    private readonly resolver?: CompetitorProgramResolver,
+  ) {
     this.synthetic = provider ? provider.kind === "deterministic-backlink" : false;
   }
+
   async discover(query: DiscoveryQuery): Promise<RawCandidate[]> {
     if (!this.provider) return []; // not wired → honest empty
-    const competitors = query.competitors.map((c) => c.toLowerCase().replace(/^www\./, "")).filter(Boolean);
+    const competitors = query.competitors.map((c) => safeHost(c) ?? c.toLowerCase()).filter(Boolean);
     if (competitors.length === 0) return [];
 
     const perCompetitor = Math.max(1, Math.ceil(query.limit / competitors.length));
@@ -274,32 +361,46 @@ export class BacklinkDiscoverySource implements DiscoverySource {
 
     for (const competitor of competitors) {
       if (out.length >= query.limit) break;
-      let rows: BacklinkRow[];
-      try {
-        rows = await this.provider.referringLinks(competitor, perCompetitor * 4); // over-fetch; most get filtered
-      } catch {
-        continue;
-      }
-      for (const row of rows) {
+      // Resolve the program → precise backlink targets. Fall back to the apex domain.
+      const programs = this.resolver ? await this.resolver.resolve(competitor).catch(() => []) : [];
+      const targets = programs.flatMap((p) => backlinkTargetsFor(p, competitor));
+      const queries = targets.length ? targets : [{ target: competitor, urlToContains: undefined as string | undefined }];
+
+      for (const t of queries) {
         if (out.length >= query.limit) break;
-        // QUALITY FILTER: the link to the competitor must carry an affiliate signature.
-        if (detectAffiliateUrl(row.urlTo).length === 0) continue;
-        const targetHost = safeHost(row.urlTo);
-        if (!targetHost || !competitors.some((c) => targetHost === c || targetHost.endsWith(`.${c}`))) continue;
-        const host = safeHost(row.urlFrom);
-        if (!host || seen.has(host)) continue;
-        seen.add(host);
-        out.push({
-          identity: host,
-          siteUrl: `https://${host}`,
-          channelUrl: null,
-          sourceType: this.sourceType,
-          evidenceUrl: row.urlFrom,
-          evidenceSummary: `Promotes ${competitor} with an affiliate link${row.anchor ? ` (anchor: "${row.anchor.slice(0, 60)}")` : ""} — a proven affiliate in your niche.`,
-          outboundLinks: [row.urlTo],
-          pageHtml: null,
-          synthetic: this.synthetic,
-        });
+        // A network-targeted query (id filter / vanity host) is, by construction, the
+        // competitor's affiliates — confirmed. An apex query needs the per-link check.
+        const networkTargeted = safeHost(t.target) !== competitor;
+        let rows: BacklinkRow[];
+        try {
+          rows = await this.provider.referringLinks(t.target, perCompetitor * 4, { urlToContains: t.urlToContains });
+        } catch {
+          continue;
+        }
+        for (const row of rows) {
+          if (out.length >= query.limit) break;
+          if (!networkTargeted) {
+            // Apex fallback: require an affiliate signature pointing at the competitor.
+            if (detectAffiliateUrl(row.urlTo).length === 0) continue;
+            const th = safeHost(row.urlTo);
+            if (!th || !competitors.some((c) => th === c || th.endsWith(`.${c}`))) continue;
+          }
+          const host = safeHost(row.urlFrom);
+          if (!host || seen.has(host)) continue;
+          seen.add(host);
+          out.push({
+            identity: host,
+            siteUrl: `https://${host}`,
+            channelUrl: null,
+            sourceType: this.sourceType,
+            evidenceUrl: row.urlFrom,
+            evidenceSummary: `Promotes ${competitor} with an affiliate link${row.anchor ? ` (anchor: "${row.anchor.slice(0, 60)}")` : ""} — a proven affiliate in your niche.`,
+            outboundLinks: [row.urlTo],
+            confirmedCompetitor: competitor,
+            pageHtml: null,
+            synthetic: this.synthetic,
+          });
+        }
       }
     }
     return out;

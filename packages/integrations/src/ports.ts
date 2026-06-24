@@ -116,6 +116,13 @@ export interface RawCandidate {
   pageHtml?: string | null;
   reachHint?: number;
   /**
+   * Set by a source that has ALREADY CONFIRMED this candidate promotes a specific
+   * competitor (e.g. backlink mining filtered by the competitor's merchant id), even
+   * when the visible link points at a network domain. The pipeline trusts it instead
+   * of re-deriving from the URL host.
+   */
+  confirmedCompetitor?: string | null;
+  /**
    * TRUE when this candidate is from a deterministic/synthetic source (no real web
    * data). Real sources set false. Carried through so prospects can be labeled.
    */

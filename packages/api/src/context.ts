@@ -22,6 +22,7 @@ import {
   BacklinkDiscoverySource,
   DataForSEOBacklinkProvider,
   DeterministicBacklinkProvider,
+  CompetitorProgramResolver,
   DbCustomerMiningSource,
   ProxyHttpFetcher,
   DeterministicFetcher,
@@ -104,6 +105,9 @@ export function createContext(overrides: Partial<AppContext> = {}): AppContext {
   // whenever we have real SERP results; deterministic (no network) otherwise.
   const pageFetcher = realDiscovery ? new ProxyHttpFetcher(staticProxyPool(proxyUrls)) : new DeterministicFetcher();
   const serpSource = new SerpDiscoverySource(serpProvider, pageFetcher);
+  // Page fetcher for following contact links + reading competitor sites — real
+  // discovery only, so dev/test never make secondary network calls.
+  const fetcher = overrides.fetcher ?? (realDiscovery ? pageFetcher : undefined);
 
   // Synthetic generators fabricate demo prospects — only included when allowed
   // (never in production). The SERP source, first-party customer mining, and the
@@ -120,11 +124,14 @@ export function createContext(overrides: Partial<AppContext> = {}): AppContext {
       : config.allowSyntheticDiscovery
         ? new DeterministicBacklinkProvider()
         : undefined;
+  // Resolves each competitor's affiliate program (network + merchant id) by reading
+  // their site, so backlink mining queries the RIGHT links. Needs a fetcher.
+  const programResolver = fetcher ? new CompetitorProgramResolver({ fetcher }) : undefined;
   const discoverySources: DiscoverySource[] = overrides.discoverySources ?? [
     serpSource,
     ...syntheticSources,
     new DbCustomerMiningSource(db),
-    new BacklinkDiscoverySource(backlinkProvider),
+    new BacklinkDiscoverySource(backlinkProvider, programResolver),
   ];
 
   // Email finding: real Hunter.io when keyed, deterministic pattern stub otherwise.
@@ -137,9 +144,6 @@ export function createContext(overrides: Partial<AppContext> = {}): AppContext {
   // verification falls back to the finder's own check.
   const redirectResolver = overrides.redirectResolver ?? (realDiscovery ? new FetchRedirectResolver() : undefined);
   const emailVerifier = overrides.emailVerifier ?? (realDiscovery ? new MxEmailVerifier() : undefined);
-  // Reuse the (proxy) page fetcher for following contact links — real discovery only,
-  // so dev/test never make secondary network calls.
-  const fetcher = overrides.fetcher ?? (realDiscovery ? pageFetcher : undefined);
 
   // Audience enrichment: one registry, cheapest source per platform. YouTube is free
   // (Data API); IG/TikTok/X use a scraping-API actor (public counts + engagement, no

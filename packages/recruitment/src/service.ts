@@ -2,6 +2,7 @@ import { blendWeights, defaultWeights, newId } from "@affiliate/core";
 import type { OutreachCampaign, ProspectOutcome } from "@affiliate/db";
 import type { RecruitmentDeps } from "./deps.js";
 import { discover, enrich, score, queueFirstTouch, send } from "./pipeline.js";
+import { planDiscovery, type DiscoveryPlan } from "./discovery-planner.js";
 import { routeReply, type ReplyOutcome } from "./reply-router.js";
 
 /**
@@ -18,6 +19,9 @@ export interface SourcingSummary {
    * generators. `synthetic` prospects must be labeled "demo data" in the UI. */
   real: number;
   synthetic: number;
+  /** The plan the orchestrator chose — which sources ran (warmest first) and which
+   * were skipped and why. Surfaced so the operator sees exactly what happened. */
+  plan: DiscoveryPlan;
 }
 
 /** Run sourcing → enrich → score for a merchant (the discovery half of the wedge). */
@@ -26,7 +30,9 @@ export async function runSourcing(
   merchantId: string,
   opts?: { limit?: number; excludeSourceTypes?: string[] },
 ): Promise<SourcingSummary> {
-  const created = await discover(deps, merchantId, opts);
+  // Plan first: decide which methods to run, warmest-first, skipping the inapplicable.
+  const plan = await planDiscovery(deps, merchantId, { excludeSourceTypes: opts?.excludeSourceTypes });
+  const created = await discover(deps, merchantId, { ...opts, plan });
   let enriched = 0;
   let scored = 0;
   let synthetic = 0;
@@ -41,7 +47,7 @@ export async function runSourcing(
       byTier[finished.tier] = (byTier[finished.tier] ?? 0) + 1;
     }
   }
-  return { discovered: created.length, enriched, scored, byTier, real: created.length - synthetic, synthetic };
+  return { discovered: created.length, enriched, scored, byTier, real: created.length - synthetic, synthetic, plan };
 }
 
 /** Re-process any prospects stuck in discovered/enriched (idempotent). */

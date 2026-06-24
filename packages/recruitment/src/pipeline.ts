@@ -24,6 +24,7 @@ import {
   type RedirectResolver,
 } from "@affiliate/integrations";
 import type { RecruitmentDeps } from "./deps.js";
+import type { DiscoveryPlan } from "./discovery-planner.js";
 import { isSuppressed, suppress } from "./suppression.js";
 import { firstStep, personalizationDepth } from "./sequencing.js";
 import { weightsForMerchant } from "./learning.js";
@@ -39,7 +40,7 @@ import { weightsForMerchant } from "./learning.js";
 export async function discover(
   deps: RecruitmentDeps,
   merchantId: string,
-  opts?: { limit?: number; excludeSourceTypes?: string[] },
+  opts?: { limit?: number; excludeSourceTypes?: string[]; plan?: DiscoveryPlan },
 ): Promise<Prospect[]> {
   const merchant = await deps.db.merchants.require(merchantId);
   const query: DiscoveryQuery = {
@@ -52,8 +53,19 @@ export async function discover(
   };
 
   const excluded = new Set(opts?.excludeSourceTypes ?? []);
+  // Run sources in the planner's priority order (warmest first), skipping the ones
+  // it ruled out. Falls back to the natural order when no plan is supplied.
+  let sources = deps.discoverySources;
+  if (opts?.plan) {
+    const order = new Map(opts.plan.steps.map((s, i) => [s.sourceType, i]));
+    const skip = new Set(opts.plan.skipped.map((s) => s.sourceType));
+    sources = deps.discoverySources
+      .filter((s) => !skip.has(s.sourceType))
+      .sort((a, b) => (order.get(a.sourceType) ?? 99) - (order.get(b.sourceType) ?? 99));
+  }
+
   const created: Prospect[] = [];
-  for (const source of deps.discoverySources) {
+  for (const source of sources) {
     if (excluded.has(source.sourceType)) continue; // source-yield pruning
     let candidates;
     try {
@@ -80,9 +92,12 @@ export async function discover(
       }
       // "Runs affiliate links" = a PROVEN monetizer: at least one HIGH-confidence
       // named-network signature. A bare generic `?ref=` is NOT proof on its own.
+      // A source may already have CONFIRMED the competitor (backlink mining filtered by
+      // the competitor's merchant id), even though the visible link points at a network
+      // domain — trust it instead of re-deriving from the URL host.
       const isAffiliate = hasProvenAffiliateSignal(signals);
-      const promotesComp = detectPromotesCompetitor(signals, merchant.competitors);
-      const competitorPromoted = firstPromotedCompetitor(signals, merchant.competitors);
+      const promotesComp = !!cand.confirmedCompetitor || detectPromotesCompetitor(signals, merchant.competitors);
+      const competitorPromoted = cand.confirmedCompetitor ?? firstPromotedCompetitor(signals, merchant.competitors);
       // Real contact extraction from the fetched page (mailto: first). Never guessed.
       const contactEmails = cand.pageHtml ? extractEmailsFromHtml(cand.pageHtml).slice(0, 5) : [];
       // Secondary contact surfaces the creator linked (Linktree, /contact, YT About)
