@@ -35,3 +35,4 @@ export * from "./recruitment/affiliate-detection.js";
 
 // ---- Creator identity graph (profile-graph plan) ----------------------------
 export * from "./profile/identity.js";
+export * from "./profile/affiliate-networks.js";
