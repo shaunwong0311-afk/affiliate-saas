@@ -1,7 +1,7 @@
 import { z } from "zod";
 import { newId } from "@affiliate/core";
 import type { Affiliate, AffiliateRelationship, OutreachCampaign, Suppression } from "@affiliate/db";
-import { runSourcing, processBacklog, launchCampaign, handleReply, recordOutcome, draftOutreach } from "@affiliate/recruitment";
+import { runSourcing, processBacklog, launchCampaign, handleReply, recordOutcome, draftOutreach, expandFrontier } from "@affiliate/recruitment";
 import type { RouteModule } from "./helpers.js";
 import { parseBody, parseQuery, ok, paginationSchema, paginate } from "./helpers.js";
 import { requireMerchant } from "../auth/middleware.js";
@@ -78,6 +78,30 @@ export const recruitmentRoutes: RouteModule = (app, ctx) => {
     const { merchantId } = await requireMerchant(ctx, request, "write");
     const result = await processBacklog(ctx, merchantId);
     return ok(reply, result);
+  });
+
+  // ---- Recursive frontier (the niche map) -----------------------------------
+  app.get("/recruitment/frontier", async (request, reply) => {
+    const { merchantId } = await requireMerchant(ctx, request, "read");
+    const nodes = (await ctx.db.frontierMerchants.find((f) => f.merchantId === merchantId)).sort(
+      (a, b) => a.depth - b.depth || b.coPromotions - a.coPromotions,
+    );
+    // How many affiliates each mined node surfaced (for node sizing / context).
+    const prospectsByDomain: Record<string, number> = {};
+    for (const n of nodes) {
+      prospectsByDomain[n.domain] = await ctx.db.prospects.count(
+        (p) => p.merchantId === merchantId && (p.evidence as { competitorPromoted?: string } | null)?.competitorPromoted === n.domain,
+      );
+    }
+    return ok(reply, { nodes, prospectsByDomain });
+  });
+
+  app.post("/recruitment/frontier/expand", async (request, reply) => {
+    const { merchantId } = await requireMerchant(ctx, request, "write");
+    const body = parseBody(z.object({ maxSeedsPerCycle: z.number().int().min(1).max(10).default(3) }), request);
+    const report = await expandFrontier(ctx, merchantId, { maxSeedsPerCycle: body.maxSeedsPerCycle });
+    if (report.discovered > 0) await processBacklog(ctx, merchantId);
+    return ok(reply, report);
   });
 
   // ---- Prospects ------------------------------------------------------------

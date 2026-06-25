@@ -222,21 +222,55 @@ export function competitorHostsFromLinks(links: string[], exclude: Iterable<stri
   const skip = new Set([...exclude].map((d) => d.toLowerCase().replace(/^www\./, "")));
   const out = new Set<string>();
   for (const raw of links) {
-    const u = parseUrl(raw);
-    if (!u) continue;
-    const host = hostOf(u);
-    const prog = identifyProgram(raw);
-    let merchant: string | null = null;
-    if (prog?.kind === "vanity" && prog.vanityHost) merchant = prog.vanityHost;
-    else if (prog?.kind === "self_hosted" && prog.merchantDomain) merchant = prog.merchantDomain;
-    else if (!prog && !isNetworkClickHost(host) && hasAffiliateMarker(u)) merchant = host;
-    if (!merchant) continue; // shared-network links yield no clean domain → skip
+    let merchant = merchantDomainFromLink(raw);
+    if (!merchant) continue;
     merchant = merchant.toLowerCase().replace(/^www\./, "");
     if (skip.has(merchant) || isNetworkClickHost(merchant)) continue;
     if (MEGA_RETAILERS.some((m) => merchant === m || merchant!.endsWith(`.${m}`))) continue;
     out.add(merchant);
   }
   return [...out];
+}
+
+/**
+ * The merchant brand DOMAIN an affiliate link points at: a vanity host
+ * (`acme.pxf.io`), a self-hosted domain (`brand.com` via `?via=`), a direct merchant
+ * domain (affiliate marker present), or — for a SHARED network — the destination
+ * encoded in the link's params (`shareasale.com/...&urllink=https://brand.com`,
+ * Rakuten `murl`, Awin `ued`). Returns null when no brand domain is recoverable
+ * (then the caller can fall back to following the redirect).
+ */
+export function merchantDomainFromLink(rawUrl: string): string | null {
+  const u = parseUrl(rawUrl);
+  if (!u) return null;
+  const prog = identifyProgram(rawUrl);
+  if (prog?.kind === "vanity" && prog.vanityHost) return prog.vanityHost;
+  if (prog?.kind === "self_hosted" && prog.merchantDomain) return prog.merchantDomain;
+  if (prog?.kind === "shared") return destinationHostFromParams(u); // resolve via the dest param
+  if (!prog && !isNetworkClickHost(hostOf(u)) && hasAffiliateMarker(u)) return hostOf(u);
+  return null;
+}
+
+// Network deep-links carry the destination URL in a param (urllink/murl/ued/url/…).
+// Scan for any param whose value is an http(s) URL to a non-network host.
+function destinationHostFromParams(u: URL): string | null {
+  for (const v of u.searchParams.values()) {
+    if (v.length < 10) continue;
+    let decoded = v;
+    try {
+      decoded = decodeURIComponent(v);
+    } catch {
+      /* keep raw */
+    }
+    if (!/^https?:\/\//i.test(decoded)) continue;
+    try {
+      const h = new URL(decoded).hostname.replace(/^www\./, "").toLowerCase();
+      if (h && !isNetworkClickHost(h)) return h;
+    } catch {
+      /* not a usable URL */
+    }
+  }
+  return null;
 }
 
 // A direct link is "affiliate-ish" if it carries a tracking param or affiliate path.

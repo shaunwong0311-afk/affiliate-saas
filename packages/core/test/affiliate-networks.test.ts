@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { identifyProgram, backlinkTargetsFor, parseProgramInput, competitorHostsFromLinks } from "../src/index.js";
+import { identifyProgram, backlinkTargetsFor, parseProgramInput, competitorHostsFromLinks, merchantDomainFromLink } from "../src/index.js";
 
 describe("identifyProgram — extracts network + merchant from an affiliate link", () => {
   it("ShareASale (m= param)", () => {
@@ -116,5 +116,22 @@ describe("competitorHostsFromLinks — recursive expansion signal", () => {
 
   it("respects the exclude set (your merchant + known competitors)", () => {
     expect(competitorHostsFromLinks(["https://known.com/buy?ref=x"], ["known.com"])).toEqual([]);
+  });
+});
+
+describe("merchantDomainFromLink — resolve shared-network links to the brand domain", () => {
+  it("reads the destination param on shared networks (ShareASale urllink, Rakuten murl, Awin ued)", () => {
+    expect(merchantDomainFromLink("https://shareasale.com/r.cfm?b=1&u=joe&m=222&urllink=https%3A%2F%2Fbrandb.com%2Fshop")).toBe("brandb.com");
+    expect(merchantDomainFromLink("https://click.linksynergy.com/deeplink?id=A&mid=99&murl=https%3A%2F%2Fbrandc.com%2Fp")).toBe("brandc.com");
+    expect(merchantDomainFromLink("https://www.awin1.com/cread.php?awinmid=5&awinaffid=9&ued=https%3A%2F%2Fbrandd.com")).toBe("brandd.com");
+  });
+
+  it("now lets the recursive extractor surface shared-network merchants (gap closed)", () => {
+    const hosts = competitorHostsFromLinks(["https://shareasale.com/r.cfm?m=222&u=joe&urllink=https%3A%2F%2Fbrandb.com%2F"]);
+    expect(hosts).toContain("brandb.com");
+  });
+
+  it("returns null when no destination is recoverable from the URL", () => {
+    expect(merchantDomainFromLink("https://shareasale.com/r.cfm?b=1&u=joe&m=222")).toBeNull(); // would need a redirect
   });
 });
