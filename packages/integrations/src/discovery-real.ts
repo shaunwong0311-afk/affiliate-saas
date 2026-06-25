@@ -237,7 +237,18 @@ export class DataForSEOBacklinkProvider implements BacklinkProvider {
   async referringLinks(target: string, limit: number, opts?: { urlToContains?: string }): Promise<BacklinkRow[]> {
     const auth = Buffer.from(`${this.opts.login}:${this.opts.password}`).toString("base64");
     const url = "https://api.dataforseo.com/v3/backlinks/backlinks/live";
-    const task: Record<string, unknown> = { target, limit, mode: "as_is", backlinks_status_type: "live" };
+    // For affiliate finding we want ONE row per referring domain (= one potential
+    // affiliate), not every raw backlink — `one_per_domain` collapses a domain's
+    // 100k+ links to its ~few-k referring domains, ~100× cheaper. Capped at the
+    // endpoint max (1000 rows/request) and ordered by rank so the best come first.
+    // No dofollow filter: affiliate links are typically rel=sponsored/nofollow.
+    const task: Record<string, unknown> = {
+      target,
+      limit: Math.min(Math.max(1, limit), 1000),
+      mode: "one_per_domain",
+      backlinks_status_type: "live",
+      order_by: ["rank,desc"],
+    };
     if (opts?.urlToContains) task.filters = [["url_to", "like", `%${opts.urlToContains}%`]];
     const body = [task];
     const headers = { Authorization: `Basic ${auth}`, "Content-Type": "application/json" };

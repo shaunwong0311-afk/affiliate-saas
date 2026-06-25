@@ -155,3 +155,27 @@ runs end-to-end behind ports and lights up with real data when provider keys are
 fabricate. `synthetic` flag on every prospect; provider signals null when unwired;
 no invented links on failed fetch. In demo mode the Niche Map seeds + mines but won't
 snowball (expansion needs a real fetcher/backlink key for co-promotion data).
+
+## DataForSEO cost strategy (backlink mining)
+
+DataForSEO charges $0.02/request + $0.00003/row (≤1000 rows/request → $0.05/1k). A
+domain can have 100k+ backlinks but only a few-k REFERRING DOMAINS, and for affiliate
+finding **one affiliate = one referring domain**. So `DataForSEOBacklinkProvider` uses
+**`mode: "one_per_domain"`** (one representative backlink per referring domain), caps
+`limit` at 1000 (one request ≈ $0.05/competitor for the top referring domains), and
+orders by rank. It does NOT filter `dofollow=true` — affiliate links are usually
+rel=sponsored/nofollow. Network-targeted queries (network domain + merchant-id filter)
+are inherently one-affiliate-per-domain. The frontier widens by adding more competitors
+rather than paging deeper into one.
+
+## Future adjacencies (parked — NOT the wedge)
+
+The same DataForSEO subscription that powers competitor-affiliate mining could power
+light merchant-facing **competitive-intel value-adds** inside the product: a
+competitor's backlink/affiliate footprint, content gaps where affiliates could rank,
+"who links to them that doesn't link to you." Surfer-style content optimization is
+very feasible on DataForSEO's SERP + on-page APIs (the moat is the scoring/UX, not the
+data). An Ahrefs-style backlink explorer is buildable as a *product* but can't match
+Ahrefs' proprietary index depth (~2.8T DataForSEO vs ~35T Ahrefs). Treat all of this as
+a future upsell riding infra we already pay for — **an adjacency, not a pivot.** Don't
+let "build our own Ahrefs" dilute the recruitment wedge.

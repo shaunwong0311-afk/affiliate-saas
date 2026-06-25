@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { buildDiscoveryQueries, SerpDiscoverySource, BacklinkDiscoverySource, CompetitorProgramResolver } from "../src/index.js";
+import { buildDiscoveryQueries, SerpDiscoverySource, BacklinkDiscoverySource, CompetitorProgramResolver, DataForSEOBacklinkProvider } from "../src/index.js";
 import type { DiscoveryQuery, SerpProvider, SerpHit, HttpFetcher, FetchResult, BacklinkProvider, BacklinkRow } from "../src/index.js";
 
 const baseQuery: DiscoveryQuery = {
@@ -97,6 +97,24 @@ describe("BacklinkDiscoverySource — competitor-affiliate mining", () => {
 
   it("returns nothing when no provider is wired (honest empty, never fabricated)", async () => {
     expect(await new BacklinkDiscoverySource().discover(q)).toEqual([]);
+  });
+});
+
+describe("DataForSEOBacklinkProvider — cost-efficient request shape", () => {
+  it("requests one_per_domain (not as_is), caps to 1000 rows, and passes the merchant filter", async () => {
+    let sentBody: any = null;
+    const http = {
+      async post(_url: string, body: unknown) {
+        sentBody = body;
+        return { status: 200, json: { tasks: [{ result: [{ items: [{ url_from: "https://aff.com", url_to: "https://shareasale.com/r.cfm?m=222" }] }] }] } };
+      },
+    };
+    const provider = new DataForSEOBacklinkProvider({ login: "x", password: "y", http });
+    const rows = await provider.referringLinks("shareasale.com", 5000, { urlToContains: "m=222" });
+    expect(sentBody[0].mode).toBe("one_per_domain"); // one row per referring domain = one affiliate
+    expect(sentBody[0].limit).toBe(1000); // capped at the endpoint max
+    expect(sentBody[0].filters).toEqual([["url_to", "like", "%m=222%"]]);
+    expect(rows[0]!.urlFrom).toBe("https://aff.com");
   });
 });
 
