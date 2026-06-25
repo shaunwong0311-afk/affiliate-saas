@@ -451,6 +451,30 @@ export interface AutomationState {
   updatedAt: Timestamp;
 }
 
+/**
+ * A node in the recursive discovery frontier (merchant-expansion engine). Each row
+ * is a competitor domain queued to be backlink-mined; expansion promotes the
+ * merchants that discovered affiliates ALSO promote (co-promotion) into new nodes,
+ * so the engine snowballs across the niche. (tenant, domain) is the visited set.
+ */
+export interface FrontierMerchant {
+  id: Id;
+  merchantId: Id; // tenant
+  /** Mineable host — the competitor's apex or a vanity affiliate domain. */
+  domain: string;
+  label: string;
+  /** Hops from a seed competitor (0 = seed). */
+  depth: number;
+  /** How many discovered affiliates promote this merchant — the relevance signal. */
+  coPromotions: number;
+  status: "pending" | "mined" | "skipped";
+  source: "seed" | "expansion";
+  /** The affiliate/merchant whose links surfaced this node. */
+  discoveredFrom: string | null;
+  createdAt: Timestamp;
+  processedAt: Timestamp | null;
+}
+
 // ---- API surface / webhooks -------------------------------------------------
 export interface ApiKey {
   id: Id;

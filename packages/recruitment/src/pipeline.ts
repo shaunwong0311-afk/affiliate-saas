@@ -22,6 +22,7 @@ import {
   detectsContactForm,
   type DiscoveryQuery,
   type RedirectResolver,
+  type RawCandidate,
 } from "@affiliate/integrations";
 import type { RecruitmentDeps } from "./deps.js";
 import type { DiscoveryPlan } from "./discovery-planner.js";
@@ -74,109 +75,105 @@ export async function discover(
       continue; // isolate source failures (Section 8.1)
     }
     for (const cand of candidates) {
-      // Dedup against existing prospects for this merchant.
-      const key = cand.siteUrl ?? cand.channelUrl ?? cand.identity;
-      const dupe = await deps.db.prospects.findOne(
-        (p) => p.merchantId === merchantId && (p.siteUrl === key || p.channelUrl === key || p.identity === cand.identity),
-      );
-      if (dupe) continue;
-
-      const now = deps.clock.now().toISOString();
-      let signals: AffiliateSignal[] = cand.outboundLinks.flatMap((l) => detectAffiliateUrl(l));
-      // Resolve LOW-confidence generic links (?ref=, ?via=, /go/) to their final
-      // host so they can be trusted as competitor evidence. Named-network links are
-      // already high-confidence and need no resolution. Only spend network calls on
-      // REAL candidates (never on demo data) and only when a resolver is wired.
-      if (deps.redirectResolver && !cand.synthetic) {
-        signals = await resolveLowConfidenceSignals(deps.redirectResolver, signals);
-      }
-      // "Runs affiliate links" = a PROVEN monetizer: at least one HIGH-confidence
-      // named-network signature. A bare generic `?ref=` is NOT proof on its own.
-      // A source may already have CONFIRMED the competitor (backlink mining filtered by
-      // the competitor's merchant id), even though the visible link points at a network
-      // domain — trust it instead of re-deriving from the URL host.
-      const isAffiliate = hasProvenAffiliateSignal(signals);
-      const promotesComp = !!cand.confirmedCompetitor || detectPromotesCompetitor(signals, merchant.competitors);
-      const competitorPromoted = cand.confirmedCompetitor ?? firstPromotedCompetitor(signals, merchant.competitors);
-      // Real contact extraction from the fetched page (mailto: first). Never guessed.
-      const contactEmails = cand.pageHtml ? extractEmailsFromHtml(cand.pageHtml).slice(0, 5) : [];
-      // Secondary contact surfaces the creator linked (Linktree, /contact, YT About)
-      // — enrichment fetches these for more real emails. Plus a YouTube About tab
-      // derived from the channel URL, and whether a contact FORM is present.
-      const contactUrls = cand.pageHtml ? discoverContactUrls(cand.pageHtml, cand.siteUrl) : [];
-      if (cand.channelUrl && /(^|\.)youtube\.com$/i.test(hostOf(cand.channelUrl) ?? "")) {
-        const about = `${cand.channelUrl.replace(/\/+$/, "")}/about`;
-        if (!contactUrls.some((u) => u.url === about)) contactUrls.push({ url: about, kind: "youtube_about" });
-      }
-      const hasContactForm = cand.pageHtml ? detectsContactForm(cand.pageHtml) : false;
-      // Identity graph: classify the surfaces this creator links from their page.
-      // The seed is their own URL; enrichment augments this from bio-aggregator pages.
-      const seedUrl = cand.siteUrl ?? cand.channelUrl;
-      const profile =
-        seedUrl || cand.pageHtml
-          ? buildProfile(seedUrl, cand.pageHtml ? [{ url: cand.evidenceUrl ?? seedUrl ?? cand.identity, links: extractHrefs(cand.pageHtml, seedUrl) }] : [])
-          : null;
-
-      const prospect: Prospect = {
-        id: newId("prosp"),
-        merchantId,
-        source: cand.sourceType,
-        identity: cand.identity,
-        siteUrl: cand.siteUrl,
-        channelUrl: cand.channelUrl,
-        email: null,
-        state: "discovered",
-        score: null,
-        tier: null,
-        country: null,
-        language: null,
-        suppressionStatus: "none",
-        scoreBreakdown: null,
-        synthetic: cand.synthetic,
-        confidence: null,
-        evidence: {
-          affiliateLinks: signals.map((s) => ({ url: s.url, network: s.network, confidence: s.confidence, verified: s.verified })),
-          competitorPromoted,
-          contactSource: null,
-          contactEmails,
-          contactUrls,
-          contactForm: hasContactForm,
-          contactFormUrl: hasContactForm ? cand.evidenceUrl : null,
-          profile,
-          pageUrl: cand.evidenceUrl,
-        },
-        createdAt: now,
-        updatedAt: now,
-      };
-      await deps.db.prospects.insert(prospect);
-      await deps.db.prospectSources.insert({
-        id: newId("psrc"),
-        prospectId: prospect.id,
-        sourceType: cand.sourceType,
-        evidenceUrl: cand.evidenceUrl,
-        evidenceSummary: cand.evidenceSummary,
-        capturedAt: now,
-      });
-      await deps.db.prospectSignals.insert({
-        id: newId("psig"),
-        prospectId: prospect.id,
-        relevance: 0,
-        isAffiliate,
-        promotesCompetitor: promotesComp,
-        intent: /review|best|vs|compare/i.test(cand.evidenceSummary ?? "") ? 0.8 : 0.3,
-        verifiedEmail: false,
-        // Provider-backed signals are UNKNOWN at discovery — no SEO/audience/creator
-        // provider has run. reachHint is a real-ish proxy only for customer mining
-        // (lifetime spend); a real SERP hit has no reach until a provider is wired.
-        reach: cand.reachHint ?? null,
-        da: null,
-        engagement: null,
-        audienceOverlap: null,
-      });
-      created.push(prospect);
+      const prospect = await ingestCandidate(deps, merchant, cand);
+      if (prospect) created.push(prospect);
     }
   }
   return created;
+}
+
+/**
+ * Turn one raw candidate into a persisted prospect (dedup → detect → identity graph →
+ * insert prospect + source + signals). Returns null on a duplicate. Shared by the
+ * discovery loop and the recursive frontier engine so both ingest identically.
+ */
+export async function ingestCandidate(deps: RecruitmentDeps, merchant: Merchant, cand: RawCandidate): Promise<Prospect | null> {
+  const merchantId = merchant.id;
+  const key = cand.siteUrl ?? cand.channelUrl ?? cand.identity;
+  const dupe = await deps.db.prospects.findOne(
+    (p) => p.merchantId === merchantId && (p.siteUrl === key || p.channelUrl === key || p.identity === cand.identity),
+  );
+  if (dupe) return null;
+
+  const now = deps.clock.now().toISOString();
+  let signals: AffiliateSignal[] = cand.outboundLinks.flatMap((l) => detectAffiliateUrl(l));
+  // Resolve LOW-confidence generic links to their final host (only real candidates,
+  // only when a resolver is wired) so they can be trusted as competitor evidence.
+  if (deps.redirectResolver && !cand.synthetic) {
+    signals = await resolveLowConfidenceSignals(deps.redirectResolver, signals);
+  }
+  // A source may already have CONFIRMED the competitor (backlink mining filtered by the
+  // merchant id) even though the link points at a network domain — trust it.
+  const isAffiliate = hasProvenAffiliateSignal(signals);
+  const promotesComp = !!cand.confirmedCompetitor || detectPromotesCompetitor(signals, merchant.competitors);
+  const competitorPromoted = cand.confirmedCompetitor ?? firstPromotedCompetitor(signals, merchant.competitors);
+  const contactEmails = cand.pageHtml ? extractEmailsFromHtml(cand.pageHtml).slice(0, 5) : [];
+  const contactUrls = cand.pageHtml ? discoverContactUrls(cand.pageHtml, cand.siteUrl) : [];
+  if (cand.channelUrl && /(^|\.)youtube\.com$/i.test(hostOf(cand.channelUrl) ?? "")) {
+    const about = `${cand.channelUrl.replace(/\/+$/, "")}/about`;
+    if (!contactUrls.some((u) => u.url === about)) contactUrls.push({ url: about, kind: "youtube_about" });
+  }
+  const hasContactForm = cand.pageHtml ? detectsContactForm(cand.pageHtml) : false;
+  const seedUrl = cand.siteUrl ?? cand.channelUrl;
+  const profile =
+    seedUrl || cand.pageHtml
+      ? buildProfile(seedUrl, cand.pageHtml ? [{ url: cand.evidenceUrl ?? seedUrl ?? cand.identity, links: extractHrefs(cand.pageHtml, seedUrl) }] : [])
+      : null;
+
+  const prospect: Prospect = {
+    id: newId("prosp"),
+    merchantId,
+    source: cand.sourceType,
+    identity: cand.identity,
+    siteUrl: cand.siteUrl,
+    channelUrl: cand.channelUrl,
+    email: null,
+    state: "discovered",
+    score: null,
+    tier: null,
+    country: null,
+    language: null,
+    suppressionStatus: "none",
+    scoreBreakdown: null,
+    synthetic: cand.synthetic,
+    confidence: null,
+    evidence: {
+      affiliateLinks: signals.map((s) => ({ url: s.url, network: s.network, confidence: s.confidence, verified: s.verified })),
+      competitorPromoted,
+      contactSource: null,
+      contactEmails,
+      contactUrls,
+      contactForm: hasContactForm,
+      contactFormUrl: hasContactForm ? cand.evidenceUrl : null,
+      profile,
+      pageUrl: cand.evidenceUrl,
+    },
+    createdAt: now,
+    updatedAt: now,
+  };
+  await deps.db.prospects.insert(prospect);
+  await deps.db.prospectSources.insert({
+    id: newId("psrc"),
+    prospectId: prospect.id,
+    sourceType: cand.sourceType,
+    evidenceUrl: cand.evidenceUrl,
+    evidenceSummary: cand.evidenceSummary,
+    capturedAt: now,
+  });
+  await deps.db.prospectSignals.insert({
+    id: newId("psig"),
+    prospectId: prospect.id,
+    relevance: 0,
+    isAffiliate,
+    promotesCompetitor: promotesComp,
+    intent: /review|best|vs|compare/i.test(cand.evidenceSummary ?? "") ? 0.8 : 0.3,
+    verifiedEmail: false,
+    reach: cand.reachHint ?? null,
+    da: null,
+    engagement: null,
+    audienceOverlap: null,
+  });
+  return prospect;
 }
 
 // ---- 2. Enrich --------------------------------------------------------------

@@ -5,6 +5,7 @@ export * from "./sequencing.js";
 export * from "./pipeline.js";
 export * from "./service.js";
 export { planDiscovery, type DiscoveryPlan, type PlannedSource, type SkippedSource } from "./discovery-planner.js";
+export { expandFrontier, type FrontierBudget, type ExpansionReport } from "./frontier.js";
 export * from "./learning.js";
 export * from "./deliverability.js";
 export * from "./reply-router.js";

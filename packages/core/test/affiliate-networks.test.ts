@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { identifyProgram, backlinkTargetsFor, parseProgramInput } from "../src/index.js";
+import { identifyProgram, backlinkTargetsFor, parseProgramInput, competitorHostsFromLinks } from "../src/index.js";
 
 describe("identifyProgram — extracts network + merchant from an affiliate link", () => {
   it("ShareASale (m= param)", () => {
@@ -92,5 +92,29 @@ describe("parseProgramInput — forgiving manual entry", () => {
   it("returns null for unrecognized input", () => {
     expect(parseProgramInput("")).toBeNull();
     expect(parseProgramInput("just some text")).toBeNull();
+  });
+});
+
+describe("competitorHostsFromLinks — recursive expansion signal", () => {
+  it("extracts other merchant hosts, skipping networks / mega-retailers / non-affiliate links", () => {
+    const hosts = competitorHostsFromLinks(
+      [
+        "https://acme.pxf.io/c/1/2", // vanity → mineable
+        "https://brandb.com/buy?ref=joe", // direct affiliate marker → mineable
+        "https://rival.com/?via=joe", // self-hosted (Rewardful) → mineable
+        "https://shareasale.com/r.cfm?m=222", // shared network → no clean domain, skip
+        "https://amzn.to/3x?tag=joe-20", // mega-retailer → skip
+        "https://news.com/article", // no affiliate marker → skip
+      ],
+      ["mycompany.com"],
+    );
+    expect(hosts).toEqual(expect.arrayContaining(["acme.pxf.io", "brandb.com", "rival.com"]));
+    expect(hosts).not.toContain("shareasale.com");
+    expect(hosts).not.toContain("amzn.to");
+    expect(hosts).not.toContain("news.com");
+  });
+
+  it("respects the exclude set (your merchant + known competitors)", () => {
+    expect(competitorHostsFromLinks(["https://known.com/buy?ref=x"], ["known.com"])).toEqual([]);
   });
 });

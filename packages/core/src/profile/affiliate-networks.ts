@@ -196,3 +196,52 @@ export function parseProgramInput(text: string, competitorDomain?: string): Reso
 export function knownNetworks(): { name: string; kind: NetworkKind }[] {
   return NETWORKS.map((s) => ({ name: s.name, kind: s.kind }));
 }
+
+// Ubiquitous retailers everyone promotes — never a "competitor" worth mining.
+const MEGA_RETAILERS = [
+  "amazon.com", "amzn.to", "ebay.com", "walmart.com", "target.com", "etsy.com", "aliexpress.com",
+  "bestbuy.com", "wayfair.com", "apple.com", "google.com", "play.google.com", "microsoft.com",
+  "paypal.com", "shopify.com", "gumroad.com", "patreon.com",
+];
+
+// Only SHARED click hosts (shareasale.com, awin1.com…) — NOT vanity suffixes, since a
+// vanity host (acme.pxf.io) IS the brand and is itself a mineable merchant.
+function isNetworkClickHost(host: string): boolean {
+  return NETWORKS.some((s) => (s.hosts ?? []).some((h) => host === h || host.endsWith(`.${h}`)));
+}
+
+/**
+ * From the affiliate links found on a creator's page, the OTHER merchant hosts they
+ * promote — the recursive-discovery expansion signal. Returns mineable hosts: a
+ * vanity affiliate domain (`acme.pxf.io`), a self-hosted merchant domain (`brand.com`
+ * via `?via=`), or a direct merchant domain carrying any affiliate marker. Network
+ * click hosts, mega-retailers, and `exclude`d hosts (your merchant + known
+ * competitors) are filtered out. Shared-network links (no clean domain) are skipped.
+ */
+export function competitorHostsFromLinks(links: string[], exclude: Iterable<string> = []): string[] {
+  const skip = new Set([...exclude].map((d) => d.toLowerCase().replace(/^www\./, "")));
+  const out = new Set<string>();
+  for (const raw of links) {
+    const u = parseUrl(raw);
+    if (!u) continue;
+    const host = hostOf(u);
+    const prog = identifyProgram(raw);
+    let merchant: string | null = null;
+    if (prog?.kind === "vanity" && prog.vanityHost) merchant = prog.vanityHost;
+    else if (prog?.kind === "self_hosted" && prog.merchantDomain) merchant = prog.merchantDomain;
+    else if (!prog && !isNetworkClickHost(host) && hasAffiliateMarker(u)) merchant = host;
+    if (!merchant) continue; // shared-network links yield no clean domain → skip
+    merchant = merchant.toLowerCase().replace(/^www\./, "");
+    if (skip.has(merchant) || isNetworkClickHost(merchant)) continue;
+    if (MEGA_RETAILERS.some((m) => merchant === m || merchant!.endsWith(`.${m}`))) continue;
+    out.add(merchant);
+  }
+  return [...out];
+}
+
+// A direct link is "affiliate-ish" if it carries a tracking param or affiliate path.
+function hasAffiliateMarker(u: URL): boolean {
+  const params = new Set([...u.searchParams.keys()].map((k) => k.toLowerCase()));
+  if (["ref", "aff", "affiliate", "aff_id", "referral", "partner", "via", "rfsn", "fpr"].some((p) => params.has(p))) return true;
+  return /\/(aff|affiliate|ref|go|recommends?)\//i.test(u.pathname);
+}

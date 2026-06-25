@@ -140,6 +140,7 @@ export function createMemoryDatabase(): Database {
     prospectOutcomes: byId(),
     meetings: byId(),
     automationStates: byId(),
+    frontierMerchants: byId(),
     apiKeys: byId(),
     webhookSubscriptions: byId(),
   } as unknown as Database;

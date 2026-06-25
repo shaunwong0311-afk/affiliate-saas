@@ -1,7 +1,8 @@
 import { newId, type Tier } from "@affiliate/core";
 import type { AutomationState, OutreachCampaign, Prospect } from "@affiliate/db";
 import type { RecruitmentDeps } from "./deps.js";
-import { runSourcing } from "./service.js";
+import { runSourcing, processBacklog } from "./service.js";
+import { expandFrontier } from "./frontier.js";
 import { queueFirstTouch, send } from "./pipeline.js";
 import { nextStep, isWithinSendWindow, personalizationDepth } from "./sequencing.js";
 import { renderTemplate } from "@affiliate/integrations";
@@ -55,13 +56,16 @@ export interface CycleSummary {
   heldForReview: number;
   circuitOpen: boolean;
   prunedSources: string[];
+  /** Recursive frontier: new competitor seeds promoted this cycle + frontier backlog. */
+  frontierPromoted: number;
+  frontierPending: number;
 }
 
 /** Run one autonomous cycle for a merchant. Idempotent and safe to call repeatedly. */
 export async function autonomousCycle(deps: RecruitmentDeps, merchantId: string): Promise<CycleSummary> {
   const state = await getAutomationState(deps, merchantId);
   const now = deps.clock.now();
-  const empty: CycleSummary = { status: state.status, sourced: 0, scored: 0, real: 0, synthetic: 0, autoSent: 0, followUpsSent: 0, heldForReview: 0, circuitOpen: false, prunedSources: [] };
+  const empty: CycleSummary = { status: state.status, sourced: 0, scored: 0, real: 0, synthetic: 0, autoSent: 0, followUpsSent: 0, heldForReview: 0, circuitOpen: false, prunedSources: [], frontierPromoted: 0, frontierPending: 0 };
   if (state.status !== "running") return empty;
 
   const pruned = await lowYieldSources(deps, merchantId);
@@ -69,6 +73,12 @@ export async function autonomousCycle(deps: RecruitmentDeps, merchantId: string)
 
   // 1) Source + enrich + score (skip pruned low-yield sources).
   const sourcing = await runSourcing(deps, merchantId, { limit: state.sourcingLimitPerCycle, excludeSourceTypes: [...pruned] });
+
+  // 1b) Recursive expansion: mine the frontier (competitor → their affiliates → the
+  // merchants those affiliates ALSO promote → next seeds). Hard-capped per cycle so it
+  // can't run away; enrich+score anything it surfaced.
+  const expansion = await expandFrontier(deps, merchantId, { maxSeedsPerCycle: 2, maxNewSeeds: 5 }).catch(() => null);
+  if (expansion && expansion.discovered > 0) await processBacklog(deps, merchantId);
 
   // 2) Auto-advance scored prospects; hold A-tier / borderline for the human gate.
   const campaign = await activeCampaign(deps, merchantId);
@@ -111,6 +121,8 @@ export async function autonomousCycle(deps: RecruitmentDeps, merchantId: string)
     heldForReview,
     circuitOpen: health.circuitOpen,
     prunedSources: [...pruned],
+    frontierPromoted: expansion?.promoted.length ?? 0,
+    frontierPending: expansion?.frontierPending ?? 0,
   };
 }
 
