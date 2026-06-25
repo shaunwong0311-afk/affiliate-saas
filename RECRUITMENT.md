@@ -98,3 +98,60 @@ SEED_DEMO=true SCHEDULER=true npm run api   # live engine; Automation page in th
 > merchants) is intentionally **not** built here — it raises a client-competition /
 > data-provenance question that needs a deliberate product decision (lookalike-first,
 > opt-in marketplace, producer protection). See the conversation notes.
+
+---
+
+## Discovery internals — current (2026 update)
+
+The discovery half of stage 1 became the most built-out part of the system. It now
+runs end-to-end behind ports and lights up with real data when provider keys are set
+(see `CLAUDE.md` → Provider keys). Components:
+
+- **Query strategy** (`integrations/query-strategy.ts`) — `buildDiscoveryQueries`
+  turns the ICP into a prioritized, deduped, capped SERP query set: competitor-affiliate
+  mining first, then buyer-intent, then merchant keywords, then **platform-targeted**
+  queries (`site:youtube.com`, `site:substack.com`, podcasts…) that reach the walled
+  platforms via SERP. `SerpDiscoverySource` does **platform-aware dedup** (two
+  `youtube.com/@x` creators don't collapse to one host) and sets `channelUrl` for social hits.
+
+- **Discovery planner** (`recruitment/discovery-planner.ts`) — `planDiscovery` is the
+  "what to do" brain: inspects the merchant (competitors set? orders on file?) + the
+  available sources and emits a **prioritized plan** (warmest first), **skipping**
+  inapplicable sources with a reason. `runSourcing` plans first, runs in that order, and
+  returns the plan in its summary (shown in `npm run demo` as "DISCOVERY PLAN").
+
+- **Affiliate-network registry** (`core/profile/affiliate-networks.ts`) — ~15 networks.
+  `identifyProgram(url)` → `{network, merchantId | vanityHost}`; `backlinkTargetsFor` →
+  the precise backlink query (vanity host directly, or network domain filtered by
+  merchant id); `parseProgramInput` → forgiving manual entry (paste a link / "Network id");
+  `merchantDomainFromLink` → resolves shared-network links to the brand domain via the
+  destination param (`urllink`/`murl`/`ued`); `competitorHostsFromLinks` → the OTHER
+  merchants an affiliate promotes (the recursive signal).
+
+- **Competitor-affiliate mining done right** (`BacklinkDiscoverySource` +
+  `CompetitorProgramResolver` + `DataForSEOBacklinkProvider`). The resolver reads the
+  competitor's own site to find their network + merchant id (or vanity domain); mining
+  queries the right backlinks and keeps only links carrying an affiliate signature
+  toward the competitor; network-targeted hits set `RawCandidate.confirmedCompetitor`
+  so the pipeline trusts the competitor-promotion signal even for network-domain links.
+
+- **Identity graph** (`core/profile/identity.ts`) — unifies a creator across platforms
+  from the links they published (provenance + confidence); on `Prospect.evidence.profile`.
+
+- **Audience enrichers** (`integrations/enrichers.ts`, `AccountEnricher`/`EnricherRegistry`/
+  `CachingEnricher`) — fill real `reach`/`engagement`: `YouTubeEnricher` (free),
+  `ScrapeMetricsEnricher` (IG/TikTok/X), `OnPageSubscriberEnricher` (Substack). Cached
+  per creator; unknown stays null.
+
+- **Recursive frontier** (`recruitment/frontier.ts` `expandFrontier`) — the snowball:
+  competitor → mine affiliates → read their other affiliate links → promote the
+  frequently co-promoted merchants as new seeds → repeat. Persisted in `frontierMerchants`
+  (visited set); HARD-CAPPED per cycle (seeds/expansions/new-seeds/depth/min-co-promotions);
+  wired into `autonomousCycle`. Surfaced as the **Niche Map** (`web/pages/NicheMap.tsx`,
+  route `/niche-map`) — an interactive radial graph (pan/zoom/hover/click); API
+  `GET /recruitment/frontier`, `POST /recruitment/frontier/expand`.
+
+**Honesty rule (REMEDIATION.md):** evidence-backed real data OR labeled demo — never
+fabricate. `synthetic` flag on every prospect; provider signals null when unwired;
+no invented links on failed fetch. In demo mode the Niche Map seeds + mines but won't
+snowball (expansion needs a real fetcher/backlink key for co-promotion data).
