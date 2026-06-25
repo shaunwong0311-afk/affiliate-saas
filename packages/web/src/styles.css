@@ -71,6 +71,42 @@ body {
   text-rendering: optimizeLegibility;
 }
 
+/* ---- Modern scrollbars --------------------------------------------------- */
+/* Firefox */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--ink-600) transparent;
+}
+/* WebKit / Chromium / Edge — slim, rounded, overlay-style, accent on hover */
+::-webkit-scrollbar {
+  width: 11px;
+  height: 11px;
+}
+::-webkit-scrollbar-track,
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--ink-600);
+  border-radius: 99px;
+  border: 3px solid transparent;
+  background-clip: padding-box;
+  transition: background 0.15s ease;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--text-faint);
+  background-clip: padding-box;
+}
+::-webkit-scrollbar-thumb:active {
+  background: var(--acc-dim);
+  background-clip: padding-box;
+}
+/* Reserve gutter on the app's scroll regions so content doesn't shift on overflow */
+.sidebar,
+.card [style*="overflow"] {
+  scrollbar-gutter: stable;
+}
+
 /* subtle film grain overlay */
 body::after {
   content: "";
