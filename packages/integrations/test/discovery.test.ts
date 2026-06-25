@@ -116,14 +116,28 @@ describe("DataForSEOBacklinkProvider — cost-efficient request shape", () => {
     expect(sentBody[0].filters).toEqual([["url_to", "like", "%m=222%"]]);
     expect(rows[0]!.urlFrom).toBe("https://aff.com");
   });
+
+  it("apex query filters to affiliate-marker links (OR), so one_per_domain picks an affiliate link", async () => {
+    let sentBody: any = null;
+    const http = {
+      async post(_url: string, body: unknown) {
+        sentBody = body;
+        return { status: 200, json: { tasks: [{ result: [{ items: [] }] }] } };
+      },
+    };
+    await new DataForSEOBacklinkProvider({ login: "x", password: "y", http }).referringLinks("competitor.com", 100, { urlToContainsAny: ["ref=", "/go/"] });
+    expect(sentBody[0].filters).toEqual([["url_to", "like", "%ref=%"], "or", ["url_to", "like", "%/go/%"]]);
+  });
 });
 
 class RecordingBacklinks implements BacklinkProvider {
   readonly kind = "recording";
   targets: string[] = [];
+  lastOpts: { urlToContains?: string; urlToContainsAny?: string[] } | undefined;
   constructor(private readonly rows: BacklinkRow[]) {}
-  async referringLinks(target: string, _limit: number, opts?: { urlToContains?: string }): Promise<BacklinkRow[]> {
+  async referringLinks(target: string, _limit: number, opts?: { urlToContains?: string; urlToContainsAny?: string[] }): Promise<BacklinkRow[]> {
     this.targets.push(opts?.urlToContains ? `${target}?${opts.urlToContains}` : target);
+    this.lastOpts = opts;
     return this.rows;
   }
 }
@@ -163,5 +177,11 @@ describe("BacklinkDiscoverySource — resolved network targeting", () => {
     const provider = new RecordingBacklinks([{ urlFrom: "https://aff.com/x", urlTo: "https://shareasale.com/r.cfm?m=56789", anchor: "" }]);
     await new BacklinkDiscoverySource(provider, resolver).discover({ ...baseQuery, competitors: ["acme.com"], limit: 5 });
     expect(provider.targets).toContain("shareasale.com?m=56789"); // queried the network, filtered by id
+  });
+
+  it("apex fallback (no resolved program) filters by affiliate markers", async () => {
+    const provider = new RecordingBacklinks([{ urlFrom: "https://aff.com/x", urlTo: "https://acme.com/p?ref=joe", anchor: "" }]);
+    await new BacklinkDiscoverySource(provider).discover({ ...baseQuery, competitors: ["acme.com"], limit: 5 });
+    expect(provider.lastOpts?.urlToContainsAny).toBeTruthy(); // affiliate-marker OR filter on the apex query
   });
 });

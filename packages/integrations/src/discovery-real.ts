@@ -205,11 +205,31 @@ export interface BacklinkRow {
 export interface BacklinkProvider {
   readonly kind: string;
   /**
-   * Pages that link AT the target domain. `urlToContains` filters server-side to
-   * links whose destination contains a substring (e.g. a `m=56789` merchant id) — so
-   * we pull only the competitor's slice of a shared network domain, not all of it.
+   * Pages that link AT the target domain. Server-side filters:
+   *  - `urlToContains` — destination contains a substring (a `m=56789` merchant id) →
+   *    the competitor's slice of a shared network domain.
+   *  - `urlToContainsAny` — destination matches ANY of these (the apex path: common
+   *    affiliate markers like `ref=`, `/go/`), so `one_per_domain` picks an AFFILIATE
+   *    link, not a plain one, on a domain that has both.
    */
-  referringLinks(targetDomain: string, limit: number, opts?: { urlToContains?: string }): Promise<BacklinkRow[]>;
+  referringLinks(
+    targetDomain: string,
+    limit: number,
+    opts?: { urlToContains?: string; urlToContainsAny?: string[] },
+  ): Promise<BacklinkRow[]>;
+}
+
+/** Common affiliate URL markers for the apex-domain server filter. */
+export const AFFILIATE_MARKERS = ["ref=", "aff=", "affiliate", "via=", "partner=", "/go/", "/recommend", "/aff/"];
+
+// Build a DataForSEO OR-of-LIKE filter (capped at 8, their max combined filters).
+function orLikeFilter(field: string, values: string[]): unknown[] {
+  const out: unknown[] = [];
+  values.slice(0, 8).forEach((v, i) => {
+    if (i > 0) out.push("or");
+    out.push([field, "like", `%${v}%`]);
+  });
+  return out;
 }
 
 interface PostJson {
@@ -234,7 +254,7 @@ async function postJson(url: string, body: unknown, headers: Record<string, stri
 export class DataForSEOBacklinkProvider implements BacklinkProvider {
   readonly kind = "dataforseo";
   constructor(private readonly opts: { login: string; password: string; http?: PostJson }) {}
-  async referringLinks(target: string, limit: number, opts?: { urlToContains?: string }): Promise<BacklinkRow[]> {
+  async referringLinks(target: string, limit: number, opts?: { urlToContains?: string; urlToContainsAny?: string[] }): Promise<BacklinkRow[]> {
     const auth = Buffer.from(`${this.opts.login}:${this.opts.password}`).toString("base64");
     const url = "https://api.dataforseo.com/v3/backlinks/backlinks/live";
     // For affiliate finding we want ONE row per referring domain (= one potential
@@ -250,6 +270,7 @@ export class DataForSEOBacklinkProvider implements BacklinkProvider {
       order_by: ["rank,desc"],
     };
     if (opts?.urlToContains) task.filters = [["url_to", "like", `%${opts.urlToContains}%`]];
+    else if (opts?.urlToContainsAny?.length) task.filters = orLikeFilter("url_to", opts.urlToContainsAny);
     const body = [task];
     const headers = { Authorization: `Basic ${auth}`, "Content-Type": "application/json" };
     const res = this.opts.http ? await this.opts.http.post(url, body, headers) : await postJson(url, body, headers);
@@ -263,7 +284,7 @@ export class DataForSEOBacklinkProvider implements BacklinkProvider {
 /** Deterministic backlink generator — affiliate links to the target, for offline/demo. */
 export class DeterministicBacklinkProvider implements BacklinkProvider {
   readonly kind = "deterministic-backlink";
-  async referringLinks(target: string, limit: number, _opts?: { urlToContains?: string }): Promise<BacklinkRow[]> {
+  async referringLinks(target: string, limit: number, _opts?: { urlToContains?: string; urlToContainsAny?: string[] }): Promise<BacklinkRow[]> {
     void _opts;
     const seed = parseInt(createHash("md5").update(target).digest("hex").slice(0, 8), 16);
     const base = target.split(".")[0] ?? "brand";
@@ -380,11 +401,17 @@ export class BacklinkDiscoverySource implements DiscoverySource {
       for (const t of queries) {
         if (out.length >= query.limit) break;
         // A network-targeted query (id filter / vanity host) is, by construction, the
-        // competitor's affiliates — confirmed. An apex query needs the per-link check.
+        // competitor's affiliates — confirmed. An apex query filters to affiliate-marker
+        // links server-side (so one_per_domain picks an affiliate link) and still runs the
+        // per-link check below.
         const networkTargeted = safeHost(t.target) !== competitor;
         let rows: BacklinkRow[];
         try {
-          rows = await this.provider.referringLinks(t.target, perCompetitor * 4, { urlToContains: t.urlToContains });
+          rows = await this.provider.referringLinks(
+            t.target,
+            perCompetitor * 4,
+            networkTargeted ? { urlToContains: t.urlToContains } : { urlToContainsAny: AFFILIATE_MARKERS },
+          );
         } catch {
           continue;
         }
