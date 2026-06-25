@@ -2,7 +2,7 @@ import { buildApp } from "../app.js";
 import { seedDemo } from "./seed.js";
 import { programHealth, moneyOps, recruitmentFunnel, affiliatePerformance, producingFunnel } from "../services/reporting.js";
 import { computePayableLines } from "../services/payout-service.js";
-import { autonomousCycle, sourceYield, deliverabilityHealth, getAutomationState } from "@affiliate/recruitment";
+import { autonomousCycle, sourceYield, deliverabilityHealth, getAutomationState, planDiscovery } from "@affiliate/recruitment";
 import { money, formatMoney } from "@affiliate/core";
 
 /**
@@ -51,7 +51,14 @@ async function main() {
   line(`    sourced ${funnel.sourced} → contacted ${funnel.contacted} → replied ${funnel.replied} → converted ${funnel.converted}`);
   line(`    tiers: ${JSON.stringify(funnel.byTier)}`);
   if (demoCount > 0)
-    line(`    ⚠ ${demoCount}/${allProspects.length} are DEMO DATA (no SERP/email keys wired — set SERPAPI_KEY + HUNTER_API_KEY for real discovery)`);
+    line(`    ⚠ ${demoCount}/${allProspects.length} are DEMO DATA (no SERP/email/backlink keys wired — set SERPAPI_KEY / HUNTER_API_KEY / DATAFORSEO_LOGIN for real discovery)`);
+  line();
+
+  const plan = await planDiscovery(ctx, merchantId);
+  line("  DISCOVERY PLAN (the orchestrator decides what to run, warmest first)");
+  for (const s of plan.steps) line(`    ✓ [P${s.priority}] ${s.label}`);
+  for (const s of plan.skipped) line(`    ✗ ${s.sourceType} — skipped: ${s.reason}`);
+  for (const note of plan.notes) line(`    · ${note}`);
   line();
 
   const auto = await getAutomationState(ctx, merchantId);
