@@ -207,6 +207,31 @@ describe("discovery honesty (pipeline)", () => {
     expect(sig.engagement).toBeNull();
   });
 
+  it("fetches the homepage in enrich for a page-poor (backlink) prospect → real email + graph", async () => {
+    // Backlink mining gives only the domain + competitor link (no pageHtml). Enrich must
+    // fetch the homepage to extract the real email, identity graph, and affiliate links.
+    const homepage = (
+      `<a href="mailto:hi@affsite.com">contact</a>` +
+      `<a href="https://youtube.com/@affcreator">yt</a>` +
+      `<a href="https://brandx.com/buy?ref=joe">brand x</a>`
+    ).padEnd(260, " ");
+    const fetcher: HttpFetcher = { kind: "mock", async get(url: string): Promise<FetchResult> { return { status: 200, url, html: homepage }; } };
+    const verifier: EmailVerifier = { kind: "mock", async verify() { return { deliverable: true, reason: "ok" }; } };
+    const backlinkCand = cand({
+      identity: "affsite.com",
+      siteUrl: "https://affsite.com",
+      outboundLinks: ["https://rival.com/p?ref=joe"],
+      confirmedCompetitor: "rival.com",
+    });
+    await runSourcing(deps([new StaticSource([backlinkCand])], { fetcher, emailVerifier: verifier }), "m1", { limit: 5 });
+
+    const p = (await db.prospects.find((x) => x.merchantId === "m1"))[0]!;
+    expect(p.email).toBe("hi@affsite.com"); // real on-page email, not a guess
+    expect(p.evidence?.contactSource).toBe("page:mailto");
+    expect(p.evidence?.profile?.accounts.some((a) => a.platform === "youtube")).toBe(true); // identity graph from the page
+    expect(p.evidence?.affiliateLinks?.some((l) => l.url.includes("brandx.com"))).toBe(true); // their other promoted merchant
+  });
+
   it("flags a contact-form-only prospect for the human gate (no email invented)", async () => {
     // No email on page, no finder hits → the prospect must be flagged form-only, not
     // assigned a fabricated address.

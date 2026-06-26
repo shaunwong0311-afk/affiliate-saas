@@ -2,6 +2,7 @@ import {
   newId,
   scoreProspect as scoreSignals,
   detectAffiliateUrl,
+  detectAffiliateLinksInHtml,
   promotesCompetitor as detectPromotesCompetitor,
   hasProvenAffiliateSignal,
   canTransition,
@@ -190,9 +191,43 @@ export async function enrich(deps: RecruitmentDeps, prospectId: string): Promise
   let chosenEmail: string | null = null;
   let contactSource: string | null = null;
 
-  // 1) PREFER emails actually extracted from the fetched page (real contact path).
-  const extracted = prospect.evidence?.contactEmails ?? [];
-  for (const c of extracted) {
+  let profile = (prospect.evidence?.profile as Profile | null) ?? null;
+  const seedUrl = prospect.siteUrl ?? prospect.channelUrl;
+  let pageEmails = prospect.evidence?.contactEmails ?? [];
+  let contactUrls = prospect.evidence?.contactUrls ?? [];
+  let contactForm = prospect.evidence?.contactForm ?? false;
+  let contactFormUrl = prospect.evidence?.contactFormUrl ?? null;
+  let affiliateLinks = prospect.evidence?.affiliateLinks ?? [];
+
+  // 0) If the SOURCE never fetched this prospect's page (backlink mining gives us only
+  //    their domain + the one competitor link), fetch their homepage NOW so the same
+  //    extractors light up: real on-page email, identity graph (their other platforms),
+  //    contact URLs/form, and their full affiliate-link profile. Real prospects + a
+  //    fetcher only; skipped when the source already provided page data (e.g. SERP).
+  if (deps.fetcher && !prospect.synthetic && seedUrl && pageEmails.length === 0 && contactUrls.length === 0) {
+    try {
+      const r = await deps.fetcher.get(seedUrl);
+      if (r.status >= 200 && r.status < 300 && r.html && r.html.length > 200) {
+        const html = r.html;
+        pageEmails = extractEmailsFromHtml(html).slice(0, 5);
+        contactUrls = discoverContactUrls(html, seedUrl);
+        contactForm = detectsContactForm(html);
+        contactFormUrl = contactForm ? (prospect.siteUrl ?? seedUrl) : contactFormUrl;
+        const page = { url: seedUrl, links: extractHrefs(html, seedUrl) };
+        profile = profile ? addPageToProfile(profile, page, seedUrl) : buildProfile(seedUrl, [page]);
+        // Capture their full affiliate-link profile (merged, deduped) — richer evidence
+        // AND the recursive frontier reads it to find the OTHER merchants they promote.
+        const found = detectAffiliateLinksInHtml(html).map((s) => ({ url: s.url, network: s.network, confidence: s.confidence, verified: s.verified }));
+        const seen = new Set(affiliateLinks.map((l) => l.url));
+        affiliateLinks = [...affiliateLinks, ...found.filter((l) => !seen.has(l.url))];
+      }
+    } catch {
+      /* unreachable homepage — fall through to the finder */
+    }
+  }
+
+  // 1) PREFER emails actually extracted from the page (real contact path).
+  for (const c of pageEmails) {
     const v = await verify(c.email).catch(() => ({ deliverable: false, reason: "verify error" }));
     if (v.deliverable) {
       chosenEmail = c.email;
@@ -205,10 +240,8 @@ export async function enrich(deps: RecruitmentDeps, prospectId: string): Promise
   //    YouTube About). Each fetched page does double duty: extract real emails AND
   //    grow the identity graph (a Linktree enumerates all the creator's accounts —
   //    the strongest cross-platform signal). Real prospects with a fetcher only.
-  let profile = (prospect.evidence?.profile as Profile | null) ?? null;
-  const seedUrl = prospect.siteUrl ?? prospect.channelUrl;
   if (deps.fetcher && !prospect.synthetic) {
-    for (const c of prospect.evidence?.contactUrls ?? []) {
+    for (const c of contactUrls) {
       let html: string | null = null;
       try {
         const r = await deps.fetcher.get(c.url);
@@ -294,7 +327,7 @@ export async function enrich(deps: RecruitmentDeps, prospectId: string): Promise
   await deps.db.usageEvents.insert({ id: newId("use"), merchantId: prospect.merchantId, kind: "enrichment", quantity: 1, sourceId: prospectId, ts });
   return deps.db.prospects.update(prospectId, {
     email: chosenEmail,
-    evidence: { ...(prospect.evidence ?? {}), contactSource, profile },
+    evidence: { ...(prospect.evidence ?? {}), contactSource, profile, contactEmails: pageEmails, contactUrls, contactForm, contactFormUrl, affiliateLinks },
     state: "enriched",
     updatedAt: ts,
   });
