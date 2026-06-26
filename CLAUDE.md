@@ -55,6 +55,7 @@ before `npm run api` (see `.env.example`). Each is gated in `packages/api/src/co
 | `DATAFORSEO_LOGIN` + `DATAFORSEO_PASSWORD` | **Real competitor backlink mining** (the warmest source) + the recursive frontier | Pay-as-you-go, ~$0.05/1k backlinks (≈100× cheaper than Ahrefs). `BacklinkDiscoverySource` + `DataForSEOBacklinkProvider`. |
 | `SERPAPI_KEY` | Real SERP discovery (`SerpApiProvider`); also enables the proxy/direct page fetcher, redirect resolver, MX verifier, and contact-link following | Without it, SERP runs the deterministic generator (synthetic). |
 | `PROXY_URL` | Rotating/residential proxy for scraping (never the box IP) | Comma-separated pool. |
+| `BROWSER_FETCH` | Headless-browser (Playwright) fetching for JS-rendered pages + passing JS anti-bot challenges (Cloudflare). Escalates static→browser only when a page looks blocked. | Optional dep: `npm install playwright && npx playwright install chromium`. `EscalatingFetcher`/`PlaywrightFetcher` in `integrations/browser-fetch.ts`. |
 | `HUNTER_API_KEY` | Real email finding/verification (`HunterFinder`) | Fallback after real page-extraction; MX verify is free. |
 | `SCRAPE_API_URL` (+ `SCRAPE_API_KEY`) | IG/TikTok/X public follower + engagement via a scraping-API actor (`ScrapeMetricsEnricher`) | Recommended vendor: ScrapeCreators or Social Fetch (pay-as-you-go). Demographics deferred. |
 | `YOUTUBE_API_KEY` | Real YouTube reach + engagement (`YouTubeEnricher`, free Data API) | subs + recent-video like/comment/view ratios + country. |

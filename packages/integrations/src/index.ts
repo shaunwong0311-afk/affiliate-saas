@@ -40,6 +40,7 @@ export { HashingEmbedder, DeterministicLlm, classifyReply, renderTemplate } from
 export { AnthropicLlmClient } from "./anthropic-llm.js";
 export { InMemorySecretStore, EnvSecretStore } from "./secrets.js";
 export * from "./http.js";
+export { PlaywrightFetcher, EscalatingFetcher, looksBlocked } from "./browser-fetch.js";
 export {
   SerpApiProvider,
   DeterministicSerpProvider,

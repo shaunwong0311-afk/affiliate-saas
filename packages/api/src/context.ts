@@ -26,6 +26,8 @@ import {
   DbCustomerMiningSource,
   ProxyHttpFetcher,
   DeterministicFetcher,
+  PlaywrightFetcher,
+  EscalatingFetcher,
   FetchJsonClient,
   staticProxyPool,
   FetchRedirectResolver,
@@ -105,9 +107,17 @@ export function createContext(overrides: Partial<AppContext> = {}): AppContext {
   // whenever we have real SERP results; deterministic (no network) otherwise.
   const pageFetcher = realDiscovery ? new ProxyHttpFetcher(staticProxyPool(proxyUrls)) : new DeterministicFetcher();
   const serpSource = new SerpDiscoverySource(serpProvider, pageFetcher);
-  // Page fetcher for following contact links + reading competitor sites — real
-  // discovery only, so dev/test never make secondary network calls.
-  const fetcher = overrides.fetcher ?? (realDiscovery ? pageFetcher : undefined);
+  // Page fetcher for following contact links + reading competitor/affiliate sites —
+  // real discovery only, so dev/test never make secondary network calls. With
+  // BROWSER_FETCH=true, wrap it so a JS-rendered or anti-bot-challenged page escalates
+  // from the cheap static fetch to a real headless browser (Playwright).
+  const fetcher =
+    overrides.fetcher ??
+    (realDiscovery
+      ? process.env.BROWSER_FETCH === "true"
+        ? new EscalatingFetcher(pageFetcher, new PlaywrightFetcher({ proxies: proxyUrls }))
+        : pageFetcher
+      : undefined);
 
   // Synthetic generators fabricate demo prospects — only included when allowed
   // (never in production). The SERP source, first-party customer mining, and the
