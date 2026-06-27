@@ -179,3 +179,23 @@ data). An Ahrefs-style backlink explorer is buildable as a *product* but can't m
 Ahrefs' proprietary index depth (~2.8T DataForSEO vs ~35T Ahrefs). Treat all of this as
 a future upsell riding infra we already pay for — **an adjacency, not a pivot.** Don't
 let "build our own Ahrefs" dilute the recruitment wedge.
+
+## Enrichment + fetching internals (current)
+
+- **enrich** (`pipeline.ts`) — homepage-first: when a source gave no page HTML (backlink
+  mining gives only the domain + competitor link), enrich **fetches the prospect's
+  homepage** so the extractors light up — real on-page email (extract → MX verify),
+  identity graph (their other platforms → enrichers fill reach/engagement), contact
+  URLs/form, and their full affiliate-link profile (which the frontier reads). Then it
+  follows the discovered contact URLs (Linktree/`/contact`/YT-About) as a second pass,
+  and falls back to the EmailFinder (Hunter by domain) only if nothing's found. All
+  page parsing/detection is OUR code (`web-evidence.ts` + `core/profile`), regex/
+  heuristics — no scraping SaaS.
+- **Fetching ladder** (`HttpFetcher` port): cheap static fetch (`ProxyHttpFetcher`, UA +
+  proxy rotation, never the box IP) → **headless browser** (`PlaywrightFetcher`, env
+  `BROWSER_FETCH`, optional `npm install playwright`) which `EscalatingFetcher` triggers
+  ONLY when a page looks blocked/empty/challenged (`looksBlocked`). The browser passes
+  JS anti-bot challenges (Cloudflare "checking your browser"); CAPTCHA walls are NOT
+  solved here — they need residential proxies to avoid, or a managed-unblocker API as
+  an optional next rung behind the same port. Static-HTML-only otherwise (no JS exec)
+  unless `BROWSER_FETCH` is on. A true block → honest miss (no fabricated data).

@@ -107,10 +107,42 @@ links. Keep this discipline in all discovery/enrichment work.
 
 ## Current state (as of this writing)
 
-All built and green (196+ tests, root + web typecheck clean, demo runs). The full
-discovery stack exists end-to-end behind ports; it runs on labeled demo data until
-provider keys are set. Known deferrals / next levers:
-- **Per-merchant ICP override UI** for competitor program IDs (resolver + `parseProgramInput` support it; storage/field not yet wired).
-- **LLM query expansion** and **crawl-history persistence** (discovery roadmap).
-- **Demo-mode frontier growth** — the deterministic generator doesn't fake cross-promotion, so the Niche Map shows seeds but doesn't snowball without a real fetcher/backlink key.
-- **Postgres-backed integration tests**, CF KV/Queue production wiring, datacenter-IP detection — see REMEDIATION.md "still open".
+All built and green (**205 tests**, root + web typecheck clean, demo runs). The full
+**discovery + enrich + score + recursive-frontier** stack exists end-to-end behind
+ports; it runs on labeled demo data until provider keys are set. Recent additions this
+session (all committed): DataForSEO `one_per_domain` cost strategy + apex
+affiliate-marker filter (`AFFILIATE_MARKERS`); `ingestCandidate` extracted + shared;
+**homepage-fetch-in-enrich** (backlink-mined prospects fetch their own homepage so
+email/identity-graph/affiliate-links/contact all populate — they're now first-class);
+**headless-browser fetching** (`PlaywrightFetcher`/`EscalatingFetcher`/`looksBlocked`
+in `integrations/browser-fetch.ts`, env `BROWSER_FETCH`) that escalates static→browser
+only when a page looks blocked (passes Cloudflare JS challenges).
+
+## Next steps (priority tiers — what to work on)
+
+The discovery/enrichment HALF is deep and done; the **act-on-it half** (send → close →
+pay) still has stub adapters. Recommended order:
+
+**Tier 1 — go live (setup, not building):** set provider keys on the box
+(`DATAFORSEO_LOGIN/PASSWORD` + `SERPAPI_KEY` + `PROXY_URL`, `BROWSER_FETCH=true` after
+`npm install playwright`); `USE_POSTGRES`/`DATABASE_URL`; prod hardening
+(`JWT_SECRET`, `NODE_ENV=production`, `ALLOW_SYNTHETIC_DISCOVERY=false`); deploy per
+`DEPLOYMENT.md` (one small VPS/Hetzner origin + Cloudflare edge/static; the 3 Hetzner
+rules: never email from box IP, scrape via proxies, back ledger off-box).
+
+**Tier 2 — make the recruit→close→pay half REAL (biggest functional gap):**
+- **Mailbox OAuth (Gmail / MS Graph)** so outreach actually sends as the merchant —
+  currently a stub (`integrations/mailbox.ts`). *Highest-value next build.*
+- **Calendar booking** (Cal.com / Google) for the A-tier meeting handoff — stub.
+- **Payout rails** (Stripe Connect / PayPal / Wise) — stubs.
+
+**Tier 3 — discovery polish / levers (we may keep iterating here):**
+- **Per-merchant ICP override UI** for competitor program IDs (`parseProgramInput` +
+  resolver overrides already support it; storage/field not wired).
+- **LLM query expansion** (cheap — the LLM client exists).
+- **Dedupe the frontier+enrich double-fetch** / crawl-history persistence.
+- **Demo-mode frontier growth** (fake cross-promotion so the Niche Map snowballs
+  offline) + Niche Map node animations.
+- **Managed-unblocker rung** for CAPTCHA-hard targets (optional, behind the fetcher port).
+- **Postgres integration tests**, CF KV/Queue wiring, datacenter-IP detection — see
+  REMEDIATION.md "still open".
