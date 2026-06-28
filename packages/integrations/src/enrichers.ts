@@ -43,6 +43,12 @@ export class YouTubeEnricher implements AccountEnricher {
     const reach = numOrNull(item.statistics?.subscriberCount);
     const primaryGeo = item.snippet?.country ?? null;
     const language = item.snippet?.defaultLanguage ?? null;
+    // The channel DESCRIPTION is where creators put "Business: x@y.com" + their website.
+    // YouTube's About-page email is captcha-gated, but the description comes free in this
+    // same API call — the key to making website-less YouTube creators contactable.
+    const description: string = item.snippet?.description ?? "";
+    const emails = [...description.matchAll(/[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/gi)].map((m) => m[0].toLowerCase());
+    const links = [...description.matchAll(/https?:\/\/[^\s)>\]]+/gi)].map((m) => m[0]);
 
     let engagementRate: number | null = null;
     const uploads = item.contentDetails?.relatedPlaylists?.uploads;
@@ -61,7 +67,7 @@ export class YouTubeEnricher implements AccountEnricher {
         if (rates.length) engagementRate = rates.reduce((a: number, b: number) => a + b, 0) / rates.length;
       }
     }
-    return { reach, engagementRate, primaryGeo, language, source: "api" };
+    return { reach, engagementRate, primaryGeo, language, source: "api", emails: emails.length ? [...new Set(emails)] : undefined, links: links.length ? [...new Set(links)] : undefined };
   }
 }
 

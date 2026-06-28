@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { buildDiscoveryQueries, SerpDiscoverySource, BacklinkDiscoverySource, CompetitorProgramResolver, DataForSEOBacklinkProvider } from "../src/index.js";
+import { buildDiscoveryQueries, SerpDiscoverySource, BacklinkDiscoverySource, CompetitorProgramResolver, DataForSEOBacklinkProvider, DataForSEOSerpProvider, YouTubeDiscoverySource } from "../src/index.js";
 import type { DiscoveryQuery, SerpProvider, SerpHit, HttpFetcher, FetchResult, BacklinkProvider, BacklinkRow } from "../src/index.js";
 
 const baseQuery: DiscoveryQuery = {
@@ -71,6 +71,28 @@ describe("SerpDiscoverySource — platform-aware dedup", () => {
   });
 });
 
+// Returns one DISTINCT hit per query (host derived from the query text), so we can
+// see which queries actually ran by inspecting the resulting candidates.
+class PerQuerySerp implements SerpProvider {
+  readonly kind = "per-query";
+  async search(query: string): Promise<SerpHit[]> {
+    const slug = query.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+    return [{ title: query, url: `https://${slug || "x"}.example/p`, snippet: query }];
+  }
+}
+
+describe("SerpDiscoverySource — platform-query budget (#10)", () => {
+  it("reserves budget so platform-targeted creator queries aren't starved by primary queries", async () => {
+    // Small limit + many competitors → primary (competitor/buyer-intent) queries would
+    // otherwise eat the whole budget before the youtube/newsletter/podcast queries run.
+    const q: DiscoveryQuery = { ...baseQuery, competitors: ["a.com", "b.com", "c.com"], limit: 6 };
+    const cands = await new SerpDiscoverySource(new PerQuerySerp(), shortFetcher, { maxQueries: 14 }).discover(q);
+    const platform = cands.filter((c) => /\[(youtube|newsletter|podcast|community|social)\]/.test(c.evidenceSummary ?? ""));
+    expect(platform.length).toBeGreaterThan(0); // platform channels got reserved room
+    expect(cands.length).toBeLessThanOrEqual(6); // still respects the cap
+  });
+});
+
 class FakeBacklinks implements BacklinkProvider {
   readonly kind = "fake-backlink";
   constructor(private readonly rows: BacklinkRow[]) {}
@@ -128,6 +150,19 @@ describe("DataForSEOBacklinkProvider — cost-efficient request shape", () => {
     await new DataForSEOBacklinkProvider({ login: "x", password: "y", http }).referringLinks("competitor.com", 100, { urlToContainsAny: ["ref=", "/go/"] });
     expect(sentBody[0].filters).toEqual([["url_to", "like", "%ref=%"], "or", ["url_to", "like", "%/go/%"]]);
   });
+
+  it("requests ranks on a 0..100 scale and reads domain_from_rank as the domain authority", async () => {
+    let sentBody: any = null;
+    const http = {
+      async post(_url: string, body: unknown) {
+        sentBody = body;
+        return { status: 200, json: { tasks: [{ result: [{ items: [{ url_from: "https://aff.com", url_to: "https://acme.com?ref=x", domain_from_rank: 72 }] }] }] } };
+      },
+    };
+    const rows = await new DataForSEOBacklinkProvider({ login: "x", password: "y", http }).referringLinks("acme.com", 100);
+    expect(sentBody[0].rank_scale).toBe("one_hundred"); // pre-normalized DA, no second call
+    expect(rows[0]!.domainFromRank).toBe(72);
+  });
 });
 
 class RecordingBacklinks implements BacklinkProvider {
@@ -183,5 +218,66 @@ describe("BacklinkDiscoverySource — resolved network targeting", () => {
     const provider = new RecordingBacklinks([{ urlFrom: "https://aff.com/x", urlTo: "https://acme.com/p?ref=joe", anchor: "" }]);
     await new BacklinkDiscoverySource(provider).discover({ ...baseQuery, competitors: ["acme.com"], limit: 5 });
     expect(provider.lastOpts?.urlToContainsAny).toBeTruthy(); // affiliate-marker OR filter on the apex query
+  });
+
+  it("carries the referring-domain authority onto the candidate (free DA from backlinks)", async () => {
+    const provider = new RecordingBacklinks([{ urlFrom: "https://aff.com/x", urlTo: "https://acme.com/p?ref=joe", anchor: "", domainFromRank: 64 }]);
+    const cands = await new BacklinkDiscoverySource(provider).discover({ ...baseQuery, competitors: ["acme.com"], limit: 5 });
+    expect(cands[0]!.domainAuthority).toBe(64);
+  });
+});
+
+describe("DataForSEOSerpProvider", () => {
+  it("posts a Google-organic-live task and maps organic items to SERP hits", async () => {
+    let sentBody: any = null;
+    const http = {
+      async post(url: string, body: unknown) {
+        sentBody = { url, body };
+        return {
+          status: 200,
+          json: {
+            tasks: [{ result: [{ items: [
+              { type: "organic", title: "Best trail shoes", url: "https://blog.com/best", description: "a review" },
+              { type: "people_also_ask", title: "ignored", url: "https://x.com" }, // non-organic → dropped
+            ] }] }],
+          },
+        };
+      },
+    };
+    const hits = await new DataForSEOSerpProvider({ login: "l", password: "p", http }).search("best trail shoes", 10);
+    expect(sentBody.url).toContain("/serp/google/organic/live/advanced");
+    expect(sentBody.body[0].keyword).toBe("best trail shoes");
+    expect(hits).toEqual([{ title: "Best trail shoes", url: "https://blog.com/best", snippet: "a review" }]);
+  });
+});
+
+describe("YouTubeDiscoverySource", () => {
+  it("collapses niche-review videos to distinct channels with a youtube channelUrl", async () => {
+    let lastUrl = "";
+    const http = {
+      async get(url: string) {
+        lastUrl = url;
+        return {
+          status: 200,
+          json: {
+            items: [
+              { id: { videoId: "v1" }, snippet: { channelId: "UC_aaa", channelTitle: "Trail Geek", title: "Best trail shoes 2026" } },
+              { id: { videoId: "v2" }, snippet: { channelId: "UC_aaa", channelTitle: "Trail Geek", title: "Another review" } }, // same channel → deduped
+              { id: { videoId: "v3" }, snippet: { channelId: "UC_bbb", channelTitle: "RunnerPro", title: "Shoe shootout" } },
+            ],
+          },
+        };
+      },
+    };
+    const src = new YouTubeDiscoverySource({ apiKey: "k", http, maxQueries: 1 });
+    const cands = await src.discover({ ...baseQuery, limit: 10 });
+    expect(lastUrl).toContain("type=video"); // search.list video query
+    expect(cands.map((c) => c.channelUrl)).toEqual([
+      "https://www.youtube.com/channel/UC_aaa",
+      "https://www.youtube.com/channel/UC_bbb",
+    ]);
+    expect(cands[0]!.identity).toBe("Trail Geek");
+    expect(cands[0]!.synthetic).toBe(false);
+    expect(cands[0]!.siteUrl).toBeNull(); // no website — exactly the gap this fills
   });
 });

@@ -117,3 +117,113 @@ export class DeterministicFetcher implements HttpFetcher {
     return { status: 200, url, html };
   }
 }
+
+function hostOf(url: string): string | null {
+  try {
+    return new URL(url.startsWith("http") ? url : `https://${url}`).hostname.replace(/^www\./, "").toLowerCase();
+  } catch {
+    return null;
+  }
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Caches fetch results — and the in-flight promise, so concurrent callers for the
+ * same URL share ONE network request — for a TTL. This is the single biggest
+ * waste-cut in discovery: the competitor-program resolver, the recursive frontier,
+ * and the enrich step all fetch the same homepages, so without this each page is
+ * pulled two or three times per cycle. Mirrors {@link CachingEnricher}. Non-2xx
+ * results get a SHORTER ttl so a transiently-down host is retried sooner than a good
+ * page is needlessly re-fetched. Put this OUTERMOST (above rate-limiting) so a cache
+ * hit skips the throttle entirely.
+ */
+export class CachingFetcher implements HttpFetcher {
+  readonly kind: string;
+  private readonly cache = new Map<string, { result: FetchResult; expiresAt: number }>();
+  private readonly inflight = new Map<string, Promise<FetchResult>>();
+  constructor(
+    private readonly inner: HttpFetcher,
+    private readonly opts: { ttlMs?: number; errorTtlMs?: number } = {},
+  ) {
+    this.kind = `cached:${inner.kind}`;
+  }
+  async get(url: string): Promise<FetchResult> {
+    const now = Date.now();
+    const hit = this.cache.get(url);
+    if (hit && hit.expiresAt > now) return hit.result;
+    const pending = this.inflight.get(url);
+    if (pending) return pending; // coalesce concurrent identical fetches into one
+    const p = (async () => {
+      try {
+        const result = await this.inner.get(url);
+        const ok = result.status >= 200 && result.status < 300;
+        const ttl = ok ? (this.opts.ttlMs ?? 10 * 60 * 1000) : (this.opts.errorTtlMs ?? 60 * 1000);
+        this.cache.set(url, { result, expiresAt: Date.now() + ttl });
+        return result;
+      } finally {
+        this.inflight.delete(url);
+      }
+    })();
+    this.inflight.set(url, p);
+    return p;
+  }
+}
+
+/**
+ * Politeness layer: enforces a per-host minimum interval between requests AND a
+ * global concurrency cap, so discovery doesn't hammer a single site (ban risk +
+ * Section 11 etiquette) or open hundreds of sockets at once. The per-host gap is
+ * RESERVED before awaiting, so several concurrent requests to one host queue up and
+ * space out instead of all reading the same "last hit" time. Wrap this around the
+ * real network fetcher; keep the cache ABOVE it so cache hits aren't throttled.
+ */
+export class RateLimitedFetcher implements HttpFetcher {
+  readonly kind: string;
+  private active = 0;
+  private readonly waiters: Array<() => void> = [];
+  private readonly nextAllowedByHost = new Map<string, number>();
+  constructor(
+    private readonly inner: HttpFetcher,
+    private readonly opts: { maxConcurrent?: number; perHostIntervalMs?: number } = {},
+  ) {
+    this.kind = `ratelimited:${inner.kind}`;
+  }
+
+  private acquire(): Promise<void> {
+    const max = this.opts.maxConcurrent ?? 6;
+    if (this.active < max) {
+      this.active += 1;
+      return Promise.resolve();
+    }
+    return new Promise((resolve) => this.waiters.push(resolve));
+  }
+  private release(): void {
+    const next = this.waiters.shift();
+    if (next) next();
+    else this.active -= 1;
+  }
+
+  async get(url: string): Promise<FetchResult> {
+    // 1) Per-host spacing — reserve our slot up front so concurrent same-host calls
+    //    stack rather than collide, WITHOUT holding a concurrency slot while we wait.
+    const interval = this.opts.perHostIntervalMs ?? 0;
+    const host = hostOf(url);
+    if (host && interval > 0) {
+      const now = Date.now();
+      const scheduled = Math.max(now, this.nextAllowedByHost.get(host) ?? 0);
+      this.nextAllowedByHost.set(host, scheduled + interval);
+      const wait = scheduled - now;
+      if (wait > 0) await delay(wait);
+    }
+    // 2) Global concurrency gate.
+    await this.acquire();
+    try {
+      return await this.inner.get(url);
+    } finally {
+      this.release();
+    }
+  }
+}

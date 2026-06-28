@@ -116,6 +116,12 @@ export interface RawCandidate {
   pageHtml?: string | null;
   reachHint?: number;
   /**
+   * Domain authority (0..100) when the source already knows it — e.g. backlink mining
+   * gets the referring domain's rank (`domain_from_rank`) FREE in the same response.
+   * null/undefined = unknown (no SEO provider for this source); never invented.
+   */
+  domainAuthority?: number | null;
+  /**
    * Set by a source that has ALREADY CONFIRMED this candidate promotes a specific
    * competitor (e.g. backlink mining filtered by the competitor's merchant id), even
    * when the visible link points at a network domain. The pipeline trusts it instead
@@ -181,6 +187,12 @@ export interface AccountMetrics {
   primaryGeo: string | null; // the CREATOR's country, when exposed (not audience geo)
   language: string | null;
   source: "api" | "scrape" | "page" | "provider";
+  /** Contact emails the platform exposed (e.g. a YouTube channel description's
+   * "Business: x@y.com"). Lets the contact resolver reach creators with no website. */
+  emails?: string[];
+  /** Outbound links the platform exposed (e.g. the website in a channel description /
+   * social bio) — fed back into the identity graph + contact traversal. */
+  links?: string[];
 }
 
 /**

@@ -35,6 +35,23 @@ describe("YouTubeEnricher", () => {
     expect(await new YouTubeEnricher({ apiKey: "k", http: ytHttp }).enrich({ platform: "youtube", handle: "UC123", url: "x" })).toMatchObject({ reach: 125000 });
     expect(await new YouTubeEnricher({ apiKey: "k", http: ytHttp }).enrich({ platform: "youtube", handle: null, url: "x" })).toBeNull();
   });
+
+  it("extracts the business email + website from the channel description (the contact path)", async () => {
+    const http = {
+      async get(url: string) {
+        if (url.includes("/channels")) {
+          return {
+            status: 200,
+            json: { items: [{ snippet: { description: "Trail running reviews.\nBusiness: hello@trailgeek.com\nShop: https://trailgeek.com", country: "US" }, statistics: { subscriberCount: "5000" }, contentDetails: {} }] },
+          };
+        }
+        return { status: 200, json: { items: [] } };
+      },
+    };
+    const m = await new YouTubeEnricher({ apiKey: "k", http }).enrich({ platform: "youtube", handle: "@trailgeek", url: "x" });
+    expect(m?.emails).toContain("hello@trailgeek.com");
+    expect(m?.links).toContain("https://trailgeek.com");
+  });
 });
 
 describe("ScrapeMetricsEnricher", () => {

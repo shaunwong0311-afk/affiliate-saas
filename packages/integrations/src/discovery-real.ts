@@ -49,6 +49,35 @@ export class SerpApiProvider implements SerpProvider {
   }
 }
 
+/**
+ * DataForSEO SERP adapter (Google Organic, live) — reuses the SAME DataForSEO account
+ * as backlink mining, so a merchant with only a DataForSEO key still gets REAL SERP
+ * discovery (no separate SerpApi subscription). Live organic is ~$0.002/query — cheaper
+ * than SerpApi — and returns the ranking URLs we then fetch + run the affiliate detector
+ * over. Drops straight into SerpDiscoverySource (same SerpProvider port).
+ */
+export class DataForSEOSerpProvider implements SerpProvider {
+  readonly kind = "dataforseo-serp";
+  constructor(private readonly opts: { login: string; password: string; locationCode?: number; languageCode?: string; http?: PostJson }) {}
+  async search(query: string, limit: number): Promise<SerpHit[]> {
+    const auth = Buffer.from(`${this.opts.login}:${this.opts.password}`).toString("base64");
+    const url = "https://api.dataforseo.com/v3/serp/google/organic/live/advanced";
+    const task = {
+      keyword: query,
+      location_code: this.opts.locationCode ?? 2840, // 2840 = United States
+      language_code: this.opts.languageCode ?? "en",
+      depth: Math.min(Math.max(1, limit), 100),
+    };
+    const headers = { Authorization: `Basic ${auth}`, "Content-Type": "application/json" };
+    const res = this.opts.http ? await this.opts.http.post(url, [task], headers) : await postJson(url, [task], headers);
+    const items = (res.json?.tasks?.[0]?.result?.[0]?.items ?? []) as Array<{ type?: string; title?: string; url?: string; description?: string }>;
+    return items
+      .filter((i) => i.type === "organic" && i.url)
+      .slice(0, limit)
+      .map((i) => ({ title: i.title ?? "", url: i.url!, snippet: i.description ?? "" }));
+  }
+}
+
 /** Deterministic SERP generator — stable buyer-intent results from the query. */
 export class DeterministicSerpProvider implements SerpProvider {
   readonly kind = "deterministic-serp";
@@ -134,8 +163,22 @@ export class SerpDiscoverySource implements DiscoverySource {
     const seen = new Set<string>();
     const out: RawCandidate[] = [];
 
+    // Budget guard (Section 8.1): the platform-targeted creator queries (YouTube /
+    // Substack / Reddit / podcast) sit at the TAIL of the priority list, so without a
+    // reservation the competitor + buyer-intent queries up front eat the whole limit and
+    // those creator channels never run. Reserve up to ~40% of the limit for platform
+    // channels; once primary (blog) queries hit their cap we SKIP the rest (saving their
+    // SERP cost too) and let the platform queries fill the reserved room.
+    const PLATFORM_CHANNELS = new Set(["youtube", "newsletter", "podcast", "community", "social"]);
+    const platformPlanCount = plans.filter((p) => PLATFORM_CHANNELS.has(p.channel)).length;
+    const reserve = Math.min(platformPlanCount * perQuery, Math.floor(query.limit * 0.4));
+    const primaryCap = Math.max(perQuery, query.limit - reserve);
+    let primaryCount = 0;
+
     for (const plan of plans) {
       if (out.length >= query.limit) break;
+      const isPlatform = PLATFORM_CHANNELS.has(plan.channel);
+      if (!isPlatform && primaryCount >= primaryCap) continue; // hold room for platform queries
       let hits: SerpHit[];
       try {
         hits = await this.serp.search(plan.q, perQuery);
@@ -188,6 +231,7 @@ export class SerpDiscoverySource implements DiscoverySource {
           pageHtml,
           synthetic: this.synthetic,
         });
+        if (!isPlatform) primaryCount++;
       }
     }
     return out;
@@ -199,6 +243,9 @@ export interface BacklinkRow {
   urlFrom: string;
   urlTo: string;
   anchor: string | null;
+  /** Referring DOMAIN authority on a 0..100 scale (DataForSEO `domain_from_rank`,
+   *  requested with `rank_scale: one_hundred`). null when the provider didn't supply it. */
+  domainFromRank?: number | null;
 }
 
 /** A backlink data provider — real (DataForSEO) or a deterministic generator. */
@@ -268,15 +315,18 @@ export class DataForSEOBacklinkProvider implements BacklinkProvider {
       mode: "one_per_domain",
       backlinks_status_type: "live",
       order_by: ["rank,desc"],
+      // Return ranks already on a 0..100 scale so `domain_from_rank` IS the domain
+      // authority — no second call, no normalization math. (Free request parameter.)
+      rank_scale: "one_hundred",
     };
     if (opts?.urlToContains) task.filters = [["url_to", "like", `%${opts.urlToContains}%`]];
     else if (opts?.urlToContainsAny?.length) task.filters = orLikeFilter("url_to", opts.urlToContainsAny);
     const body = [task];
     const headers = { Authorization: `Basic ${auth}`, "Content-Type": "application/json" };
     const res = this.opts.http ? await this.opts.http.post(url, body, headers) : await postJson(url, body, headers);
-    const items = (res.json?.tasks?.[0]?.result?.[0]?.items ?? []) as Array<{ url_from?: string; url_to?: string; anchor?: string }>;
+    const items = (res.json?.tasks?.[0]?.result?.[0]?.items ?? []) as Array<{ url_from?: string; url_to?: string; anchor?: string; domain_from_rank?: number }>;
     return items
-      .map((i) => ({ urlFrom: i.url_from ?? "", urlTo: i.url_to ?? "", anchor: i.anchor ?? null }))
+      .map((i) => ({ urlFrom: i.url_from ?? "", urlTo: i.url_to ?? "", anchor: i.anchor ?? null, domainFromRank: typeof i.domain_from_rank === "number" ? i.domain_from_rank : null }))
       .filter((r) => r.urlFrom && r.urlTo);
   }
 }
@@ -291,7 +341,9 @@ export class DeterministicBacklinkProvider implements BacklinkProvider {
     const out: BacklinkRow[] = [];
     for (let i = 0; i < limit; i++) {
       const slug = `${base}-fan${(seed + i) % 53}`;
-      out.push({ urlFrom: `https://${slug}.com/best-${base}`, urlTo: `https://${target}/product?ref=${slug}`, anchor: `check out ${target}` });
+      // A deterministic 35..85 DA so demo prospects tier realistically (still synthetic).
+      const domainFromRank = 35 + ((seed + i * 7) % 51);
+      out.push({ urlFrom: `https://${slug}.com/best-${base}`, urlTo: `https://${target}/product?ref=${slug}`, anchor: `check out ${target}`, domainFromRank });
     }
     return out;
   }
@@ -435,6 +487,7 @@ export class BacklinkDiscoverySource implements DiscoverySource {
             evidenceSummary: `Promotes ${competitor} with an affiliate link${row.anchor ? ` (anchor: "${row.anchor.slice(0, 60)}")` : ""} — a proven affiliate in your niche.`,
             outboundLinks: [row.urlTo],
             confirmedCompetitor: competitor,
+            domainAuthority: row.domainFromRank ?? null, // referring-domain rank, free from the backlinks response
             pageHtml: null,
             synthetic: this.synthetic,
           });
@@ -484,6 +537,72 @@ export class DbCustomerMiningSource implements DiscoverySource {
         reachHint: Math.min(50_000, agg.spendCents),
         synthetic: false, // real first-party order data
       });
+    }
+    return out;
+  }
+}
+
+interface SearchJsonHttp {
+  get(url: string): Promise<{ status: number; json: any }>;
+}
+
+/**
+ * Direct YouTube creator discovery (Section 8.1). Competitor backlink mining finds the
+ * affiliates who run WEBSITES; this finds the other half — video creators who review
+ * products in the niche but often have no site to backlink-mine. One `search.list`
+ * (type=video, 100 quota) per query returns niche-review videos; we collapse them to
+ * the distinct CHANNELS behind them. Reach / engagement / country are filled later for
+ * free by {@link YouTubeEnricher} (the channel id flows through the identity graph).
+ * Real source, key-gated; with no key it isn't wired at all (honest absence, not synthetic).
+ */
+export class YouTubeDiscoverySource implements DiscoverySource {
+  readonly sourceType = "youtube_discovery";
+  constructor(private readonly opts: { apiKey: string; http: SearchJsonHttp; maxQueries?: number }) {}
+
+  async discover(query: DiscoveryQuery): Promise<RawCandidate[]> {
+    const niche = (query.niche || "products").trim();
+    const queries = [`${niche} review`, `best ${niche}`, ...query.competitors.slice(0, 2).map((c) => `${safeHost(c) ?? c} review`)]
+      .filter(Boolean)
+      .slice(0, this.opts.maxQueries ?? 3);
+
+    const perQuery = Math.min(50, Math.max(1, Math.ceil(query.limit / Math.max(1, queries.length))));
+    const seen = new Set<string>();
+    const out: RawCandidate[] = [];
+    const base = "https://www.googleapis.com/youtube/v3";
+
+    for (const q of queries) {
+      if (out.length >= query.limit) break;
+      let res: { status: number; json: any };
+      try {
+        res = await this.opts.http.get(
+          `${base}/search?part=snippet&type=video&order=relevance&maxResults=${perQuery}&q=${encodeURIComponent(q)}&key=${this.opts.apiKey}`,
+        );
+      } catch {
+        continue; // isolate source failures (Section 8.1)
+      }
+      const items = (res.json?.items ?? []) as Array<{
+        id?: { videoId?: string };
+        snippet?: { channelId?: string; channelTitle?: string; title?: string };
+      }>;
+      for (const it of items) {
+        if (out.length >= query.limit) break;
+        const channelId = it.snippet?.channelId;
+        if (!channelId || seen.has(channelId)) continue; // distinct channels only
+        seen.add(channelId);
+        const channelUrl = `https://www.youtube.com/channel/${channelId}`;
+        const videoUrl = it.id?.videoId ? `https://www.youtube.com/watch?v=${it.id.videoId}` : channelUrl;
+        out.push({
+          identity: it.snippet?.channelTitle ?? channelId,
+          siteUrl: null,
+          channelUrl,
+          sourceType: this.sourceType,
+          evidenceUrl: videoUrl,
+          evidenceSummary: `YouTube creator surfacing for "${q}"${it.snippet?.title ? ` — e.g. "${it.snippet.title.slice(0, 70)}"` : ""}.`,
+          outboundLinks: [],
+          pageHtml: null,
+          synthetic: false,
+        });
+      }
     }
     return out;
   }

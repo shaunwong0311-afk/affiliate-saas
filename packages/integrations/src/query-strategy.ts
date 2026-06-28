@@ -65,5 +65,16 @@ export function buildDiscoveryQueries(query: DiscoveryQuery, opts?: { max?: numb
   if (channels.has("podcast")) add(`${niche} podcast`, "podcast");
   if (channels.has("community")) add(`site:reddit.com ${niche} recommendations`, "community");
 
-  return out.slice(0, opts?.max ?? 14);
+  // Reserve slots for platform-targeted creator queries so a long competitor list can't
+  // push them past the `max` cap (planning-level starvation — paired with the execution
+  // -level reservation in SerpDiscoverySource). Competitor/buyer-intent stay first.
+  const max = opts?.max ?? 14;
+  const platform = out.filter((p) => PLATFORM_CHANNELS.has(p.channel));
+  const primary = out.filter((p) => !PLATFORM_CHANNELS.has(p.channel));
+  const reservedForPlatform = Math.min(platform.length, Math.floor(max * 0.35));
+  const primaryBudget = Math.max(0, max - reservedForPlatform);
+  return [...primary.slice(0, primaryBudget), ...platform.slice(0, reservedForPlatform)];
 }
+
+/** Channels whose discovery happens on a walled platform (reached via `site:` SERP). */
+const PLATFORM_CHANNELS = new Set<PlannedQuery["channel"]>(["youtube", "newsletter", "podcast", "community", "social"]);

@@ -38,11 +38,14 @@ export {
 export { buildDiscoveryQueries, type PlannedQuery } from "./query-strategy.js";
 export { HashingEmbedder, DeterministicLlm, classifyReply, renderTemplate } from "./llm.js";
 export { AnthropicLlmClient } from "./anthropic-llm.js";
+export { OpenAiCompatibleLlmClient } from "./openai-llm.js";
+export { EmbeddingRelevanceScorer, LlmRelevanceScorer, type RelevanceScorer } from "./relevance.js";
 export { InMemorySecretStore, EnvSecretStore } from "./secrets.js";
 export * from "./http.js";
 export { PlaywrightFetcher, EscalatingFetcher, looksBlocked } from "./browser-fetch.js";
 export {
   SerpApiProvider,
+  DataForSEOSerpProvider,
   DeterministicSerpProvider,
   SerpDiscoverySource,
   BacklinkDiscoverySource,
@@ -50,11 +53,13 @@ export {
   DeterministicBacklinkProvider,
   CompetitorProgramResolver,
   DbCustomerMiningSource,
+  YouTubeDiscoverySource,
   type SerpProvider,
   type SerpHit,
   type BacklinkProvider,
   type BacklinkRow,
 } from "./discovery-real.js";
+export { PodcastDiscoverySource, parsePodcastFeed } from "./discovery-podcast.js";
 export {
   StubCalendarBooking,
   CalcomBooking,
