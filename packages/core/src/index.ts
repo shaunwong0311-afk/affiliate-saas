@@ -32,7 +32,10 @@ export * from "./security/postback.js";
 export * from "./recruitment/scoring.js";
 export * from "./recruitment/state-machine.js";
 export * from "./recruitment/affiliate-detection.js";
+export * from "./recruitment/audience-overlap.js";
+export * from "./recruitment/triage.js";
 
 // ---- Creator identity graph (profile-graph plan) ----------------------------
 export * from "./profile/identity.js";
+export * from "./profile/identity-merge.js";
 export * from "./profile/affiliate-networks.js";

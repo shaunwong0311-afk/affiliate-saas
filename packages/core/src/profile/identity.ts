@@ -221,6 +221,33 @@ function addAccountsFromPage(
   }
 }
 
+/**
+ * Merge two profiles for the SAME creator (discovered via different surfaces) into one.
+ * Accounts are unioned by identity key, keeping the highest-confidence provenance for
+ * each; audience figures prefer the known (non-null) value. Used by prospect-level
+ * identity resolution to build one comprehensive profile per person.
+ */
+export function mergeProfiles(a: Profile, b: Profile): Profile {
+  const accounts = new Map<string, Account>(a.accounts.map((x) => [keyOf(x), x]));
+  for (const acc of b.accounts) {
+    const key = keyOf(acc);
+    const existing = accounts.get(key);
+    if (!existing || acc.confidence > existing.confidence) accounts.set(key, acc);
+  }
+  const list = [...accounts.values()];
+  const primary = a.primary ?? b.primary ?? pickPrimary(list);
+  const linked = list.filter((x) => x.provenance !== "seed");
+  const identityConfidence = linked.length ? Math.max(...linked.map((x) => x.confidence)) : list.length ? 1 : 0;
+  const audience: AudienceEstimate = {
+    reach: a.audience.reach ?? b.audience.reach,
+    primaryGeo: a.audience.primaryGeo ?? b.audience.primaryGeo,
+    language: a.audience.language ?? b.audience.language,
+    engagementRate: a.audience.engagementRate ?? b.audience.engagementRate,
+    source: a.audience.source ?? b.audience.source,
+  };
+  return { primary, accounts: list, audience, identityConfidence };
+}
+
 function pickPrimary(accounts: Account[]): Account | null {
   if (accounts.length === 0) return null;
   const seed = accounts.find((a) => a.provenance === "seed");
