@@ -107,16 +107,52 @@ links. Keep this discipline in all discovery/enrichment work.
 
 ## Current state (as of this writing)
 
-All built and green (**205 tests**, root + web typecheck clean, demo runs). The full
+All built and green (**261 tests**, root + web typecheck clean, demo runs). The full
 **discovery + enrich + score + recursive-frontier** stack exists end-to-end behind
-ports; it runs on labeled demo data until provider keys are set. Recent additions this
-session (all committed): DataForSEO `one_per_domain` cost strategy + apex
-affiliate-marker filter (`AFFILIATE_MARKERS`); `ingestCandidate` extracted + shared;
-**homepage-fetch-in-enrich** (backlink-mined prospects fetch their own homepage so
-email/identity-graph/affiliate-links/contact all populate — they're now first-class);
-**headless-browser fetching** (`PlaywrightFetcher`/`EscalatingFetcher`/`looksBlocked`
-in `integrations/browser-fetch.ts`, env `BROWSER_FETCH`) that escalates static→browser
-only when a page looks blocked (passes Cloudflare JS challenges).
+ports; it runs on labeled demo data until provider keys are set.
+
+A large **discovery/enrichment-quality pass** landed this session (all behind ports,
+key-gated, offline-testable):
+- **Fetcher hardening** (`integrations/http.ts`): `CachingFetcher` (short-TTL + in-flight
+  coalescing — kills the resolver/frontier/enrich re-fetch) + `RateLimitedFetcher`
+  (per-host throttle + global concurrency cap). Composed once in `context.ts`.
+- **Free domain authority**: DataForSEO backlink rows already carry `domain_from_rank`
+  (requested with `rank_scale:"one_hundred"`) → threaded `BacklinkRow → RawCandidate →
+  prospectSignals.da`. The `quality` scoring factor was permanently null; now real for
+  backlink-mined prospects at zero extra cost.
+- **`audienceOverlap`** (`core/recruitment/audience-overlap.ts`): geo/language alignment
+  from the real creator geo/language we already fetch vs a currency-derived target market;
+  null when genuinely unknown.
+- **Pluggable relevance** (`integrations/relevance.ts`): `RelevanceScorer` — lexical
+  embedder offline, a CHEAP LLM when keyed. `RELEVANCE_LLM_*` env points it at any
+  OpenAI-compatible budget model (Grok/Groq/OpenAI-mini/DeepSeek via `OpenAiCompatibleLlmClient`),
+  else Haiku. Replaces hash-similarity relevance with semantic niche fit.
+- **New discovery sources**: `YouTubeDiscoverySource` (search.list → channels, free API,
+  reaches website-less video creators), `PodcastDiscoverySource` (free iTunes API + RSS
+  feed → owner email + site, contactable), `DataForSEOSerpProvider` (Google-organic-live,
+  ~$0.002/q — real SERP reusing the DataForSEO key, no SerpApi needed). SERP-budget fix
+  (`query-strategy.ts` + `SerpDiscoverySource`) reserves room so platform-targeted
+  creator queries aren't starved by competitor queries.
+- **Cross-platform prospect merge** (`core/profile/identity-merge.ts` + `ingestCandidate`):
+  a creator found as a YouTube channel + a website + a social collapses into ONE prospect
+  when they share a hard identifier (handle / email / website domain). `mergeProfiles` unions
+  the graph.
+- **Triage + guards** (`core/recruitment/triage.ts`, `recruitment/guards.ts`, `service.ts`):
+  `preScoreProspect` ranks on cheap discovery-time signals → `runSourcing` enriches
+  best-first, tiers PAID enrichment depth by band, and `maxEnrich`-defers the cold tail;
+  guards skip enriching/cold-emailing existing affiliates (`isExistingAffiliate`) and
+  suppressed contacts. (Contact-finding fetches are NOT tiered down — they're what make a
+  prospect contactable.)
+- **Graph-traversal contact resolver** (`recruitment/contact-resolver.ts`): best-effort
+  email finding as a bounded BFS over the identity graph that EXPANDS as it goes (social
+  bio → website → `/contact` → email); converges from any entry point. YouTube uses the
+  free channel-description email/website (`enrichers.ts` parses `snippet.description`,
+  surfaced on `AccountMetrics.emails/links`) — the captcha-gated About page is bypassed.
+  Replaces the old fixed waterfall in `enrich`.
+
+Earlier this session (also committed): DataForSEO `one_per_domain` + apex affiliate-marker
+filter; `ingestCandidate` extracted + shared; homepage-fetch-in-enrich; headless-browser
+fetching (`PlaywrightFetcher`/`EscalatingFetcher`/`looksBlocked`, env `BROWSER_FETCH`).
 
 ## Next steps (priority tiers — what to work on)
 
@@ -137,12 +173,17 @@ rules: never email from box IP, scrape via proxies, back ledger off-box).
 - **Payout rails** (Stripe Connect / PayPal / Wise) — stubs.
 
 **Tier 3 — discovery polish / levers (we may keep iterating here):**
-- **Per-merchant ICP override UI** for competitor program IDs (`parseProgramInput` +
-  resolver overrides already support it; storage/field not wired).
+- **Go-live VALIDATION**: no provider keys are wired here, so the real-data path is
+  logic-tested only (244→261 tests, all mocked). The actual DataForSEO/SERP/YouTube/proxy/
+  Playwright behavior against the live web is untested — that's a key-on-the-box task.
+- **Per-merchant ICP override UI** for competitor program IDs + an explicit target-market
+  field (audienceOverlap currently derives it from billing currency).
+- **DataForSEO Labs niche graph** (`competitors_domain`/`serp_competitors`) to feed the
+  recursive frontier / Niche Map (research done: cheaper + better-structured than raw SERP).
 - **LLM query expansion** (cheap — the LLM client exists).
-- **Dedupe the frontier+enrich double-fetch** / crawl-history persistence.
-- **Demo-mode frontier growth** (fake cross-promotion so the Niche Map snowballs
-  offline) + Niche Map node animations.
+- **DataForSEO SERP queued mode** (standard queue $0.0006 vs live $0.002) — only worth it
+  at volume; needs the async POST/poll path. Latency hides inside the scraping-bound run.
+- **Demo-mode frontier growth** + Niche Map node animations.
 - **Managed-unblocker rung** for CAPTCHA-hard targets (optional, behind the fetcher port).
 - **Postgres integration tests**, CF KV/Queue wiring, datacenter-IP detection — see
   REMEDIATION.md "still open".

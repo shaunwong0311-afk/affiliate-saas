@@ -199,3 +199,56 @@ let "build our own Ahrefs" dilute the recruitment wedge.
   solved here — they need residential proxies to avoid, or a managed-unblocker API as
   an optional next rung behind the same port. Static-HTML-only otherwise (no JS exec)
   unless `BROWSER_FETCH` is on. A true block → honest miss (no fabricated data).
+
+## Discovery/enrichment quality pass (current)
+
+A round of work focused on COVERAGE, SIGNAL QUALITY, EFFICIENCY, and CONTACTABILITY —
+all behind ports, key-gated, offline-testable:
+
+- **Fetcher hardening** (`integrations/http.ts`): `CachingFetcher` (short-TTL + in-flight
+  coalescing, so the program resolver / frontier / enrich never re-fetch the same page)
+  and `RateLimitedFetcher` (per-host min-interval reserved up front + global concurrency
+  cap). Composed once in `context.ts`: `Caching(RateLimited(Escalating(proxy, playwright)))`.
+- **Free domain authority**: the DataForSEO backlinks response carries the referring
+  domain's rank on every row. We add `rank_scale:"one_hundred"` and read `domain_from_rank`
+  (0..100) → `RawCandidate.domainAuthority` → `prospectSignals.da`. No extra call. The
+  `quality` scoring factor (previously always null for everyone) is now real for
+  backlink-mined prospects.
+- **Audience overlap** (`core/recruitment/audience-overlap.ts`): `audienceOverlapScore`
+  from the real creator geo/language (YouTube `country`/`defaultLanguage`, scrape country)
+  vs `targetMarketForCurrency(merchant.defaultCurrency)`. Both-unknown → null (never invented).
+- **Relevance** (`integrations/relevance.ts`): `RelevanceScorer` — `EmbeddingRelevanceScorer`
+  (lexical, offline) or `LlmRelevanceScorer` (semantic). Wired in `context.ts` with
+  precedence `RELEVANCE_LLM_API_KEY` (any OpenAI-compatible budget model via
+  `OpenAiCompatibleLlmClient`; defaults to xAI Grok-fast) → `ANTHROPIC_API_KEY` (Haiku) →
+  embedder. ~$0.0001–0.001/prospect, cached. Replaces hash-similarity in `score`.
+- **New sources**: `YouTubeDiscoverySource` (search.list, free, reaches website-less
+  creators), `PodcastDiscoverySource` (`integrations/discovery-podcast.ts` — free iTunes
+  Search API + RSS feed → owner email + website, so podcasts are contactable),
+  `DataForSEOSerpProvider` (Google-organic-live ~$0.002/q, real SERP reusing the
+  DataForSEO key). All labeled in the discovery planner. SERP-budget guard
+  (`query-strategy.ts` reserves ~35% for platform channels + `SerpDiscoverySource` caps
+  primary queries) so YouTube/Substack/Reddit creator queries aren't starved.
+- **Cross-platform prospect merge** (`core/profile/identity-merge.ts`): `ingestCandidate`
+  computes `identitySignalsFromProfile` (account keys / emails / website domains) and, on
+  `identitiesOverlap` with an existing prospect, MERGES (`mergeProfiles` + union links/
+  contacts, fill missing URLs, OR signals) and returns null instead of inserting a dup.
+  One creator across YouTube + website + socials = one comprehensive prospect.
+- **Triage + guards** (`core/recruitment/triage.ts`, `recruitment/guards.ts`,
+  `service.ts`): `preScoreProspect` (cheap pre-score: competitor-promotion, affiliate,
+  free DA, intent, contact-path) → `runSourcing` enriches best-first, tiers the PAID
+  enrichment depth (`enrich({ maxAccounts })`) by band, and `maxEnrich`-defers the cold
+  tail. Guards skip enriching/cold-emailing existing affiliates (`isExistingAffiliate`,
+  by relationship `prospectId` or affiliate email) and suppressed contacts. NOTE:
+  contact-finding fetches are NOT tiered down — only paid audience lookups scale, because
+  the contact fetch is what makes a prospect reachable in the first place.
+- **Graph-traversal contact resolver** (`recruitment/contact-resolver.ts`):
+  `resolveContact` is a bounded best-effort BFS over the identity graph. Tries on-page
+  emails first, then walks every linked property (bio aggregator → contact page →
+  website → YouTube API → social), EXPANDING as it discovers new nodes (a social bio
+  links the website; the website's `/contact` has the email). Converges from ANY entry
+  point; stops at the first MX-verified address. YouTube uses the free channel
+  DESCRIPTION (`enrichers.ts` parses `snippet.description` → `AccountMetrics.emails/links`)
+  to bypass the captcha-gated About page. Replaces the fixed waterfall in `enrich`; Hunter
+  stays the final fallback. Email acquisition is now strong across backlink/SERP/podcast/
+  YouTube (customer mining is contact-less by design — hashed email).
