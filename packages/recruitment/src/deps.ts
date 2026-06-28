@@ -10,6 +10,7 @@ import type {
   LlmClient,
   MailboxSender,
   RedirectResolver,
+  RelevanceScorer,
   CalendarBooking,
 } from "@affiliate/integrations";
 
@@ -56,6 +57,12 @@ export interface RecruitmentDeps {
    * this cap. Default 3. Set to 1 to enrich only the primary surface.
    */
   enrichmentMaxAccounts?: number;
+  /**
+   * Topical-relevance scorer. When a cheap LLM is wired it judges niche fit
+   * semantically (synonyms/adjacency/intent); otherwise relevance falls back to the
+   * lexical embedder similarity. Optional — absent → embedder is used directly.
+   */
+  relevanceScorer?: RelevanceScorer;
   /** Meeting booking for the managed (A-tier) track. Optional. */
   calendar?: CalendarBooking;
   clock: Clock;

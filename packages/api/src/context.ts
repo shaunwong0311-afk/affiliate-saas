@@ -13,21 +13,29 @@ import {
   HashingEmbedder,
   DeterministicLlm,
   AnthropicLlmClient,
+  OpenAiCompatibleLlmClient,
+  EmbeddingRelevanceScorer,
+  LlmRelevanceScorer,
   InMemorySecretStore,
   CompetitorAffiliateSource,
   CreatorDiscoverySource,
   SerpDiscoverySource,
   SerpApiProvider,
+  DataForSEOSerpProvider,
   DeterministicSerpProvider,
   BacklinkDiscoverySource,
   DataForSEOBacklinkProvider,
   DeterministicBacklinkProvider,
   CompetitorProgramResolver,
   DbCustomerMiningSource,
+  YouTubeDiscoverySource,
+  PodcastDiscoverySource,
   ProxyHttpFetcher,
   DeterministicFetcher,
   PlaywrightFetcher,
   EscalatingFetcher,
+  CachingFetcher,
+  RateLimitedFetcher,
   FetchJsonClient,
   staticProxyPool,
   FetchRedirectResolver,
@@ -44,6 +52,7 @@ import {
   type EmailVerifier,
   type Embedder,
   type LlmClient,
+  type RelevanceScorer,
   type SecretStore,
   type DiscoverySource,
   type RedirectResolver,
@@ -71,6 +80,8 @@ export interface AppContext {
   emailFinder: EmailFinder;
   embedder: Embedder;
   llm: LlmClient;
+  /** Topical-relevance scorer (LLM-backed when keyed; lexical embedder otherwise). */
+  relevanceScorer: RelevanceScorer;
   secrets: SecretStore;
   discoverySources: DiscoverySource[];
   /** Follows redirects so generic affiliate links can be trusted (real network). Optional. */
@@ -98,26 +109,38 @@ export function createContext(overrides: Partial<AppContext> = {}): AppContext {
   const proxyUrls = (process.env.PROXY_URL ?? "").split(",").map((s) => s.trim()).filter(Boolean);
   const jsonHttp = new FetchJsonClient();
   const hasSerp = !!process.env.SERPAPI_KEY;
-  const realDiscovery = hasSerp || proxyUrls.length > 0;
+  // DataForSEO doubles as a real SERP provider (Google Organic live, ~$0.002/query),
+  // so a merchant with only a DataForSEO key still gets real SERP discovery — no
+  // separate SerpApi subscription. SerpApi wins when both are set.
+  const hasDfs = !!(process.env.DATAFORSEO_LOGIN && process.env.DATAFORSEO_PASSWORD);
+  const realDiscovery = hasSerp || hasDfs || proxyUrls.length > 0;
 
   const serpProvider = hasSerp
     ? new SerpApiProvider({ apiKey: process.env.SERPAPI_KEY!, http: jsonHttp })
-    : new DeterministicSerpProvider();
+    : hasDfs
+      ? new DataForSEOSerpProvider({ login: process.env.DATAFORSEO_LOGIN!, password: process.env.DATAFORSEO_PASSWORD! })
+      : new DeterministicSerpProvider();
   // A real page fetcher (proxy pool, or direct fetch when only a SERP key is set)
   // whenever we have real SERP results; deterministic (no network) otherwise.
   const pageFetcher = realDiscovery ? new ProxyHttpFetcher(staticProxyPool(proxyUrls)) : new DeterministicFetcher();
-  const serpSource = new SerpDiscoverySource(serpProvider, pageFetcher);
-  // Page fetcher for following contact links + reading competitor/affiliate sites —
-  // real discovery only, so dev/test never make secondary network calls. With
-  // BROWSER_FETCH=true, wrap it so a JS-rendered or anti-bot-challenged page escalates
-  // from the cheap static fetch to a real headless browser (Playwright).
-  const fetcher =
-    overrides.fetcher ??
-    (realDiscovery
-      ? process.env.BROWSER_FETCH === "true"
-        ? new EscalatingFetcher(pageFetcher, new PlaywrightFetcher({ proxies: proxyUrls }))
-        : pageFetcher
-      : undefined);
+  // Build ONE hardened fetcher used everywhere real pages are read (SERP result pages,
+  // competitor program pages, contact links, frontier expansion, enrich homepages):
+  //  - BROWSER_FETCH=true → escalate a JS-rendered/anti-bot-challenged page from the
+  //    cheap static fetch to a real headless browser (Playwright);
+  //  - RateLimitedFetcher → per-host throttle + global concurrency cap (ban-safe, polite);
+  //  - CachingFetcher (outermost) → short-TTL cache + in-flight coalescing, so the
+  //    resolver/frontier/enrich never re-pull the same homepage in a cycle.
+  // Dev/test stays on the unwrapped DeterministicFetcher (no delays, no caching surprises),
+  // and `fetcher` is left undefined there so no secondary network calls are attempted.
+  const networkFetcher =
+    realDiscovery && process.env.BROWSER_FETCH === "true"
+      ? new EscalatingFetcher(pageFetcher, new PlaywrightFetcher({ proxies: proxyUrls }))
+      : pageFetcher;
+  const sharedFetcher: HttpFetcher = realDiscovery
+    ? new CachingFetcher(new RateLimitedFetcher(networkFetcher, { maxConcurrent: 6, perHostIntervalMs: 1000 }))
+    : pageFetcher;
+  const serpSource = new SerpDiscoverySource(serpProvider, sharedFetcher);
+  const fetcher = overrides.fetcher ?? (realDiscovery ? sharedFetcher : undefined);
 
   // Synthetic generators fabricate demo prospects — only included when allowed
   // (never in production). The SERP source, first-party customer mining, and the
@@ -137,11 +160,22 @@ export function createContext(overrides: Partial<AppContext> = {}): AppContext {
   // Resolves each competitor's affiliate program (network + merchant id) by reading
   // their site, so backlink mining queries the RIGHT links. Needs a fetcher.
   const programResolver = fetcher ? new CompetitorProgramResolver({ fetcher }) : undefined;
+  // Direct YouTube creator discovery — finds video reviewers (no website to backlink-mine).
+  // Free Data API; only wired when a key is present. Reach/engagement come from YouTubeEnricher.
+  const youtubeDiscovery = process.env.YOUTUBE_API_KEY
+    ? new YouTubeDiscoverySource({ apiKey: process.env.YOUTUBE_API_KEY, http: jsonHttp })
+    : null;
+  // Podcast discovery via the free iTunes Search API — finds podcast affiliates and,
+  // by reading the RSS feed, pulls the owner email + site so they're contactable. Only
+  // when real discovery is on (so dev/test make no outbound calls); reuses the fetcher.
+  const podcastDiscovery = realDiscovery ? new PodcastDiscoverySource({ http: jsonHttp, fetcher: sharedFetcher }) : null;
   const discoverySources: DiscoverySource[] = overrides.discoverySources ?? [
     serpSource,
     ...syntheticSources,
     new DbCustomerMiningSource(db),
     new BacklinkDiscoverySource(backlinkProvider, programResolver),
+    ...(youtubeDiscovery ? [youtubeDiscovery] : []),
+    ...(podcastDiscovery ? [podcastDiscovery] : []),
   ];
 
   // Email finding: real Hunter.io when keyed, deterministic pattern stub otherwise.
@@ -172,6 +206,25 @@ export function createContext(overrides: Partial<AppContext> = {}): AppContext {
     overrides.llm ??
     (process.env.ANTHROPIC_API_KEY ? new AnthropicLlmClient({ apiKey: process.env.ANTHROPIC_API_KEY }) : new DeterministicLlm());
 
+  // Relevance scoring: a cheap LLM judges topical niche fit semantically
+  // (~$0.0001-0.001/prospect, cached). Precedence:
+  //  1) RELEVANCE_LLM_API_KEY → any OpenAI-compatible budget model (Grok/Groq/OpenAI-mini/
+  //     DeepSeek/OpenRouter). Defaults to xAI Grok-fast; override base URL + model via env.
+  //  2) ANTHROPIC_API_KEY → Claude Haiku.
+  //  3) neither → the lexical hashing-embedder similarity (the default `embedder` below).
+  const embedder = overrides.embedder ?? new HashingEmbedder();
+  const relevanceLlm: LlmClient | null = process.env.RELEVANCE_LLM_API_KEY
+    ? new OpenAiCompatibleLlmClient({
+        apiKey: process.env.RELEVANCE_LLM_API_KEY,
+        baseUrl: process.env.RELEVANCE_LLM_BASE_URL ?? "https://api.x.ai/v1",
+        model: process.env.RELEVANCE_LLM_MODEL ?? "grok-4-fast-non-reasoning",
+      })
+    : process.env.ANTHROPIC_API_KEY
+      ? new AnthropicLlmClient({ apiKey: process.env.ANTHROPIC_API_KEY, model: "claude-haiku-4-5-20251001" })
+      : null;
+  const relevanceScorer =
+    overrides.relevanceScorer ?? (relevanceLlm ? new LlmRelevanceScorer(relevanceLlm) : new EmbeddingRelevanceScorer(embedder));
+
   return {
     config,
     db,
@@ -179,8 +232,9 @@ export function createContext(overrides: Partial<AppContext> = {}): AppContext {
     rails: overrides.rails ?? new PayoutRailRegistry(),
     mailer: overrides.mailer ?? new MockMailboxSender(),
     emailFinder,
-    embedder: overrides.embedder ?? new HashingEmbedder(),
+    embedder,
     llm,
+    relevanceScorer,
     secrets: overrides.secrets ?? new InMemorySecretStore(),
     discoverySources,
     redirectResolver,

@@ -8,6 +8,12 @@ import {
   canTransition,
   buildProfile,
   addPageToProfile,
+  mergeProfiles,
+  identitySignalsFromProfile,
+  identitiesOverlap,
+  hasIdentitySignal,
+  audienceOverlapScore,
+  targetMarketForCurrency,
   type ScoringSignals,
   type AffiliateSignal,
   type Tier,
@@ -28,6 +34,8 @@ import {
 import type { RecruitmentDeps } from "./deps.js";
 import type { DiscoveryPlan } from "./discovery-planner.js";
 import { isSuppressed, suppress } from "./suppression.js";
+import { isExistingAffiliate } from "./guards.js";
+import { resolveContact } from "./contact-resolver.js";
 import { firstStep, personalizationDepth } from "./sequencing.js";
 import { weightsForMerchant } from "./learning.js";
 
@@ -90,11 +98,16 @@ export async function discover(
  */
 export async function ingestCandidate(deps: RecruitmentDeps, merchant: Merchant, cand: RawCandidate): Promise<Prospect | null> {
   const merchantId = merchant.id;
-  const key = cand.siteUrl ?? cand.channelUrl ?? cand.identity;
-  const dupe = await deps.db.prospects.findOne(
-    (p) => p.merchantId === merchantId && (p.siteUrl === key || p.channelUrl === key || p.identity === cand.identity),
-  );
-  if (dupe) return null;
+  // Fast path: exact re-discovery of the same surface (cheap, runs before the resolver).
+  // For URL-less candidates (e.g. customer mining) fall back to identity-name equality.
+  const exact = await deps.db.prospects.findOne((p) => {
+    if (p.merchantId !== merchantId) return false;
+    if (cand.siteUrl && p.siteUrl === cand.siteUrl) return true;
+    if (cand.channelUrl && p.channelUrl === cand.channelUrl) return true;
+    if (!cand.siteUrl && !cand.channelUrl && p.identity === cand.identity) return true;
+    return false;
+  });
+  if (exact) return null;
 
   const now = deps.clock.now().toISOString();
   let signals: AffiliateSignal[] = cand.outboundLinks.flatMap((l) => detectAffiliateUrl(l));
@@ -120,6 +133,24 @@ export async function ingestCandidate(deps: RecruitmentDeps, merchant: Merchant,
     seedUrl || cand.pageHtml
       ? buildProfile(seedUrl, cand.pageHtml ? [{ url: cand.evidenceUrl ?? seedUrl ?? cand.identity, links: extractHrefs(cand.pageHtml, seedUrl) }] : [])
       : null;
+
+  // Cross-platform identity merge: is this the SAME creator as an existing prospect,
+  // surfaced via a DIFFERENT channel (e.g. a YouTube channel found on its own, then the
+  // creator's website via backlinks)? Merge into it — one comprehensive profile — rather
+  // than creating a duplicate. Matches on a shared social handle, contact email, or
+  // website domain (never on name alone).
+  const candSignals = identitySignalsFromProfile(profile, contactEmails.map((e) => e.email));
+  if (hasIdentitySignal(candSignals)) {
+    const others = await deps.db.prospects.find((p) => p.merchantId === merchantId);
+    for (const other of others) {
+      const otherEmails = [other.email, ...(((other.evidence?.contactEmails as { email: string }[] | undefined) ?? []).map((e) => e.email))];
+      const otherSignals = identitySignalsFromProfile((other.evidence?.profile as Profile | null) ?? null, otherEmails);
+      if (identitiesOverlap(candSignals, otherSignals)) {
+        await mergeCandidateInto(deps, other, cand, { signals, profile, contactEmails, contactUrls, hasContactForm, competitorPromoted, isAffiliate, promotesComp, now });
+        return null; // enriched an existing prospect — not a net-new one
+      }
+    }
+  }
 
   const prospect: Prospect = {
     id: newId("prosp"),
@@ -170,7 +201,7 @@ export async function ingestCandidate(deps: RecruitmentDeps, merchant: Merchant,
     intent: /review|best|vs|compare/i.test(cand.evidenceSummary ?? "") ? 0.8 : 0.3,
     verifiedEmail: false,
     reach: cand.reachHint ?? null,
-    da: null,
+    da: cand.domainAuthority ?? null, // backlink mining supplies the referring-domain rank free
     engagement: null,
     audienceOverlap: null,
   });
@@ -178,7 +209,11 @@ export async function ingestCandidate(deps: RecruitmentDeps, merchant: Merchant,
 }
 
 // ---- 2. Enrich --------------------------------------------------------------
-export async function enrich(deps: RecruitmentDeps, prospectId: string): Promise<Prospect> {
+export async function enrich(
+  deps: RecruitmentDeps,
+  prospectId: string,
+  opts?: { maxAccounts?: number },
+): Promise<Prospect> {
   const prospect = await deps.db.prospects.require(prospectId);
   if (!canTransition(prospect.state, "enriched")) return prospect;
 
@@ -226,46 +261,28 @@ export async function enrich(deps: RecruitmentDeps, prospectId: string): Promise
     }
   }
 
-  // 1) PREFER emails actually extracted from the page (real contact path).
-  for (const c of pageEmails) {
-    const v = await verify(c.email).catch(() => ({ deliverable: false, reason: "verify error" }));
-    if (v.deliverable) {
-      chosenEmail = c.email;
-      contactSource = `page:${c.source}`;
-      break;
-    }
-  }
-
-  // 2) FOLLOW the contact-bearing pages the creator linked (Linktree, /contact,
-  //    YouTube About). Each fetched page does double duty: extract real emails AND
-  //    grow the identity graph (a Linktree enumerates all the creator's accounts —
-  //    the strongest cross-platform signal). Real prospects with a fetcher only.
-  if (deps.fetcher && !prospect.synthetic) {
-    for (const c of contactUrls) {
-      let html: string | null = null;
-      try {
-        const r = await deps.fetcher.get(c.url);
-        if (r.status >= 200 && r.status < 300 && r.html && r.html.length > 200) html = r.html;
-      } catch {
-        /* skip unreachable contact page */
-      }
-      if (!html) continue;
-      // Grow the graph from this page's links (bio aggregators are high-confidence).
-      const page = { url: c.url, links: extractHrefs(html, c.url), bioAggregator: c.kind === "bio_aggregator" };
-      profile = profile ? addPageToProfile(profile, page, seedUrl) : buildProfile(seedUrl, [page]);
-      // Mine it for a deliverable contact email if we don't have one yet.
-      if (!chosenEmail) {
-        for (const f of extractEmailsFromHtml(html)) {
-          const v = await verify(f.email).catch(() => ({ deliverable: false, reason: "verify error" }));
-          if (v.deliverable) {
-            chosenEmail = f.email;
-            contactSource = `${c.kind}:${f.source}`;
-            break;
-          }
-        }
-      }
-    }
-  }
+  // 1+2) BEST-EFFORT contact resolution as a TRAVERSAL of the identity graph: try the
+  //   on-page emails first, then walk every linked property — Linktree, /contact, the
+  //   website, the YouTube channel description (free API), social bios — EXPANDING as it
+  //   goes (a social bio → the website → /contact → the email). Converges from any entry
+  //   point; stops at the first deliverable address. Grows the graph with all it fetched.
+  const resolution = await resolveContact(
+    { fetcher: deps.fetcher, enricher: deps.enricher, verify },
+    {
+      profile,
+      seedUrl,
+      canFetch: !!deps.fetcher && !prospect.synthetic,
+      knownEmails: pageEmails,
+      knownContactUrls: contactUrls,
+      contactForm,
+      contactFormUrl,
+    },
+  );
+  chosenEmail = resolution.email;
+  contactSource = resolution.source;
+  profile = resolution.profile;
+  contactForm = resolution.contactForm;
+  contactFormUrl = resolution.contactFormUrl;
 
   // 3) FALL BACK to the EmailFinder (Hunter in prod; pattern-guessing stub in dev).
   //    Pattern-guessed addresses are clearly labeled so the UI can flag them.
@@ -293,7 +310,7 @@ export async function enrich(deps: RecruitmentDeps, prospectId: string): Promise
     // Filter to BILLABLE (enricher-supported) accounts FIRST, then cap by confidence —
     // so the cap counts paid lookups, not graph nodes, and walled accounts aren't
     // crowded out by website/linktree nodes.
-    const cap = deps.enrichmentMaxAccounts ?? 3;
+    const cap = opts?.maxAccounts ?? deps.enrichmentMaxAccounts ?? 3;
     const targets = profile.accounts
       .filter((a) => (a.provenance === "seed" || a.confidence >= 0.85) && enricher.supports(a.platform))
       .sort((a, b) => b.confidence - a.confidence)
@@ -311,15 +328,28 @@ export async function enrich(deps: RecruitmentDeps, prospectId: string): Promise
     if (audienceEngagement != null) profile.audience.engagementRate = audienceEngagement;
   }
 
+  // Geo/language alignment: if a provider gave us the creator's real geo/language,
+  // turn it into the audienceOverlap signal vs the merchant's market (currency-derived).
+  // Stays null when the creator's geo AND language are both unknown — never invented.
+  let audienceOverlap: number | null = null;
+  if (profile && (profile.audience.primaryGeo != null || profile.audience.language != null)) {
+    const merchant = await deps.db.merchants.get(prospect.merchantId);
+    audienceOverlap = audienceOverlapScore(
+      { primaryGeo: profile.audience.primaryGeo, language: profile.audience.language },
+      targetMarketForCurrency(merchant?.defaultCurrency),
+    );
+  }
+
   const signal = await deps.db.prospectSignals.findOne((s) => s.prospectId === prospectId);
   if (signal) {
-    // verifiedEmail always; reach/engagement ONLY when a real enricher returned them.
-    // DA / audience-overlap stay null unless their own provider is wired — never
-    // estimated. The score's confidence reflects how much is real (scoring.ts).
+    // verifiedEmail always; reach/engagement/overlap ONLY when real data backs them.
+    // DA stays as the source supplied it; nothing here is estimated. The score's
+    // confidence reflects how much is real (scoring.ts).
     await deps.db.prospectSignals.update(signal.id, {
       verifiedEmail: !!chosenEmail,
       ...(audienceReach != null ? { reach: audienceReach } : {}),
       ...(audienceEngagement != null ? { engagement: audienceEngagement } : {}),
+      ...(audienceOverlap != null ? { audienceOverlap } : {}),
     } as Partial<ProspectSignal>);
   }
 
@@ -344,7 +374,11 @@ export async function score(deps: RecruitmentDeps, prospectId: string): Promise<
   const source = await deps.db.prospectSources.findOne((s) => s.prospectId === prospectId);
   const prospectText = `${prospect.identity} ${source?.evidenceSummary ?? ""}`;
   const merchantText = `${merchant.niche ?? ""} ${merchant.name}`;
-  const relevance = await deps.embedder.similarity(prospectText, merchantText);
+  // Prefer the (LLM-backed) relevance scorer when wired — semantic niche fit, not just
+  // shared tokens. Falls back to the lexical embedder when no scorer is injected.
+  const relevance = deps.relevanceScorer
+    ? await deps.relevanceScorer.score({ prospect: prospectText, merchant: merchantText })
+    : await deps.embedder.similarity(prospectText, merchantText);
 
   const scoringSignals: ScoringSignals = {
     relevance,
@@ -382,6 +416,11 @@ export async function queueFirstTouch(
   if (!prospect.email) return null;
   if (await isSuppressed(deps, prospect.merchantId, prospect.email)) {
     await deps.db.prospects.update(prospectId, { state: "suppressed", suppressionStatus: "suppressed" });
+    return null;
+  }
+  // Never cold-email someone who is ALREADY this merchant's affiliate.
+  if (await isExistingAffiliate(deps, prospect.merchantId, prospect)) {
+    await deps.db.prospects.update(prospectId, { state: "dead", updatedAt: deps.clock.now().toISOString() });
     return null;
   }
   const step = firstStep(campaign);
@@ -515,6 +554,88 @@ export function draftOutreach(
       `commission terms, creative, and your tracking link. Just reply and I'll share everything.\n\n` +
       `Thanks,\n${merchant.name}`,
   };
+}
+
+interface MergeParts {
+  signals: AffiliateSignal[];
+  profile: Profile | null;
+  contactEmails: { email: string; source: string }[];
+  contactUrls: { url: string; kind: string }[];
+  hasContactForm: boolean;
+  competitorPromoted: string | null;
+  isAffiliate: boolean;
+  promotesComp: boolean;
+  now: string;
+}
+
+/**
+ * Fold a candidate (a different surface of an already-known creator) into the existing
+ * prospect: union the identity graph, affiliate links, contact emails/urls; fill any
+ * missing site/channel URL; record the new evidence source; and strengthen the signal
+ * (OR the booleans, keep the best known reach/DA). Builds one comprehensive profile.
+ */
+async function mergeCandidateInto(deps: RecruitmentDeps, target: Prospect, cand: RawCandidate, parts: MergeParts): Promise<void> {
+  const ev = (target.evidence ?? {}) as Record<string, unknown>;
+  const existingProfile = (ev.profile as Profile | null) ?? null;
+  const mergedProfile = parts.profile && existingProfile ? mergeProfiles(existingProfile, parts.profile) : (existingProfile ?? parts.profile ?? null);
+
+  const newLinks = parts.signals.map((s) => ({ url: s.url, network: s.network, confidence: s.confidence, verified: s.verified }));
+  const affiliateLinks = unionBy([...((ev.affiliateLinks as typeof newLinks) ?? []), ...newLinks], (l) => l.url);
+  const contactEmails = unionBy([...((ev.contactEmails as typeof parts.contactEmails) ?? []), ...parts.contactEmails], (e) => e.email);
+  const contactUrls = unionBy([...((ev.contactUrls as typeof parts.contactUrls) ?? []), ...parts.contactUrls], (u) => u.url);
+
+  await deps.db.prospects.update(target.id, {
+    siteUrl: target.siteUrl ?? cand.siteUrl,
+    channelUrl: target.channelUrl ?? cand.channelUrl,
+    evidence: {
+      ...ev,
+      profile: mergedProfile,
+      affiliateLinks,
+      contactEmails,
+      contactUrls,
+      competitorPromoted: (ev.competitorPromoted as string | null) ?? parts.competitorPromoted,
+      contactForm: !!ev.contactForm || parts.hasContactForm,
+    },
+    updatedAt: parts.now,
+  });
+
+  await deps.db.prospectSources.insert({
+    id: newId("psrc"),
+    prospectId: target.id,
+    sourceType: cand.sourceType,
+    evidenceUrl: cand.evidenceUrl,
+    evidenceSummary: cand.evidenceSummary,
+    capturedAt: parts.now,
+  });
+
+  const sig = await deps.db.prospectSignals.findOne((s) => s.prospectId === target.id);
+  if (sig) {
+    await deps.db.prospectSignals.update(sig.id, {
+      isAffiliate: sig.isAffiliate || parts.isAffiliate,
+      promotesCompetitor: sig.promotesCompetitor || parts.promotesComp,
+      reach: maxNullable(sig.reach, cand.reachHint ?? null),
+      da: maxNullable(sig.da, cand.domainAuthority ?? null),
+    } as Partial<ProspectSignal>);
+  }
+}
+
+function unionBy<T>(items: T[], key: (t: T) => string): T[] {
+  const seen = new Set<string>();
+  const out: T[] = [];
+  for (const it of items) {
+    const k = key(it);
+    if (!seen.has(k)) {
+      seen.add(k);
+      out.push(it);
+    }
+  }
+  return out;
+}
+
+function maxNullable(a: number | null, b: number | null): number | null {
+  if (a == null) return b;
+  if (b == null) return a;
+  return Math.max(a, b);
 }
 
 // ---- helpers ----------------------------------------------------------------

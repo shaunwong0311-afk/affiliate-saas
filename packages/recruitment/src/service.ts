@@ -1,9 +1,11 @@
-import { blendWeights, defaultWeights, newId } from "@affiliate/core";
-import type { OutreachCampaign, ProspectOutcome } from "@affiliate/db";
+import { blendWeights, defaultWeights, newId, preScoreProspect, type PreScoreResult } from "@affiliate/core";
+import type { OutreachCampaign, Prospect, ProspectOutcome } from "@affiliate/db";
 import type { RecruitmentDeps } from "./deps.js";
 import { discover, enrich, score, queueFirstTouch, send } from "./pipeline.js";
 import { planDiscovery, type DiscoveryPlan } from "./discovery-planner.js";
 import { routeReply, type ReplyOutcome } from "./reply-router.js";
+import { isSuppressed } from "./suppression.js";
+import { existingAffiliateEmails } from "./guards.js";
 
 /**
  * High-level recruitment orchestration used by the API routes. Composes the
@@ -15,6 +17,13 @@ export interface SourcingSummary {
   enriched: number;
   scored: number;
   byTier: Record<string, number>;
+  /** Triage band counts (pre-score): how the discovered prospects split hot/warm/cold. */
+  byBand: Record<string, number>;
+  /** Prospects left un-enriched this run because the enrichment budget was hit (the
+   * coldest tail — they stay `discovered` for a later pass). */
+  deferred: number;
+  /** Prospects skipped by a guard (already an affiliate / suppressed) — never enriched. */
+  guarded: number;
   /** Of the discovered prospects, how many came from REAL sources vs synthetic demo
    * generators. `synthetic` prospects must be labeled "demo data" in the UI. */
   real: number;
@@ -24,22 +33,83 @@ export interface SourcingSummary {
   plan: DiscoveryPlan;
 }
 
-/** Run sourcing → enrich → score for a merchant (the discovery half of the wedge). */
+/** Cheap, reachable-contact heuristic from what discovery already captured. */
+function hasContactPath(p: Prospect): boolean {
+  const ev = (p.evidence ?? {}) as { contactEmails?: unknown[]; contactUrls?: unknown[]; contactForm?: boolean };
+  return !!(p.email || ev.contactEmails?.length || ev.contactUrls?.length || ev.contactForm || p.channelUrl || p.siteUrl);
+}
+
+/** Any email we already know for a prospect at discovery time (own + page-extracted). */
+function knownEmailOf(p: Prospect): string | null {
+  if (p.email) return p.email;
+  const ev = (p.evidence ?? {}) as { contactEmails?: { email?: string }[] };
+  return ev.contactEmails?.[0]?.email ?? null;
+}
+
+/**
+ * Run sourcing → enrich → score for a merchant (the discovery half of the wedge).
+ *
+ * Triage: enrichment is the expensive stage, so rather than enrich every prospect
+ * identically we PRE-SCORE each on cheap discovery-time signals, enrich the most
+ * promising FIRST, and tier the enrichment DEPTH by band (deep on hot, shallow on
+ * cold). With `maxEnrich` set, the coldest tail is deferred (left `discovered`) so a
+ * run on a huge candidate set still spends its budget on the best prospects.
+ */
 export async function runSourcing(
   deps: RecruitmentDeps,
   merchantId: string,
-  opts?: { limit?: number; excludeSourceTypes?: string[] },
+  opts?: { limit?: number; excludeSourceTypes?: string[]; maxEnrich?: number },
 ): Promise<SourcingSummary> {
   // Plan first: decide which methods to run, warmest-first, skipping the inapplicable.
   const plan = await planDiscovery(deps, merchantId, { excludeSourceTypes: opts?.excludeSourceTypes });
   const created = await discover(deps, merchantId, { ...opts, plan });
+
+  // Pre-score every prospect on cheap signals, then process best-first.
+  const triaged: Array<{ prospect: Prospect; pre: PreScoreResult }> = [];
+  for (const prospect of created) {
+    const sig = await deps.db.prospectSignals.findOne((s) => s.prospectId === prospect.id);
+    const pre = preScoreProspect({
+      runsAffiliateLinks: sig?.isAffiliate ?? false,
+      promotesCompetitor: sig?.promotesCompetitor ?? false,
+      domainAuthority: sig?.da ?? null,
+      commercialIntent: sig?.intent ?? 0,
+      hasContactPath: hasContactPath(prospect),
+    });
+    triaged.push({ prospect, pre });
+  }
+  triaged.sort((a, b) => b.pre.preScore - a.pre.preScore);
+
+  // Guard set: people we already have as affiliates (computed once for the whole run).
+  const affiliateEmails = await existingAffiliateEmails(deps, merchantId);
+
   let enriched = 0;
   let scored = 0;
   let synthetic = 0;
+  let processed = 0;
+  let guarded = 0;
   const byTier: Record<string, number> = { A: 0, B: 0, C: 0 };
-  for (const prospect of created) {
+  const byBand: Record<string, number> = { hot: 0, warm: 0, cold: 0 };
+
+  for (const { prospect, pre } of triaged) {
+    byBand[pre.band] = (byBand[pre.band] ?? 0) + 1;
     if (prospect.synthetic) synthetic++;
-    await enrich(deps, prospect.id);
+
+    // Guard: if we already know a contact email for this prospect and it's an existing
+    // affiliate or a suppressed/opted-out address, kill it now — never waste enrichment
+    // (or risk outreach) on someone we already have or can't email.
+    const email = knownEmailOf(prospect);
+    if (email && (affiliateEmails.has(email.toLowerCase()) || (await isSuppressed(deps, merchantId, email)))) {
+      await deps.db.prospects.update(prospect.id, { state: "dead", updatedAt: deps.clock.now().toISOString() });
+      guarded++;
+      continue;
+    }
+
+    // Enrichment budget: defer the coldest tail (stays `discovered` for a later pass).
+    if (opts?.maxEnrich != null && processed >= opts.maxEnrich) continue;
+    processed++;
+    // Tier only the PAID enrichment depth; contact-finding fetches always run (they're
+    // cheap + cached, and they're what make the prospect contactable).
+    await enrich(deps, prospect.id, { maxAccounts: pre.enrichDepth });
     enriched++;
     const finished = await score(deps, prospect.id);
     if (finished.tier) {
@@ -47,7 +117,18 @@ export async function runSourcing(
       byTier[finished.tier] = (byTier[finished.tier] ?? 0) + 1;
     }
   }
-  return { discovered: created.length, enriched, scored, byTier, real: created.length - synthetic, synthetic, plan };
+  return {
+    discovered: created.length,
+    enriched,
+    scored,
+    byTier,
+    byBand,
+    deferred: created.length - processed - guarded,
+    guarded,
+    real: created.length - synthetic,
+    synthetic,
+    plan,
+  };
 }
 
 /** Re-process any prospects stuck in discovered/enriched (idempotent). */

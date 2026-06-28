@@ -33,6 +33,8 @@ const SOURCE_META: Record<string, { label: string; priority: number }> = {
   backlink_mining: { label: "Competitor-affiliate mining (backlinks)", priority: 1 },
   customer_mining: { label: "First-party customer mining", priority: 1 },
   competitor_affiliate_mining: { label: "Competitor-affiliate (demo generator)", priority: 2 },
+  youtube_discovery: { label: "YouTube creator discovery", priority: 2 },
+  podcast_discovery: { label: "Podcast discovery (Apple/iTunes)", priority: 2 },
   serp_mining: { label: "Buyer-intent SERP mining", priority: 3 },
   creator_discovery: { label: "Creator discovery (demo generator)", priority: 4 },
 };
@@ -45,6 +47,10 @@ function rationaleFor(type: string, hasCompetitors: boolean, orderCount: number)
       return `Your ${orderCount} buyers are the warmest, lowest-bounce source — repeat/high-AOV customers who already love the product.`;
     case "competitor_affiliate_mining":
       return "Generates competitor-promoter prospects (demo data unless a backlink provider is wired).";
+    case "youtube_discovery":
+      return "Finds video creators reviewing in your niche — the affiliates who don't run a website (so backlink mining can't see them).";
+    case "podcast_discovery":
+      return "Finds niche podcasts via Apple/iTunes and reads their RSS feed for the host's contact email — a channel backlinks rarely surface.";
     case "serp_mining":
       return "Broad coverage: buyer-intent + platform-targeted queries surface creators across the web.";
     case "creator_discovery":
