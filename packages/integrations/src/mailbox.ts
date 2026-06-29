@@ -188,6 +188,9 @@ export interface MailboxCredentials {
   user?: string;
   pass?: string;
   secure?: boolean;
+  // imap (reply ingestion for the smtp rail)
+  imapHost?: string;
+  imapPort?: number;
   // oauth rails (microsoft / gmail) — accessToken refreshed before use
   accessToken?: string;
   refreshToken?: string;

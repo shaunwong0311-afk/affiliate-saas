@@ -1,11 +1,15 @@
 import { z } from "zod";
 import { newId } from "@affiliate/core";
+import { detectMailProvider, SmtpSender, type MailboxCredentials } from "@affiliate/integrations";
 import type { MerchantIntegration, Mailbox, SendingDomain } from "@affiliate/db";
 import type { RouteModule } from "./helpers.js";
 import { parseBody, ok } from "./helpers.js";
 import { requireMerchant } from "../auth/middleware.js";
 import { notFound } from "../errors.js";
 import { writeAudit } from "../services/audit.js";
+
+/** Secret-store key for a mailbox's encrypted credentials (never stored in the row). */
+const credsRef = (mailboxId: string) => `mailbox:${mailboxId}:creds`;
 
 const integrationCreateSchema = z.object({
   kind: z.enum(["shopify", "woocommerce", "stripe", "s2s", "klaviyo", "hubspot", "chargebee", "recurly"]),
@@ -132,6 +136,71 @@ export const integrationRoutes: RouteModule = (app, ctx) => {
     const body = parseBody(mailboxPatchSchema, request);
     const updated = await ctx.db.mailboxes.update(id, body as Partial<Mailbox>);
     return ok(reply, updated);
+  });
+
+  // ---- Smart Connect: detect the easiest connection method from the email ----
+  app.post("/mailboxes/detect", async (request, reply) => {
+    await requireMerchant(ctx, request, "admin");
+    const body = parseBody(z.object({ email: z.string().email() }), request);
+    return ok(reply, await detectMailProvider(body.email));
+  });
+
+  // Store SMTP/app-password credentials (encrypted in the SecretStore) + live-test them.
+  app.post("/mailboxes/:id/credentials/smtp", async (request, reply) => {
+    const { merchantId } = await requireMerchant(ctx, request, "admin");
+    const id = (request.params as { id: string }).id;
+    const mailbox = await ctx.db.mailboxes.get(id);
+    if (!mailbox || mailbox.merchantId !== merchantId) throw notFound("mailbox");
+    const body = parseBody(
+      z.object({
+        host: z.string().min(1),
+        port: z.number().int().min(1).max(65535),
+        user: z.string().min(1),
+        pass: z.string().min(1),
+        secure: z.boolean().optional(),
+        imapHost: z.string().optional(),
+        imapPort: z.number().int().min(1).max(65535).optional(),
+      }),
+      request,
+    );
+    const creds: MailboxCredentials = {
+      kind: "smtp",
+      host: body.host,
+      port: body.port,
+      user: body.user,
+      pass: body.pass,
+      secure: body.secure,
+      imapHost: body.imapHost,
+      imapPort: body.imapPort,
+    };
+    const ref = credsRef(id);
+    await ctx.secrets.put(ref, JSON.stringify(creds));
+    const test = await new SmtpSender({ host: body.host, port: body.port, user: body.user, pass: body.pass, secure: body.secure }).verify();
+    const updated = await ctx.db.mailboxes.update(id, {
+      provider: "smtp",
+      credentialsRef: ref,
+      status: test.ok ? "connected" : "error",
+    });
+    await writeAudit(ctx, { merchantId, actorId: null, action: "mailbox.connected", subjectType: "mailbox", subjectId: id, metadata: { provider: "smtp", ok: test.ok } });
+    return ok(reply, { mailbox: updated, test });
+  });
+
+  // Re-test a connected mailbox (the "Test connection" button).
+  app.post("/mailboxes/:id/test", async (request, reply) => {
+    const { merchantId } = await requireMerchant(ctx, request, "admin");
+    const id = (request.params as { id: string }).id;
+    const mailbox = await ctx.db.mailboxes.get(id);
+    if (!mailbox || mailbox.merchantId !== merchantId) throw notFound("mailbox");
+    if (!mailbox.credentialsRef) return ok(reply, { ok: false, reason: "no credentials connected" });
+    const raw = await ctx.secrets.get(mailbox.credentialsRef);
+    if (!raw) return ok(reply, { ok: false, reason: "credentials missing" });
+    const creds = JSON.parse(raw) as MailboxCredentials;
+    if (creds.kind === "smtp" && creds.host && creds.port && creds.user && creds.pass != null) {
+      const test = await new SmtpSender({ host: creds.host, port: creds.port, user: creds.user, pass: creds.pass, secure: creds.secure }).verify();
+      await ctx.db.mailboxes.update(id, { status: test.ok ? "connected" : "error" });
+      return ok(reply, test);
+    }
+    return ok(reply, { ok: mailbox.status === "connected" });
   });
 
   app.delete("/mailboxes/:id", async (request, reply) => {
