@@ -36,6 +36,7 @@ import type { DiscoveryPlan } from "./discovery-planner.js";
 import { isSuppressed, suppress } from "./suppression.js";
 import { isExistingAffiliate } from "./guards.js";
 import { resolveContact } from "./contact-resolver.js";
+import { personalizeOutreach } from "./personalization.js";
 import { firstStep, personalizationDepth } from "./sequencing.js";
 import { weightsForMerchant } from "./learning.js";
 
@@ -440,20 +441,54 @@ export async function queueFirstTouch(
           : "Thought our affiliate program might interest you.",
   };
 
+  // Personalize per the merchant's plan (template / hybrid / llm). The LLM path cites the
+  // prospect's real evidence; falls back to the token template otherwise or on any failure.
+  const personalized = await personalizeOutreach(deps, { merchant, prospect, step, tokens });
+
+  const now = deps.clock.now().toISOString();
   const message: OutreachMessage = {
     id: newId("omsg"),
     prospectId,
     campaignId: campaign.id,
     step: step.step,
-    variant: depth,
-    subject: renderTemplate(step.subject, tokens),
-    body: renderTemplate(step.body, tokens),
+    variant: personalized.mode === "llm" ? "llm" : depth,
+    subject: personalized.subject,
+    body: personalized.body,
     sentAt: null,
     status: "queued",
   };
   await deps.db.outreachMessages.insert(message);
-  await deps.db.prospects.update(prospectId, { state: "queued", updatedAt: deps.clock.now().toISOString() });
+  // Meter LLM personalizations for plan-tier billing (one event per LLM-written email).
+  if (personalized.mode === "llm") {
+    await deps.db.usageEvents.insert({ id: newId("use"), merchantId: prospect.merchantId, kind: "personalization", quantity: 1, sourceId: message.id, ts: now });
+  }
+  await deps.db.prospects.update(prospectId, { state: "queued", updatedAt: now });
   return message;
+}
+
+/** Render (without queuing) the first-touch email for a prospect — the preview/test-send. */
+export async function previewOutreach(
+  deps: RecruitmentDeps,
+  prospectId: string,
+  campaign: OutreachCampaign,
+): Promise<{ subject: string; body: string; mode: "template" | "llm" } | null> {
+  const prospect = await deps.db.prospects.require(prospectId);
+  const step = firstStep(campaign);
+  if (!step) return null;
+  const merchant = await deps.db.merchants.require(prospect.merchantId);
+  const depth = personalizationDepth(prospect.tier);
+  const tokens = {
+    name: prospect.identity,
+    merchant: merchant.name,
+    offer: merchant.niche ?? "our products",
+    angle:
+      depth === "deep"
+        ? "I saw your reviews in this exact niche and your affiliate links — you'd be a strong fit."
+        : depth === "medium"
+          ? "Your content is a great match for our products."
+          : "Thought our affiliate program might interest you.",
+  };
+  return personalizeOutreach(deps, { merchant, prospect, step, tokens });
 }
 
 // ---- 4b. Send a queued message as the merchant ------------------------------

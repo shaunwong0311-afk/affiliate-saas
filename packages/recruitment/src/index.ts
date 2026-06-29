@@ -3,6 +3,8 @@ export * from "./queue.js";
 export * from "./suppression.js";
 export * from "./guards.js";
 export * from "./contact-resolver.js";
+export * from "./personalization.js";
+export * from "./conversion.js";
 export * from "./sequencing.js";
 export * from "./pipeline.js";
 export * from "./service.js";

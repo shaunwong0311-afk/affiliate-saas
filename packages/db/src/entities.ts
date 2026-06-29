@@ -43,6 +43,9 @@ export interface Merchant {
   /** Per-merchant secret for HMAC postback verification (Section 6). */
   postbackSecret: string;
   physicalAddress: string | null; // CAN-SPAM compliance
+  /** Outreach personalization plan (billed differently). Default "hybrid" when unset:
+   *  template = tokens only · hybrid = LLM for A-tier, tokens otherwise · llm = LLM for all. */
+  personalizationPlan?: "template" | "hybrid" | "llm";
   createdAt: Timestamp;
 }
 
@@ -92,7 +95,7 @@ export interface BillingSubscription {
 export interface UsageEvent {
   id: Id;
   merchantId: Id;
-  kind: "enrichment" | "send" | "active_affiliate" | "recruitment_credit" | "conversion";
+  kind: "enrichment" | "send" | "active_affiliate" | "recruitment_credit" | "conversion" | "personalization";
   quantity: number;
   sourceId: string | null;
   ts: Timestamp;

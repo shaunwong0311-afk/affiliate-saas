@@ -1,5 +1,5 @@
 import { newId, type Tier } from "@affiliate/core";
-import { classifyReply } from "@affiliate/integrations";
+import { classifyReply, type InboundReply } from "@affiliate/integrations";
 import type { Meeting, Reply } from "@affiliate/db";
 import type { RecruitmentDeps } from "./deps.js";
 import { suppress } from "./suppression.js";
@@ -117,6 +117,28 @@ export async function routeReply(deps: RecruitmentDeps, prospectId: string, raw:
     return { reply, classification, action: "ai_sdr", answer, signupUrl };
   }
   return { reply, classification, action: "self_serve", signupUrl };
+}
+
+/**
+ * Bridge an INBOUND email (from an IMAP poll or a Graph/ESP webhook) to the reply
+ * router: match the sender to a prospect and route it. This is what makes replies
+ * stop the sequence + drive the two-track handoff automatically — without it the
+ * engine keeps emailing people who already answered.
+ */
+export async function processInboundReply(
+  deps: RecruitmentDeps,
+  inbound: InboundReply,
+  opts: RouteOptions = {},
+): Promise<{ matched: boolean; prospectId?: string; outcome?: ReplyOutcome }> {
+  const from = inbound.fromEmail.toLowerCase().trim();
+  if (!from) return { matched: false };
+  // Match by the prospect's contact email. (Prefer the most recently updated when an
+  // address was reused across prospects.)
+  const candidates = await deps.db.prospects.find((p) => (p.email ?? "").toLowerCase() === from);
+  const prospect = candidates.sort((a, b) => (b.updatedAt ?? "").localeCompare(a.updatedAt ?? ""))[0];
+  if (!prospect) return { matched: false };
+  const outcome = await routeReply(deps, prospect.id, inbound.body, opts);
+  return { matched: true, prospectId: prospect.id, outcome };
 }
 
 /** Use the real LLM for intent when available; fall back to the keyword classifier. */

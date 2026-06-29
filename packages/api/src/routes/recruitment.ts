@@ -1,7 +1,8 @@
 import { z } from "zod";
 import { newId } from "@affiliate/core";
-import type { Affiliate, AffiliateRelationship, OutreachCampaign, Suppression } from "@affiliate/db";
-import { runSourcing, processBacklog, launchCampaign, handleReply, recordOutcome, draftOutreach, expandFrontier } from "@affiliate/recruitment";
+import { parseInboundWebhook } from "@affiliate/integrations";
+import type { OutreachCampaign, Suppression } from "@affiliate/db";
+import { runSourcing, processBacklog, launchCampaign, handleReply, recordOutcome, draftOutreach, expandFrontier, convertProspectToAffiliate, previewOutreach, processInboundReply } from "@affiliate/recruitment";
 import type { RouteModule } from "./helpers.js";
 import { parseBody, parseQuery, ok, paginationSchema, paginate } from "./helpers.js";
 import { requireMerchant } from "../auth/middleware.js";
@@ -129,6 +130,8 @@ export const recruitmentRoutes: RouteModule = (app, ctx) => {
     return ok(reply, { ...prospect, sources, signals, messages, replies, scoreBreakdown: prospect.scoreBreakdown });
   });
 
+  // Approve a prospect → materialize a portal-ready affiliate + relationship (the
+  // recruitment→portal seam). Idempotent via the shared conversion service.
   app.post("/recruitment/prospects/:id/approve", async (request, reply) => {
     const { merchantId } = await requireMerchant(ctx, request, "write");
     const id = (request.params as { id: string }).id;
@@ -136,57 +139,33 @@ export const recruitmentRoutes: RouteModule = (app, ctx) => {
     if (!prospect || prospect.merchantId !== merchantId) throw notFound("prospect");
     if (!prospect.email) throw badRequest("prospect has no email to convert");
 
-    const program = await ctx.db.programs.findOne((p) => p.merchantId === merchantId);
-    if (!program) throw badRequest("merchant has no program to attach the affiliate to");
+    const result = await convertProspectToAffiliate(ctx, id);
+    if (!result) throw badRequest("merchant has no program to attach the affiliate to");
 
-    const email = prospect.email;
-    const existing = await ctx.db.affiliates.findOne((a) => a.primaryEmail === email);
-    let affiliate: Affiliate;
-    if (existing) {
-      affiliate = existing;
-    } else {
-      affiliate = {
-        id: newId("aff"),
-        name: prospect.identity,
-        primaryEmail: email,
-        country: prospect.country,
-        audienceProfile: null,
-        status: "active",
-        createdAt: ctx.clock.now().toISOString(),
-      };
-      await ctx.db.affiliates.insert(affiliate);
-    }
-
-    const relationship: AffiliateRelationship = {
-      id: newId("rel"),
-      affiliateId: affiliate.id,
-      merchantId,
-      programId: program.id,
-      status: "active",
-      joinedAt: ctx.clock.now().toISOString(),
-      role: "seller",
-      commissionTerms: null,
-      // Carry the discovery sourceType + prospect id so a producing affiliate can
-      // be traced to the source that found it (source-yield / cost-per-producing).
-      source: prospect.source,
-      ownerUserId: null,
-      tags: [],
-      sponsorAffiliateId: null,
-      prospectId: id,
-    };
-    await ctx.db.relationships.insert(relationship);
-
-    await ctx.db.prospects.update(id, { state: "converted" });
-    await recordOutcome(ctx, id, "high_potential", { relationshipId: relationship.id });
+    await recordOutcome(ctx, id, "high_potential", { relationshipId: result.relationship.id });
     await writeAudit(ctx, {
       merchantId,
       actorId: null,
       action: "recruitment.prospect.approved",
       subjectType: "prospect",
       subjectId: id,
-      metadata: { affiliateId: affiliate.id, relationshipId: relationship.id },
+      metadata: { affiliateId: result.affiliate.id, relationshipId: result.relationship.id },
     });
-    return ok(reply, { affiliateId: affiliate.id, relationshipId: relationship.id }, 201);
+    return ok(reply, { affiliateId: result.affiliate.id, relationshipId: result.relationship.id }, 201);
+  });
+
+  // Preview the exact personalized email for a prospect under a campaign (incl. LLM).
+  app.post("/recruitment/prospects/:id/preview", async (request, reply) => {
+    const { merchantId } = await requireMerchant(ctx, request, "read");
+    const id = (request.params as { id: string }).id;
+    const prospect = await ctx.db.prospects.get(id);
+    if (!prospect || prospect.merchantId !== merchantId) throw notFound("prospect");
+    const body = parseBody(z.object({ campaignId: z.string() }), request);
+    const campaign = await ctx.db.campaigns.get(body.campaignId);
+    if (!campaign || campaign.merchantId !== merchantId) throw notFound("campaign");
+    const preview = await previewOutreach(ctx, id, campaign);
+    if (!preview) throw badRequest("campaign has no sequence steps");
+    return ok(reply, preview);
   });
 
   app.post("/recruitment/prospects/:id/reject", async (request, reply) => {
@@ -342,5 +321,35 @@ export const recruitmentRoutes: RouteModule = (app, ctx) => {
       metadata: { scope: suppression.scope },
     });
     return ok(reply, suppression, 201);
+  });
+
+  // ---- Personalization plan (billed differently) ----------------------------
+  app.get("/recruitment/personalization", async (request, reply) => {
+    const { merchantId } = await requireMerchant(ctx, request, "read");
+    const merchant = await ctx.db.merchants.require(merchantId);
+    return ok(reply, { plan: merchant.personalizationPlan ?? "hybrid" });
+  });
+
+  app.put("/recruitment/personalization", async (request, reply) => {
+    const { merchantId } = await requireMerchant(ctx, request, "admin");
+    const body = parseBody(z.object({ plan: z.enum(["template", "hybrid", "llm"]) }), request);
+    const merchant = await ctx.db.merchants.update(merchantId, { personalizationPlan: body.plan });
+    await writeAudit(ctx, { merchantId, actorId: null, action: "recruitment.personalization.updated", subjectType: "merchant", subjectId: merchantId, metadata: { plan: body.plan } });
+    return ok(reply, { plan: merchant.personalizationPlan });
+  });
+
+  // ---- Inbound reply webhook (Graph / ESP inbound-parse) --------------------
+  // Public endpoint (no JWT — the provider posts here). Guarded by a shared secret:
+  // set INBOUND_WEBHOOK_SECRET in prod; when unset (dev) the guard is skipped.
+  app.post("/webhooks/inbound", async (request, reply) => {
+    const secret = process.env.INBOUND_WEBHOOK_SECRET;
+    if (secret) {
+      const provided = (request.headers["x-webhook-secret"] as string | undefined) ?? (request.query as { secret?: string }).secret;
+      if (provided !== secret) throw badRequest("invalid webhook secret");
+    }
+    const inbound = parseInboundWebhook(request.body);
+    if (!inbound) return ok(reply, { matched: false, reason: "unparseable payload" });
+    const result = await processInboundReply(ctx, inbound);
+    return ok(reply, { matched: result.matched, action: result.outcome?.action ?? null });
   });
 };
