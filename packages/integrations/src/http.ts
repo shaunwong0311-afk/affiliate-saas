@@ -106,6 +106,28 @@ export class FetchJsonClient {
       clearTimeout(t);
     }
   }
+
+  async post(url: string, body: unknown, headers?: Record<string, string>): Promise<{ status: number; json: any }> {
+    const controller = new AbortController();
+    const t = setTimeout(() => controller.abort(), this.opts.timeoutMs ?? 15000);
+    try {
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...headers },
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      });
+      let json: any = null;
+      try {
+        json = await res.json();
+      } catch {
+        json = null;
+      }
+      return { status: res.status, json };
+    } finally {
+      clearTimeout(t);
+    }
+  }
 }
 
 /** Dev/test fetcher: returns a deterministic page so discovery runs with no network. */

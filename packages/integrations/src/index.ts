@@ -8,7 +8,17 @@ export {
   PayoutRailRegistry,
   NotConfiguredError,
 } from "./payouts.js";
-export { MockMailboxSender, GmailSender, MicrosoftGraphSender } from "./mailbox.js";
+export {
+  MockMailboxSender,
+  GmailSender,
+  MicrosoftGraphSender,
+  SmtpSender,
+  buildMailboxSender,
+  type SmtpConfig,
+  type SmtpTransport,
+  type SmtpTransportFactory,
+  type MailboxCredentials,
+} from "./mailbox.js";
 export { StubEmailFinder, HunterFinder } from "./enrichment.js";
 export {
   CompetitorAffiliateSource,

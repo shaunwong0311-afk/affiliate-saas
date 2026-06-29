@@ -8,6 +8,8 @@ import { createMemoryDatabase, type Database } from "@affiliate/db";
 import {
   PayoutRailRegistry,
   MockMailboxSender,
+  buildMailboxSender,
+  type MailboxCredentials,
   StubEmailFinder,
   HunterFinder,
   HashingEmbedder,
@@ -77,6 +79,9 @@ export interface AppContext {
   engines: EngineRegistry;
   rails: PayoutRailRegistry;
   mailer: MailboxSender;
+  /** Resolves the per-campaign send-as-the-merchant sender from the connected mailbox's
+   * encrypted credentials (SMTP/Graph/Gmail). Falls back to `mailer` when none is connected. */
+  mailboxResolver: (mailboxId: string | null) => Promise<MailboxSender>;
   emailFinder: EmailFinder;
   embedder: Embedder;
   llm: LlmClient;
@@ -225,17 +230,40 @@ export function createContext(overrides: Partial<AppContext> = {}): AppContext {
   const relevanceScorer =
     overrides.relevanceScorer ?? (relevanceLlm ? new LlmRelevanceScorer(relevanceLlm) : new EmbeddingRelevanceScorer(embedder));
 
+  // Send-as-the-merchant: resolve the campaign's connected mailbox to the right adapter
+  // (SMTP for cPanel/host + Gmail app-password; Graph/Gmail OAuth later), loading its
+  // encrypted credentials from the SecretStore. Falls back to the mock when unconnected.
+  const mailer = overrides.mailer ?? new MockMailboxSender();
+  const secrets = overrides.secrets ?? new InMemorySecretStore();
+  const mailboxResolver =
+    overrides.mailboxResolver ??
+    (async (mailboxId: string | null): Promise<MailboxSender> => {
+      if (!mailboxId) return mailer;
+      const mailbox = await db.mailboxes.get(mailboxId);
+      if (!mailbox || mailbox.status === "disconnected" || !mailbox.credentialsRef) return mailer;
+      const raw = await secrets.get(mailbox.credentialsRef);
+      if (!raw) return mailer;
+      let creds: MailboxCredentials;
+      try {
+        creds = JSON.parse(raw) as MailboxCredentials;
+      } catch {
+        return mailer;
+      }
+      return buildMailboxSender(creds, { http: jsonHttp });
+    });
+
   return {
     config,
     db,
     engines: overrides.engines ?? defaultEngineRegistry,
     rails: overrides.rails ?? new PayoutRailRegistry(),
-    mailer: overrides.mailer ?? new MockMailboxSender(),
+    mailer,
+    mailboxResolver,
     emailFinder,
     embedder,
     llm,
     relevanceScorer,
-    secrets: overrides.secrets ?? new InMemorySecretStore(),
+    secrets,
     discoverySources,
     redirectResolver,
     emailVerifier,

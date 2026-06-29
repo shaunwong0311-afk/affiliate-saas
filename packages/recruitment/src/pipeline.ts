@@ -479,7 +479,10 @@ export async function send(deps: RecruitmentDeps, messageId: string): Promise<Ou
     `\n\n—\n${merchant.name}` +
     (merchant.physicalAddress ? `\n${merchant.physicalAddress}` : "") +
     `\nUnsubscribe: reply STOP, or ${unsubscribeLink(prospect.merchantId, prospect.email)}`;
-  const result = await deps.mailer.send({
+  // Send AS the merchant: resolve their connected mailbox (SMTP/Graph/Gmail). Falls back to
+  // the default mailer (the dev/test mock) when no resolver is wired or the mailbox is gone.
+  const sender = deps.mailboxResolver ? await deps.mailboxResolver(campaign.mailboxId).catch(() => deps.mailer) : deps.mailer;
+  const result = await sender.send({
     fromName: merchant.name,
     fromEmail: mailbox?.email ?? `team@${merchant.name.toLowerCase().replace(/\s+/g, "")}.com`,
     toEmail: prospect.email,

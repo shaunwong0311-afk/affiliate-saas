@@ -63,6 +63,12 @@ export interface RecruitmentDeps {
    * lexical embedder similarity. Optional — absent → embedder is used directly.
    */
   relevanceScorer?: RelevanceScorer;
+  /**
+   * Resolves the send-as-the-merchant mailbox sender for a campaign's mailbox (loads the
+   * encrypted credentials, refreshes OAuth tokens, builds the right SMTP/Graph/Gmail
+   * adapter). Optional — absent → the default `mailer` is used (the dev/test mock).
+   */
+  mailboxResolver?: (mailboxId: string | null) => Promise<MailboxSender>;
   /** Meeting booking for the managed (A-tier) track. Optional. */
   calendar?: CalendarBooking;
   clock: Clock;

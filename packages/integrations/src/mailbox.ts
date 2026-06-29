@@ -73,6 +73,151 @@ export class MicrosoftGraphSender implements MailboxSender {
   }
 }
 
+/**
+ * SMTP sender — the highest-coverage rail (Section 8.4 / OUTREACH-SPEC §2). Sends as the
+ * merchant over standard SMTP AUTH, covering business email hosted on the merchant's web
+ * host (cPanel/Rackspace/GoDaddy/Namecheap/Zoho/Fastmail) AND free Gmail / Workspace via an
+ * app password. Needs NO OAuth and NO third-party verification, so it's the launch rail.
+ * (NOT for Outlook/M365 — Exchange Online retired basic-auth SMTP; those use Graph OAuth.)
+ *
+ * nodemailer is an OPTIONAL dependency, dynamically imported (same pattern as undici/
+ * playwright) so install + tests work without it. A transport factory can be injected for
+ * offline testing. To enable real sending: `npm install nodemailer`.
+ */
+export interface SmtpConfig {
+  host: string;
+  port: number; // 587 (STARTTLS) or 465 (implicit TLS)
+  user: string;
+  pass: string; // mailbox password or app password
+  secure?: boolean; // defaults to true for port 465
+}
+
+export interface SmtpTransport {
+  sendMail(msg: {
+    from: string;
+    to: string;
+    subject: string;
+    text: string;
+    inReplyTo?: string;
+    references?: string;
+  }): Promise<{ messageId?: string; accepted?: string[]; rejected?: string[]; response?: string }>;
+  verify(): Promise<boolean>;
+}
+
+export type SmtpTransportFactory = (cfg: {
+  host: string;
+  port: number;
+  secure: boolean;
+  auth: { user: string; pass: string };
+}) => SmtpTransport;
+
+export class SmtpSender implements MailboxSender {
+  readonly provider = "smtp";
+  private transportP: Promise<SmtpTransport> | null = null;
+  constructor(
+    private readonly cfg: SmtpConfig,
+    private readonly factory?: SmtpTransportFactory,
+  ) {}
+
+  private transport(): Promise<SmtpTransport> {
+    if (!this.transportP) {
+      const cfg = {
+        host: this.cfg.host,
+        port: this.cfg.port,
+        secure: this.cfg.secure ?? this.cfg.port === 465,
+        auth: { user: this.cfg.user, pass: this.cfg.pass },
+      };
+      this.transportP = (async () => {
+        if (this.factory) return this.factory(cfg);
+        const nm: any = await import("nodemailer" as string).catch(() => {
+          throw new NotConfiguredError("smtp (nodemailer not installed — run `npm install nodemailer`)");
+        });
+        return nm.createTransport(cfg) as SmtpTransport;
+      })().catch((e) => {
+        this.transportP = null; // don't cache a failed init
+        throw e;
+      });
+    }
+    return this.transportP;
+  }
+
+  async send(email: OutboundEmail): Promise<SendResult> {
+    try {
+      const t = await this.transport();
+      const info = await t.sendMail({
+        from: `${email.fromName} <${email.fromEmail}>`,
+        to: email.toEmail,
+        subject: email.subject,
+        text: email.body,
+        ...(email.inReplyTo ? { inReplyTo: email.inReplyTo, references: email.inReplyTo } : {}),
+      });
+      if (info.rejected && info.rejected.length > 0) {
+        return { messageId: info.messageId ?? "", status: "bounced", reason: `rejected: ${info.rejected.join(", ")}` };
+      }
+      return { messageId: info.messageId ?? "", status: "sent" };
+    } catch (e: unknown) {
+      // A 5xx / "user unknown" is a hard bounce → suppress; anything else (auth, TLS,
+      // network) is a transient failure → retry later, don't suppress the address.
+      const msg = e instanceof Error ? e.message : String(e);
+      const hardBounce = /\b5\d\d\b|mailbox unavailable|user unknown|no such user|recipient.*reject|does not exist/i.test(msg);
+      return { messageId: "", status: hardBounce ? "bounced" : "failed", reason: msg.slice(0, 200) };
+    }
+  }
+
+  /** Connection + auth check for the "test mailbox" step on connect. */
+  async verify(): Promise<{ ok: boolean; reason?: string }> {
+    try {
+      const t = await this.transport();
+      await t.verify();
+      return { ok: true };
+    } catch (e: unknown) {
+      return { ok: false, reason: (e instanceof Error ? e.message : String(e)).slice(0, 200) };
+    }
+  }
+}
+
+/**
+ * Encrypted mailbox credentials, stored ONLY in the SecretStore (referenced by an opaque
+ * `credentialsRef` on the Mailbox row — never in the row itself). One shape per rail.
+ */
+export interface MailboxCredentials {
+  kind: "smtp" | "microsoft" | "gmail_oauth";
+  // smtp rail (cPanel/host + Gmail app-password)
+  host?: string;
+  port?: number;
+  user?: string;
+  pass?: string;
+  secure?: boolean;
+  // oauth rails (microsoft / gmail) — accessToken refreshed before use
+  accessToken?: string;
+  refreshToken?: string;
+  expiresAt?: string;
+}
+
+/**
+ * Construct the right send-as-the-merchant adapter from stored credentials (OUTREACH-SPEC
+ * §4.1). Pure — token refresh + credential loading happen at the call site (where the
+ * SecretStore lives). Falls back to the mock when the rail can't be built.
+ */
+export function buildMailboxSender(
+  creds: MailboxCredentials,
+  opts: { http?: HttpClient; smtpFactory?: SmtpTransportFactory } = {},
+): MailboxSender {
+  switch (creds.kind) {
+    case "smtp":
+      if (!creds.host || !creds.port || !creds.user || creds.pass == null) return new MockMailboxSender();
+      return new SmtpSender({ host: creds.host, port: creds.port, user: creds.user, pass: creds.pass, secure: creds.secure }, opts.smtpFactory);
+    case "microsoft":
+      if (!creds.accessToken) return new MockMailboxSender();
+      return new MicrosoftGraphSender({ accessToken: creds.accessToken, http: opts.http });
+    case "gmail_oauth":
+      if (!creds.accessToken) return new MockMailboxSender();
+      return new GmailSender({ accessToken: creds.accessToken, http: opts.http });
+    default:
+      return new MockMailboxSender();
+  }
+}
+
 function buildRfc822(email: OutboundEmail): string {
   return [
     `From: ${email.fromName} <${email.fromEmail}>`,
