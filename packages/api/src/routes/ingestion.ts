@@ -10,13 +10,11 @@ import { reverseOrder } from "../services/reversal.js";
 
 export const ingestionRoutes: RouteModule = (app, ctx) => {
   // ---- Public one-click unsubscribe (the link in every outreach email) ------
-  // Honored globally across all merchants, per CAN-SPAM / bulk-sender rules.
-  app.get("/track/unsubscribe", async (request, reply) => {
-    const q = request.query as { e?: string; m?: string };
-    const email = (q.e ?? "").toLowerCase();
-    if (!email || !email.includes("@")) {
-      return reply.type("text/html").send("<p>Invalid unsubscribe link.</p>");
-    }
+  // Honored globally across all merchants, per CAN-SPAM / bulk-sender rules. Both the
+  // human GET (the footer link) and the RFC 8058 POST (the mailbox's one-click button,
+  // body `List-Unsubscribe=One-Click`) resolve here.
+  const doUnsubscribe = async (email: string): Promise<boolean> => {
+    if (!email || !email.includes("@")) return false;
     const existing = await ctx.db.suppressions.findOne((s) => s.scope === "global" && s.email?.toLowerCase() === email);
     if (!existing) {
       const supp: Suppression = {
@@ -30,10 +28,20 @@ export const ingestionRoutes: RouteModule = (app, ctx) => {
       };
       await ctx.db.suppressions.insert(supp);
     }
-    // Also flip any matching prospect to suppressed.
     const prospects = await ctx.db.prospects.find((p) => p.email?.toLowerCase() === email);
     for (const p of prospects) await ctx.db.prospects.update(p.id, { state: "suppressed", suppressionStatus: "suppressed" });
-    return reply.type("text/html").send(`<p>You've been unsubscribed. You won't receive further emails.</p>`);
+    return true;
+  };
+
+  app.get("/track/unsubscribe", async (request, reply) => {
+    const ok = await doUnsubscribe(((request.query as { e?: string }).e ?? "").toLowerCase());
+    return reply.type("text/html").send(ok ? `<p>You've been unsubscribed. You won't receive further emails.</p>` : "<p>Invalid unsubscribe link.</p>");
+  });
+
+  // RFC 8058 one-click POST — the mailbox calls this directly; respond 200 with no body.
+  app.post("/track/unsubscribe", async (request, reply) => {
+    await doUnsubscribe(((request.query as { e?: string }).e ?? "").toLowerCase());
+    return reply.code(200).send();
   });
 
   // ---- Public signed S2S postback (Section 6) -------------------------------

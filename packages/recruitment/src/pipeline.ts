@@ -509,11 +509,18 @@ export async function send(deps: RecruitmentDeps, messageId: string): Promise<Ou
   }
 
   const mailbox = campaign.mailboxId ? await deps.db.mailboxes.get(campaign.mailboxId) : null;
+  const unsubUrl = unsubscribeLink(prospect.merchantId, prospect.email);
   // CAN-SPAM compliant footer: valid physical address + one-click unsubscribe.
   const footer =
     `\n\n—\n${merchant.name}` +
     (merchant.physicalAddress ? `\n${merchant.physicalAddress}` : "") +
-    `\nUnsubscribe: reply STOP, or ${unsubscribeLink(prospect.merchantId, prospect.email)}`;
+    `\nUnsubscribe: reply STOP, or ${unsubUrl}`;
+  // One-click List-Unsubscribe (RFC 8058) — REQUIRED by Gmail/Yahoo bulk-sender rules. The
+  // POST variant lets the inbox unsubscribe the user without opening the link.
+  const headers: Record<string, string> = {
+    "List-Unsubscribe": `<${unsubUrl}>`,
+    "List-Unsubscribe-Post": "List-Unsubscribe=One-Click",
+  };
   // Send AS the merchant: resolve their connected mailbox (SMTP/Graph/Gmail). Falls back to
   // the default mailer (the dev/test mock) when no resolver is wired or the mailbox is gone.
   const sender = deps.mailboxResolver ? await deps.mailboxResolver(campaign.mailboxId).catch(() => deps.mailer) : deps.mailer;
@@ -523,6 +530,7 @@ export async function send(deps: RecruitmentDeps, messageId: string): Promise<Ou
     toEmail: prospect.email,
     subject: message.subject,
     body: message.body + footer,
+    headers,
   });
 
   const now = deps.clock.now().toISOString();

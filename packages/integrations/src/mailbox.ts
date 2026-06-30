@@ -100,6 +100,7 @@ export interface SmtpTransport {
     text: string;
     inReplyTo?: string;
     references?: string;
+    headers?: Record<string, string>;
   }): Promise<{ messageId?: string; accepted?: string[]; rejected?: string[]; response?: string }>;
   verify(): Promise<boolean>;
 }
@@ -150,6 +151,7 @@ export class SmtpSender implements MailboxSender {
         subject: email.subject,
         text: email.body,
         ...(email.inReplyTo ? { inReplyTo: email.inReplyTo, references: email.inReplyTo } : {}),
+        ...(email.headers ? { headers: email.headers } : {}),
       });
       if (info.rejected && info.rejected.length > 0) {
         return { messageId: info.messageId ?? "", status: "bounced", reason: `rejected: ${info.rejected.join(", ")}` };
@@ -222,11 +224,13 @@ export function buildMailboxSender(
 }
 
 function buildRfc822(email: OutboundEmail): string {
+  const extra = Object.entries(email.headers ?? {}).map(([k, v]) => `${k}: ${v}`);
   return [
     `From: ${email.fromName} <${email.fromEmail}>`,
     `To: ${email.toEmail}`,
     `Subject: ${email.subject}`,
     email.inReplyTo ? `In-Reply-To: ${email.inReplyTo}` : "",
+    ...extra,
     "Content-Type: text/plain; charset=UTF-8",
     "",
     email.body,

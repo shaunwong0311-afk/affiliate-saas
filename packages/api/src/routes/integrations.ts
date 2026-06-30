@@ -260,26 +260,49 @@ export const integrationRoutes: RouteModule = (app, ctx) => {
     const domain = await ctx.db.sendingDomains.get(id);
     if (!domain || domain.merchantId !== merchantId) throw notFound("sending domain");
 
+    const body = (request.body ?? {}) as { dkimSelector?: string };
     const spfOk = await hasTxtRecord(domain.domain, (v) => v.toLowerCase().startsWith("v=spf1"));
     const dmarcOk = await hasTxtRecord(`_dmarc.${domain.domain}`, (v) => v.toLowerCase().startsWith("v=dmarc1"));
+
+    // DKIM needs a selector. Use the one provided, else probe the common provider
+    // selectors. A DKIM TXT record contains `v=DKIM1` and/or a public key (`p=`).
+    const selectors = body.dkimSelector ? [body.dkimSelector] : ["google", "default", "s1", "s2", "k1", "dkim", "mail", "selector1", "selector2"];
+    let dkimOk = false;
+    let dkimSelector: string | null = null;
+    for (const sel of selectors) {
+      if (await hasTxtRecord(`${sel}._domainkey.${domain.domain}`, (v) => /v=dkim1|(^|;)\s*p=/i.test(v))) {
+        dkimOk = true;
+        dkimSelector = sel;
+        break;
+      }
+    }
 
     const updated = await ctx.db.sendingDomains.update(id, {
       spfStatus: spfOk ? "verified" : "failed",
       dmarcStatus: dmarcOk ? "verified" : "failed",
-      // DKIM verification requires the selector; not configured → remains pending.
-      dkimStatus: "pending",
+      dkimStatus: dkimOk ? "verified" : "failed",
     });
+    // From-alignment: outreach mailboxes whose address-domain matches an authenticated
+    // sending domain are aligned (best deliverability). Surface any that aren't.
+    const mailboxes = await ctx.db.mailboxes.find((m) => m.merchantId === merchantId);
+    const aligned = mailboxes.filter((m) => emailDomain(m.email) === domain.domain.replace(/^mail\./, "")).map((m) => m.email);
+    const unaligned = mailboxes.filter((m) => !aligned.includes(m.email) && emailDomain(m.email) !== domain.domain).map((m) => m.email);
     await writeAudit(ctx, {
       merchantId,
       actorId: null,
       action: "sending_domain.verify_attempted",
       subjectType: "sending_domain",
       subjectId: id,
-      metadata: { spfOk, dmarcOk },
+      metadata: { spfOk, dmarcOk, dkimOk, dkimSelector },
     });
-    return ok(reply, updated);
+    return ok(reply, { ...updated, dkimSelector, alignment: { aligned, unaligned } });
   });
 };
+
+/** The domain part of an email address (lowercased), or "" when malformed. */
+function emailDomain(email: string): string {
+  return (email.split("@")[1] ?? "").toLowerCase();
+}
 
 /** Real DNS TXT lookup. Returns false on any error (fail closed). */
 async function hasTxtRecord(host: string, predicate: (value: string) => boolean): Promise<boolean> {

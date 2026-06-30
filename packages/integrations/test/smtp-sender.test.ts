@@ -38,6 +38,13 @@ describe("SmtpSender", () => {
     expect(t.sent()[0]).toMatchObject({ from: "Lumen Skincare <team@lumen.com>", to: "creator@example.com", subject: "Partner with us", text: "Hi — loved your reviews." });
   });
 
+  it("passes custom headers (e.g. List-Unsubscribe) through to the transport", async () => {
+    const t = fakeTransport();
+    const sender = new SmtpSender({ host: "h", port: 587, user: "u", pass: "p" }, () => t);
+    await sender.send({ ...email, headers: { "List-Unsubscribe": "<https://x/u>", "List-Unsubscribe-Post": "List-Unsubscribe=One-Click" } });
+    expect(t.sent()[0].headers).toMatchObject({ "List-Unsubscribe": "<https://x/u>", "List-Unsubscribe-Post": "List-Unsubscribe=One-Click" });
+  });
+
   it("sets threading headers when inReplyTo is present", async () => {
     const t = fakeTransport();
     const sender = new SmtpSender({ host: "h", port: 587, user: "u", pass: "p" }, () => t);

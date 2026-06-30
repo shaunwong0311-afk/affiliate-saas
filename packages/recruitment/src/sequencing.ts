@@ -13,7 +13,29 @@ export function isWithinSendWindow(campaign: OutreachCampaign, at: Date): boolea
   return hour >= startHour || hour < endHour; // window wraps midnight
 }
 
+/**
+ * Cadence discipline (research-backed): 1 initial + at most 3 follow-ups, spaced ~5-7
+ * days. Reply rate peaks at follow-up #2 and craters by #4 — past ~3 follow-ups you burn
+ * sender reputation faster than you generate replies (Pitchbox data). So we hard-cap.
+ */
+export const MAX_FOLLOWUPS = 3;
+export const RECOMMENDED_FOLLOWUP_DELAY_DAYS = [3, 5, 7];
+
+/** True once the cadence cap is reached — stop sending further follow-ups. */
+export function followupCapReached(currentStep: number): boolean {
+  return currentStep >= MAX_FOLLOWUPS + 1; // initial (step 1) + 3 follow-ups
+}
+
+/** Build a disciplined default sequence from per-step templates (capped + spaced). */
+export function recommendedSequence(steps: Array<{ subject: string; body: string }>): SequenceStep[] {
+  return steps.slice(0, MAX_FOLLOWUPS + 1).map(
+    (s, i) =>
+      ({ step: i + 1, subject: s.subject, body: s.body, delayDays: i === 0 ? 0 : RECOMMENDED_FOLLOWUP_DELAY_DAYS[i - 1] ?? 7 }) as SequenceStep,
+  );
+}
+
 export function nextStep(campaign: OutreachCampaign, currentStep: number): SequenceStep | null {
+  if (followupCapReached(currentStep)) return null; // cadence discipline — never over-send
   return campaign.sequence.find((s) => s.step === currentStep + 1) ?? null;
 }
 

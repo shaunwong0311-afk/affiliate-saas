@@ -66,6 +66,9 @@ export interface OutboundEmail {
   body: string;
   /** For threading follow-ups. */
   inReplyTo?: string | null;
+  /** Extra RFC822 headers — e.g. the one-click List-Unsubscribe (RFC 8058) required by
+   *  Gmail/Yahoo bulk-sender rules. Senders include these on the outgoing message. */
+  headers?: Record<string, string>;
 }
 
 export interface SendResult {
