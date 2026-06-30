@@ -34,11 +34,13 @@ const STORE_KINDS = [
   { value: "s2s", label: "Server-to-server (S2S)" },
 ];
 
-const MAILBOX_PROVIDERS = [
-  { value: "gmail", label: "Gmail / Google Workspace" },
-  { value: "microsoft", label: "Microsoft 365" },
-  { value: "smtp", label: "Custom SMTP" },
-];
+interface Detected {
+  kind: "google" | "microsoft" | "smtp";
+  method: "google_oauth" | "google_app_password" | "microsoft_oauth" | "smtp";
+  smtp?: { host: string; port: number; secure: boolean };
+  imap?: { host: string; port: number };
+  note: string;
+}
 
 export function Integrations() {
   const integrations = useApi<Integration[]>(() => api.get("/integrations"));
@@ -51,10 +53,12 @@ export function Integrations() {
   // store/payment connect form
   const [storeKind, setStoreKind] = useState("shopify");
 
-  // mailbox connect form
-  const [mbProvider, setMbProvider] = useState("gmail");
+  // mailbox connect (Smart Connect: detect → pre-filled SMTP form → connect + test)
   const [mbEmail, setMbEmail] = useState("");
   const [mbCap, setMbCap] = useState(50);
+  const [detected, setDetected] = useState<Detected | null>(null);
+  const [smtp, setSmtp] = useState({ host: "", port: 587, user: "", pass: "", secure: false });
+  const [testResult, setTestResult] = useState<{ ok: boolean; reason?: string } | null>(null);
 
   // domain form
   const [domainName, setDomainName] = useState("");
@@ -76,15 +80,42 @@ export function Integrations() {
     await run("store", () => api.post("/integrations", { kind: storeKind, config: {}, credentialsRef: "" }), integrations.reload);
   }
 
-  async function connectMailbox() {
+  async function detectMailbox() {
     if (!mbEmail.trim()) {
-      setErr("Mailbox email is required.");
+      setErr("Enter the mailbox email first.");
       return;
     }
-    await run("mailbox", async () => {
-      await api.post("/mailboxes", { provider: mbProvider, email: mbEmail.trim(), dailyCap: mbCap });
-      setMbEmail("");
-      setMbCap(50);
+    await run("detect", async () => {
+      const d = await api.post<Detected>("/mailboxes/detect", { email: mbEmail.trim() });
+      setDetected(d);
+      setTestResult(null);
+      if (d.smtp) setSmtp({ host: d.smtp.host, port: d.smtp.port, user: mbEmail.trim(), pass: "", secure: d.smtp.secure });
+    }, () => {});
+  }
+
+  async function connectSmtp() {
+    if (!smtp.host || !smtp.pass) {
+      setErr("Server host and password are required.");
+      return;
+    }
+    await run("mb-connect", async () => {
+      const mailbox = await api.post<{ id: string }>("/mailboxes", { provider: "smtp", email: mbEmail.trim(), dailyCap: mbCap });
+      const res = await api.post<{ test: { ok: boolean; reason?: string } }>(`/mailboxes/${mailbox.id}/credentials/smtp`, {
+        host: smtp.host,
+        port: Number(smtp.port),
+        user: smtp.user || mbEmail.trim(),
+        pass: smtp.pass,
+        secure: smtp.secure,
+        imapHost: detected?.imap?.host,
+        imapPort: detected?.imap?.port,
+      });
+      setTestResult(res.test);
+      if (res.test.ok) {
+        setMbEmail("");
+        setMbCap(50);
+        setDetected(null);
+        setSmtp({ host: "", port: 587, user: "", pass: "", secure: false });
+      }
     }, mailboxes.reload);
   }
 
@@ -183,37 +214,88 @@ export function Integrations() {
       <div className="mt-24">
         <Card flush title="Mailboxes" sub="we send as the merchant — outreach lands from your own inbox, not a shared relay">
           <div style={{ padding: "16px 20px", borderBottom: "1px solid var(--line)" }}>
+            {/* Step 1 — enter the email; we detect the easiest way to connect. */}
             <div className="grid grid-4" style={{ alignItems: "end" }}>
-              <Field label="Provider">
-                <select className="select" value={mbProvider} onChange={(e) => setMbProvider(e.target.value)}>
-                  {MAILBOX_PROVIDERS.map((p) => (
-                    <option key={p.value} value={p.value}>{p.label}</option>
-                  ))}
-                </select>
-              </Field>
               <Field label="Inbox address">
                 <input
                   className="input"
                   type="email"
                   placeholder="founder@yourbrand.com"
                   value={mbEmail}
-                  onChange={(e) => setMbEmail(e.target.value)}
+                  onChange={(e) => {
+                    setMbEmail(e.target.value);
+                    setDetected(null);
+                    setTestResult(null);
+                  }}
                 />
               </Field>
               <Field label="Daily send cap">
-                <input
-                  className="input"
-                  type="number"
-                  min={1}
-                  value={mbCap}
-                  onChange={(e) => setMbCap(Math.max(1, Number(e.target.value) || 1))}
-                />
+                <input className="input" type="number" min={1} value={mbCap} onChange={(e) => setMbCap(Math.max(1, Number(e.target.value) || 1))} />
               </Field>
-              <button className="btn primary" onClick={connectMailbox} disabled={busy === "mailbox"}>
-                {busy === "mailbox" ? "connecting…" : "Connect mailbox"}
+              <button className="btn" onClick={detectMailbox} disabled={busy === "detect"}>
+                {busy === "detect" ? "detecting…" : "Detect provider"}
               </button>
             </div>
-            <div className="faint" style={{ fontSize: 11.5, marginTop: 10 }}>
+
+            {/* Step 2 — route to the easiest method for the detected provider. */}
+            {detected && (
+              <div className="mt-16" style={{ borderTop: "1px dashed var(--line)", paddingTop: 14 }}>
+                <div className="row gap-8" style={{ marginBottom: 8 }}>
+                  <Badge kind="info">{detected.kind}</Badge>
+                  <span className="faint" style={{ fontSize: 12 }}>{detected.note}</span>
+                </div>
+
+                {detected.method === "microsoft_oauth" ? (
+                  <div className="faint" style={{ fontSize: 12.5 }}>
+                    Microsoft 365 / Outlook uses one-click <strong>Connect with Microsoft</strong> (coming in this build).
+                    Basic-auth SMTP is no longer supported by Microsoft, so an app password won't work here.
+                  </div>
+                ) : (
+                  <>
+                    {detected.method === "google_app_password" && (
+                      <div className="faint" style={{ fontSize: 12, marginBottom: 10 }}>
+                        Gmail/Workspace: enable 2-Step Verification, then generate an <strong>app password</strong> and paste it below.
+                      </div>
+                    )}
+                    <div className="grid grid-4" style={{ alignItems: "end" }}>
+                      <Field label="SMTP server">
+                        <input className="input mono" value={smtp.host} onChange={(e) => setSmtp({ ...smtp, host: e.target.value })} />
+                      </Field>
+                      <Field label="Port">
+                        <input className="input" type="number" value={smtp.port} onChange={(e) => setSmtp({ ...smtp, port: Number(e.target.value) || 587 })} />
+                      </Field>
+                      <Field label="Username">
+                        <input className="input mono" value={smtp.user} placeholder={mbEmail} onChange={(e) => setSmtp({ ...smtp, user: e.target.value })} />
+                      </Field>
+                      <Field label={detected.method === "google_app_password" ? "App password" : "Password"}>
+                        <input className="input" type="password" value={smtp.pass} onChange={(e) => setSmtp({ ...smtp, pass: e.target.value })} />
+                      </Field>
+                    </div>
+                    <div className="row gap-8 mt-16" style={{ alignItems: "center" }}>
+                      <label className="row gap-8" style={{ fontSize: 12 }}>
+                        <input type="checkbox" checked={smtp.secure} onChange={(e) => setSmtp({ ...smtp, secure: e.target.checked })} />
+                        SSL (port 465)
+                      </label>
+                      <button className="btn primary" onClick={connectSmtp} disabled={busy === "mb-connect"}>
+                        {busy === "mb-connect" ? "connecting…" : "Connect & test"}
+                      </button>
+                    </div>
+                  </>
+                )}
+              </div>
+            )}
+
+            {testResult && (
+              <div className="mt-16" style={{ fontSize: 12.5 }}>
+                {testResult.ok ? (
+                  <Badge kind="ok">✓ connection verified</Badge>
+                ) : (
+                  <span><Badge kind="danger">✕ test failed</Badge> <span className="faint">{testResult.reason}</span></span>
+                )}
+              </div>
+            )}
+
+            <div className="faint" style={{ fontSize: 11.5, marginTop: 12 }}>
               Outreach sends as the merchant. Keep caps low while warming up to protect deliverability.
             </div>
           </div>
@@ -244,6 +326,13 @@ export function Integrations() {
                     <td className="num mono">{b.dailyCap}</td>
                     <td className="num">
                       <div className="row gap-8" style={{ justifyContent: "flex-end" }}>
+                        <button
+                          className="btn sm ghost"
+                          onClick={() => run(`mb-test-${b.id}`, async () => { setTestResult(await api.post(`/mailboxes/${b.id}/test`, {})); }, mailboxes.reload)}
+                          disabled={busy === `mb-test-${b.id}`}
+                        >
+                          Test
+                        </button>
                         {b.warmupStatus === "warming" ? (
                           <button
                             className="btn sm ghost"
