@@ -71,6 +71,54 @@ export async function draftDm(deps: RecruitmentDeps, merchant: Merchant, prospec
   const target = bestDmTarget(profile);
   if (!target) return null;
 
+  return draftDmInner(deps, merchant, prospect, target);
+}
+
+const TIER_RANK = { A: 3, B: 2, C: 1 } as const;
+
+export interface DmFollowupTarget {
+  prospectId: string;
+  identity: string;
+  tier: "A" | "B" | "C" | null;
+  score: number | null;
+  lastEmailedAt: string | null;
+  daysSinceEmail: number | null;
+  target: DmTarget;
+}
+
+/**
+ * The high-value social-follow-up queue: HIGH-QUALITY prospects we EMAILED who haven't
+ * replied — surfaced for a DM nudge on the channel they actually answer. Filters to tier
+ * ≥ minTier, state contacted/in_sequence (emailed, no reply), a DM-able handle, and
+ * (default) emailed at least `minDaysSinceEmail` ago so email has had time to land first.
+ */
+export async function dmFollowupTargets(
+  deps: RecruitmentDeps,
+  merchantId: string,
+  opts: { minTier?: "A" | "B" | "C"; minDaysSinceEmail?: number } = {},
+): Promise<DmFollowupTarget[]> {
+  const minRank = TIER_RANK[opts.minTier ?? "B"];
+  const minDays = opts.minDaysSinceEmail ?? 3;
+  const nowMs = deps.clock.now().getTime();
+  const prospects = await deps.db.prospects.find(
+    (p) => p.merchantId === merchantId && (p.state === "contacted" || p.state === "in_sequence") && p.tier != null && TIER_RANK[p.tier] >= minRank,
+  );
+
+  const out: DmFollowupTarget[] = [];
+  for (const p of prospects) {
+    if (await deps.db.replies.findOne((r) => r.prospectId === p.id)) continue; // already replied → skip
+    const target = bestDmTarget((p.evidence?.profile as Profile | null) ?? null);
+    if (!target) continue; // no social handle to DM
+    const sentAts = (await deps.db.outreachMessages.find((m) => m.prospectId === p.id && m.status === "sent" && !!m.sentAt)).map((m) => m.sentAt!).sort();
+    const lastEmailedAt = sentAts.length ? sentAts[sentAts.length - 1]! : null;
+    const daysSinceEmail = lastEmailedAt ? (nowMs - new Date(lastEmailedAt).getTime()) / 86_400_000 : null;
+    if (daysSinceEmail != null && daysSinceEmail < minDays) continue; // give email time to land
+    out.push({ prospectId: p.id, identity: p.identity, tier: p.tier, score: p.score, lastEmailedAt, daysSinceEmail, target });
+  }
+  return out.sort((a, b) => TIER_RANK[b.tier ?? "C"] - TIER_RANK[a.tier ?? "C"] || (b.score ?? 0) - (a.score ?? 0));
+}
+
+async function draftDmInner(deps: RecruitmentDeps, merchant: Merchant, prospect: Prospect, target: DmTarget): Promise<DmDraft> {
   const fallback = `Hey ${prospect.identity}! Really like your content — I run the affiliate program at ${merchant.name} (${merchant.niche ?? "our products"}) and think you'd be a great fit. Mind if I share the details?`;
   if (deps.llm.model === "deterministic-llm-v1") return { target, message: fallback, mode: "template" };
 

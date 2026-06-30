@@ -2,7 +2,7 @@ import { z } from "zod";
 import { newId } from "@affiliate/core";
 import { parseInboundWebhook } from "@affiliate/integrations";
 import type { OutreachCampaign, Suppression } from "@affiliate/db";
-import { runSourcing, processBacklog, launchCampaign, handleReply, recordOutcome, draftOutreach, expandFrontier, convertProspectToAffiliate, previewOutreach, processInboundReply, activationMetrics, draftDm, bestDmTarget, abResults, applyToJoin, firstStep } from "@affiliate/recruitment";
+import { runSourcing, processBacklog, launchCampaign, handleReply, recordOutcome, draftOutreach, expandFrontier, convertProspectToAffiliate, previewOutreach, processInboundReply, activationMetrics, draftDm, bestDmTarget, dmFollowupTargets, abResults, applyToJoin, firstStep } from "@affiliate/recruitment";
 import { renderTemplate } from "@affiliate/integrations";
 import type { Profile } from "@affiliate/core";
 import type { RouteModule } from "./helpers.js";
@@ -336,6 +336,18 @@ export const recruitmentRoutes: RouteModule = (app, ctx) => {
       .filter((x) => x.target)
       .map((x) => ({ prospectId: x.p.id, identity: x.p.identity, tier: x.p.tier, state: x.p.state, target: x.target }));
     return ok(reply, queue);
+  });
+
+  // High-value social-follow-up queue: high-quality prospects we EMAILED who didn't reply,
+  // surfaced for a DM nudge. ?minTier=A|B|C &minDaysSinceEmail=N (defaults B / 3 days).
+  app.get("/recruitment/dm-followup", async (request, reply) => {
+    const { merchantId } = await requireMerchant(ctx, request, "read");
+    const q = request.query as { minTier?: "A" | "B" | "C"; minDaysSinceEmail?: string };
+    const targets = await dmFollowupTargets(ctx, merchantId, {
+      minTier: q.minTier,
+      minDaysSinceEmail: q.minDaysSinceEmail != null ? Number(q.minDaysSinceEmail) : undefined,
+    });
+    return ok(reply, targets);
   });
 
   // The drafted DM + deep link for one prospect (the operator copies + sends).
