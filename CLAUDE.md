@@ -107,11 +107,33 @@ links. Keep this discipline in all discovery/enrichment work.
 
 ## Current state (as of this writing)
 
-All built and green (**261 tests**, root + web typecheck clean, demo runs). The full
-**discovery + enrich + score + recursive-frontier** stack exists end-to-end behind
-ports; it runs on labeled demo data until provider keys are set.
+All built and green (**306 tests**, root + web typecheck clean, demo runs). The full
+**discovery + enrich + score + recursive-frontier** AND the **outreach/recruit→close**
+half now exist end-to-end behind ports; runs on labeled demo data until keys are set.
 
-A large **discovery/enrichment-quality pass** landed this session (all behind ports,
+The **email-outreach build** (spec: `docs/OUTREACH-SPEC.md`) — the engine can now SEND,
+PERSONALIZE, and PROCESS REPLIES as the merchant:
+- **Send-as-the-merchant**: `SmtpSender` (real SMTP AUTH, the launch rail — cPanel/host +
+  Gmail app-password; Outlook/M365 need Graph OAuth, basic-auth SMTP retired), `buildMailboxSender`
+  + per-send `mailboxResolver` loading encrypted creds from the SecretStore. `GmailSender`/
+  `MicrosoftGraphSender` are real-shaped (OAuth flow itself = a later rung).
+- **Smart Connect**: `detectMailProvider` MX-routes a merchant's email → easiest method
+  (Google→app-password, Microsoft→OAuth, else pre-filled SMTP); web Integrations page wired.
+- **Personalization**: per-merchant plan `template|hybrid|llm` (billed; metered as usageEvents),
+  LLM body cites real evidence; `previewOutreach`. Cheap-LLM (Grok/Haiku) via the relevance wiring.
+- **Replies + conversion**: `processInboundReply` (match sender→prospect→two-track route),
+  `convertProspectToAffiliate` (idempotent prospect→Affiliate+Relationship so a recruit can
+  magic-link into the portal), `applyToJoin` (public inbound self-serve, `POST /join/:merchantId`).
+- **Deliverability (competitive-gap pass)**: one-click `List-Unsubscribe` (RFC 8058) header +
+  POST endpoint; DKIM selector verification + From-alignment; cadence cap (1 initial + 3
+  follow-ups); send-time/timezone gate (`isGoodLocalSendTime`); A/B step variants (`pickVariant`
+  + `abResults`); seed-send placement test.
+- **Activation analytics**: `activationMetrics` — activated/producing rates, time-to-first-sale,
+  fast-start (the recruitment-ROI metric), from clicks+conversions joined via relationship `prospectId`.
+- **Multichannel DM-assist** (compliant, semi-assisted — NEVER auto-DM): `bestDmTarget` +
+  `dmDeepLink` (ig.me/m, t.me, profile links) + `draftDm`; `dm-queue` / `dm-draft` / `dm-sent` routes.
+
+Pre-outreach, a large **discovery/enrichment-quality pass** also landed (all behind ports,
 key-gated, offline-testable):
 - **Fetcher hardening** (`integrations/http.ts`): `CachingFetcher` (short-TTL + in-flight
   coalescing — kills the resolver/frontier/enrich re-fetch) + `RateLimitedFetcher`
@@ -166,11 +188,18 @@ pay) still has stub adapters. Recommended order:
 `DEPLOYMENT.md` (one small VPS/Hetzner origin + Cloudflare edge/static; the 3 Hetzner
 rules: never email from box IP, scrape via proxies, back ledger off-box).
 
-**Tier 2 — make the recruit→close→pay half REAL (biggest functional gap):**
-- **Mailbox OAuth (Gmail / MS Graph)** so outreach actually sends as the merchant —
-  currently a stub (`integrations/mailbox.ts`). *Highest-value next build.*
+**Tier 2 — finish the recruit→close→pay half (outreach SENDING is now built — see above):**
+- **Mailbox OAuth consent flow** (Gmail/MS Graph): the *senders* are real and the SMTP rail
+  ships today; the remaining rung is the OAuth consent round-trip + token refresh + storing
+  creds (MailboxCredentials kind microsoft/gmail_oauth). MS Graph first (no CASA).
+- **IMAP reply poller** transport (the `ImapReplyIngestion` skeleton) — the webhook reply path
+  + `processInboundReply` logic are done; the SMTP-rail IMAP poll is the missing transport.
+- **Branching/conditional sequences + full channel orchestration**: the model (step `channel`,
+  `variants`) is in; the scheduler auto-advancing email→DM steps + open/click branching is next.
 - **Calendar booking** (Cal.com / Google) for the A-tier meeting handoff — stub.
 - **Payout rails** (Stripe Connect / PayPal / Wise) — stubs.
+- **SES dedicated-domain rail** + DNS automation (scale/deliverability) — OUTREACH-SPEC Phase 2.
+- **Web pages**: a public apply-to-join page + DM-queue/activation dashboards (routes exist).
 
 **Tier 3 — discovery polish / levers (we may keep iterating here):**
 - **Go-live VALIDATION**: no provider keys are wired here, so the real-data path is
