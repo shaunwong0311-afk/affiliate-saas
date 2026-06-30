@@ -2,7 +2,7 @@ import { z } from "zod";
 import { newId } from "@affiliate/core";
 import { parseInboundWebhook } from "@affiliate/integrations";
 import type { OutreachCampaign, Suppression } from "@affiliate/db";
-import { runSourcing, processBacklog, launchCampaign, handleReply, recordOutcome, draftOutreach, expandFrontier, convertProspectToAffiliate, previewOutreach, processInboundReply } from "@affiliate/recruitment";
+import { runSourcing, processBacklog, launchCampaign, handleReply, recordOutcome, draftOutreach, expandFrontier, convertProspectToAffiliate, previewOutreach, processInboundReply, activationMetrics } from "@affiliate/recruitment";
 import type { RouteModule } from "./helpers.js";
 import { parseBody, parseQuery, ok, paginationSchema, paginate } from "./helpers.js";
 import { requireMerchant } from "../auth/middleware.js";
@@ -321,6 +321,12 @@ export const recruitmentRoutes: RouteModule = (app, ctx) => {
       metadata: { scope: suppression.scope },
     });
     return ok(reply, suppression, 201);
+  });
+
+  // ---- Activation analytics (the recruitment ROI metric) --------------------
+  app.get("/recruitment/activation", async (request, reply) => {
+    const { merchantId } = await requireMerchant(ctx, request, "read");
+    return ok(reply, await activationMetrics(ctx, merchantId));
   });
 
   // ---- Personalization plan (billed differently) ----------------------------

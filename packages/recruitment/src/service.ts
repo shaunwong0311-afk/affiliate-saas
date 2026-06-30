@@ -4,6 +4,7 @@ import type { RecruitmentDeps } from "./deps.js";
 import { discover, enrich, score, queueFirstTouch, send } from "./pipeline.js";
 import { planDiscovery, type DiscoveryPlan } from "./discovery-planner.js";
 import { routeReply, type ReplyOutcome } from "./reply-router.js";
+import { isGoodLocalSendTime } from "./send-timing.js";
 import { isSuppressed } from "./suppression.js";
 import { existingAffiliateEmails } from "./guards.js";
 
@@ -152,6 +153,8 @@ export interface LaunchSummary {
   sent: number;
   bounced: number;
   skipped: number;
+  /** Held back because it wasn't a good local send time for the recipient (try next run). */
+  deferred: number;
 }
 
 /**
@@ -161,7 +164,7 @@ export interface LaunchSummary {
 export async function launchCampaign(
   deps: RecruitmentDeps,
   campaignId: string,
-  opts?: { minTier?: "A" | "B" | "C"; max?: number },
+  opts?: { minTier?: "A" | "B" | "C"; max?: number; respectLocalTime?: boolean },
 ): Promise<LaunchSummary> {
   const campaign: OutreachCampaign = await deps.db.campaigns.require(campaignId);
   const tierRank = { A: 3, B: 2, C: 1 };
@@ -175,7 +178,15 @@ export async function launchCampaign(
   let sent = 0;
   let bounced = 0;
   let skipped = 0;
+  let deferred = 0;
+  const now = deps.clock.now();
   for (const p of ordered) {
+    // Send-time optimization: hold prospects whose local time isn't a good send window
+    // (picked up on the next run). Unknown geo never defers.
+    if (opts?.respectLocalTime && !isGoodLocalSendTime(p.country, now)) {
+      deferred++;
+      continue;
+    }
     const message = await queueFirstTouch(deps, p.id, campaign);
     if (!message) {
       skipped++;
@@ -187,7 +198,7 @@ export async function launchCampaign(
     else if (result.status === "bounced") bounced++;
     else skipped++;
   }
-  return { queued, sent, bounced, skipped };
+  return { queued, sent, bounced, skipped, deferred };
 }
 
 /** A reply (operator-entered or webhook-delivered) → classify + two-track route. */
