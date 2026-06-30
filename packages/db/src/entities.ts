@@ -366,6 +366,12 @@ export interface SequenceStep {
   subject: string;
   body: string; // template with {{tokens}}
   kind: "initial" | "follow_up" | "breakup";
+  /** Channel for this step. Default "email" (auto-sent). "dm"/"contact_form" steps are
+   *  human-completed handoff tasks (compliant — we never auto-DM). */
+  channel?: "email" | "dm" | "contact_form";
+  /** A/B variants for this step. When present the engine picks one per prospect (even,
+   *  deterministic split) and records it on the message for reply-rate-by-variant analysis. */
+  variants?: Array<{ subject: string; body: string }>;
 }
 
 export interface OutreachMessage {

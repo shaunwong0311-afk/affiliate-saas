@@ -37,7 +37,7 @@ import { isSuppressed, suppress } from "./suppression.js";
 import { isExistingAffiliate } from "./guards.js";
 import { resolveContact } from "./contact-resolver.js";
 import { personalizeOutreach } from "./personalization.js";
-import { firstStep, personalizationDepth } from "./sequencing.js";
+import { firstStep, personalizationDepth, pickVariant } from "./sequencing.js";
 import { weightsForMerchant } from "./learning.js";
 
 /**
@@ -441,9 +441,18 @@ export async function queueFirstTouch(
           : "Thought our affiliate program might interest you.",
   };
 
+  // A/B: when the step defines variants, pick one (even, deterministic per prospect) and
+  // personalize within it. The chosen variant is recorded for reply-rate-by-variant analysis.
+  let effectiveStep = step;
+  let abLabel: string | null = null;
+  if (step.variants?.length) {
+    const picked = pickVariant(step.variants, prospectId);
+    effectiveStep = { ...step, subject: picked.value.subject, body: picked.value.body };
+    abLabel = `ab:v${picked.index}`;
+  }
   // Personalize per the merchant's plan (template / hybrid / llm). The LLM path cites the
   // prospect's real evidence; falls back to the token template otherwise or on any failure.
-  const personalized = await personalizeOutreach(deps, { merchant, prospect, step, tokens });
+  const personalized = await personalizeOutreach(deps, { merchant, prospect, step: effectiveStep, tokens });
 
   const now = deps.clock.now().toISOString();
   const message: OutreachMessage = {
@@ -451,7 +460,9 @@ export async function queueFirstTouch(
     prospectId,
     campaignId: campaign.id,
     step: step.step,
-    variant: personalized.mode === "llm" ? "llm" : depth,
+    // LLM bodies are personalized per-prospect (no fixed variant to test); template sends
+    // carry the A/B label so variant reply-rates are comparable.
+    variant: personalized.mode === "llm" ? "llm" : abLabel ?? depth,
     subject: personalized.subject,
     body: personalized.body,
     sentAt: null,

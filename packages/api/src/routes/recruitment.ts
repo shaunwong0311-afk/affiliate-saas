@@ -2,7 +2,8 @@ import { z } from "zod";
 import { newId } from "@affiliate/core";
 import { parseInboundWebhook } from "@affiliate/integrations";
 import type { OutreachCampaign, Suppression } from "@affiliate/db";
-import { runSourcing, processBacklog, launchCampaign, handleReply, recordOutcome, draftOutreach, expandFrontier, convertProspectToAffiliate, previewOutreach, processInboundReply, activationMetrics } from "@affiliate/recruitment";
+import { runSourcing, processBacklog, launchCampaign, handleReply, recordOutcome, draftOutreach, expandFrontier, convertProspectToAffiliate, previewOutreach, processInboundReply, activationMetrics, draftDm, bestDmTarget, abResults } from "@affiliate/recruitment";
+import type { Profile } from "@affiliate/core";
 import type { RouteModule } from "./helpers.js";
 import { parseBody, parseQuery, ok, paginationSchema, paginate } from "./helpers.js";
 import { requireMerchant } from "../auth/middleware.js";
@@ -323,10 +324,61 @@ export const recruitmentRoutes: RouteModule = (app, ctx) => {
     return ok(reply, suppression, 201);
   });
 
+  // ---- Multichannel DM assist (semi-assisted — operator sends, never auto) --
+  // Prospects with a DM-able social handle, worth a DM nudge (no reply yet).
+  app.get("/recruitment/dm-queue", async (request, reply) => {
+    const { merchantId } = await requireMerchant(ctx, request, "read");
+    const states = new Set(["scored", "queued", "contacted", "in_sequence"]);
+    const prospects = await ctx.db.prospects.find((p) => p.merchantId === merchantId && states.has(p.state));
+    const queue = prospects
+      .map((p) => ({ p, target: bestDmTarget((p.evidence?.profile as Profile | null) ?? null) }))
+      .filter((x) => x.target)
+      .map((x) => ({ prospectId: x.p.id, identity: x.p.identity, tier: x.p.tier, state: x.p.state, target: x.target }));
+    return ok(reply, queue);
+  });
+
+  // The drafted DM + deep link for one prospect (the operator copies + sends).
+  app.get("/recruitment/prospects/:id/dm-draft", async (request, reply) => {
+    const { merchantId } = await requireMerchant(ctx, request, "read");
+    const id = (request.params as { id: string }).id;
+    const prospect = await ctx.db.prospects.get(id);
+    if (!prospect || prospect.merchantId !== merchantId) throw notFound("prospect");
+    const merchant = await ctx.db.merchants.require(merchantId);
+    const draft = await draftDm(ctx, merchant, prospect);
+    if (!draft) throw badRequest("no DM-able social handle for this prospect");
+    return ok(reply, draft);
+  });
+
+  // Record that the operator sent the DM (a manual touch); optionally capture the reply.
+  app.post("/recruitment/prospects/:id/dm-sent", async (request, reply) => {
+    const { merchantId } = await requireMerchant(ctx, request, "write");
+    const id = (request.params as { id: string }).id;
+    const prospect = await ctx.db.prospects.get(id);
+    if (!prospect || prospect.merchantId !== merchantId) throw notFound("prospect");
+    const body = parseBody(z.object({ reply: z.string().optional() }), request);
+    await writeAudit(ctx, { merchantId, actorId: null, action: "recruitment.dm.sent", subjectType: "prospect", subjectId: id });
+    // If they pasted a DM reply, route it through the same two-track handler.
+    if (body.reply?.trim()) {
+      const outcome = await handleReply(ctx, id, body.reply);
+      return ok(reply, { recorded: true, outcome });
+    }
+    if (prospect.state === "scored" || prospect.state === "queued") await ctx.db.prospects.update(id, { state: "contacted", updatedAt: ctx.clock.now().toISOString() });
+    return ok(reply, { recorded: true });
+  });
+
   // ---- Activation analytics (the recruitment ROI metric) --------------------
   app.get("/recruitment/activation", async (request, reply) => {
     const { merchantId } = await requireMerchant(ctx, request, "read");
     return ok(reply, await activationMetrics(ctx, merchantId));
+  });
+
+  // A/B variant reply-rates for a campaign.
+  app.get("/recruitment/campaigns/:id/ab", async (request, reply) => {
+    const { merchantId } = await requireMerchant(ctx, request, "read");
+    const id = (request.params as { id: string }).id;
+    const campaign = await ctx.db.campaigns.get(id);
+    if (!campaign || campaign.merchantId !== merchantId) throw notFound("campaign");
+    return ok(reply, await abResults(ctx, id));
   });
 
   // ---- Personalization plan (billed differently) ----------------------------

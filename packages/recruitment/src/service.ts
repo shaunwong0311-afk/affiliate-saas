@@ -201,6 +201,30 @@ export async function launchCampaign(
   return { queued, sent, bounced, skipped, deferred };
 }
 
+export interface AbVariantResult {
+  variant: string;
+  sent: number;
+  replied: number;
+  replyRate: number;
+}
+
+/** Reply-rate by A/B variant for a campaign (only template-variant sends are comparable). */
+export async function abResults(deps: RecruitmentDeps, campaignId: string): Promise<AbVariantResult[]> {
+  const messages = await deps.db.outreachMessages.find((m) => m.campaignId === campaignId && (m.variant ?? "").startsWith("ab:"));
+  const byVariant = new Map<string, { sent: number; replied: number }>();
+  for (const m of messages) {
+    if (m.status !== "sent" && m.status !== "replied") continue;
+    const cur = byVariant.get(m.variant!) ?? { sent: 0, replied: 0 };
+    cur.sent++;
+    const replies = await deps.db.replies.find((r) => r.prospectId === m.prospectId);
+    if (replies.length) cur.replied++;
+    byVariant.set(m.variant!, cur);
+  }
+  return [...byVariant.entries()]
+    .map(([variant, s]) => ({ variant, sent: s.sent, replied: s.replied, replyRate: s.sent ? s.replied / s.sent : 0 }))
+    .sort((a, b) => a.variant.localeCompare(b.variant));
+}
+
 /** A reply (operator-entered or webhook-delivered) → classify + two-track route. */
 export async function handleReply(
   deps: RecruitmentDeps,

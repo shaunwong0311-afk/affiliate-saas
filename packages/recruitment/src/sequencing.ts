@@ -43,6 +43,15 @@ export function firstStep(campaign: OutreachCampaign): SequenceStep | null {
   return [...campaign.sequence].sort((a, b) => a.step - b.step)[0] ?? null;
 }
 
+/** Deterministic even A/B split: pick a variant by hashing a stable key (the prospect id). */
+export function pickVariant<T>(variants: T[], key: string): { index: number; value: T } {
+  if (variants.length === 1) return { index: 0, value: variants[0]! };
+  let h = 0;
+  for (let i = 0; i < key.length; i++) h = (h * 31 + key.charCodeAt(i)) >>> 0;
+  const index = h % variants.length;
+  return { index, value: variants[index]! };
+}
+
 /** Delay in ms before a follow-up step should send. */
 export function delayForStep(step: SequenceStep): number {
   return step.delayDays * 86_400_000;

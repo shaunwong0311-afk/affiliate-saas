@@ -7,6 +7,7 @@ export * from "./personalization.js";
 export * from "./conversion.js";
 export * from "./activation.js";
 export * from "./send-timing.js";
+export * from "./dm.js";
 export * from "./sequencing.js";
 export * from "./pipeline.js";
 export * from "./service.js";
