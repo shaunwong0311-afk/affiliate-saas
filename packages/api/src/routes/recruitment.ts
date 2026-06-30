@@ -2,7 +2,8 @@ import { z } from "zod";
 import { newId } from "@affiliate/core";
 import { parseInboundWebhook } from "@affiliate/integrations";
 import type { OutreachCampaign, Suppression } from "@affiliate/db";
-import { runSourcing, processBacklog, launchCampaign, handleReply, recordOutcome, draftOutreach, expandFrontier, convertProspectToAffiliate, previewOutreach, processInboundReply, activationMetrics, draftDm, bestDmTarget, abResults } from "@affiliate/recruitment";
+import { runSourcing, processBacklog, launchCampaign, handleReply, recordOutcome, draftOutreach, expandFrontier, convertProspectToAffiliate, previewOutreach, processInboundReply, activationMetrics, draftDm, bestDmTarget, abResults, applyToJoin, firstStep } from "@affiliate/recruitment";
+import { renderTemplate } from "@affiliate/integrations";
 import type { Profile } from "@affiliate/core";
 import type { RouteModule } from "./helpers.js";
 import { parseBody, parseQuery, ok, paginationSchema, paginate } from "./helpers.js";
@@ -394,6 +395,48 @@ export const recruitmentRoutes: RouteModule = (app, ctx) => {
     const merchant = await ctx.db.merchants.update(merchantId, { personalizationPlan: body.plan });
     await writeAudit(ctx, { merchantId, actorId: null, action: "recruitment.personalization.updated", subjectType: "merchant", subjectId: merchantId, metadata: { plan: body.plan } });
     return ok(reply, { plan: merchant.personalizationPlan });
+  });
+
+  // ---- Public "apply to join the program" (inbound recruiting) --------------
+  // No JWT — the applicant isn't logged in. Keyed by merchant id in the path.
+  app.post("/join/:merchantId", async (request, reply) => {
+    const merchantId = (request.params as { merchantId: string }).merchantId;
+    const body = parseBody(z.object({ email: z.string().email(), name: z.string().min(1), socialUrl: z.string().url().optional() }), request);
+    const result = await applyToJoin(ctx, merchantId, body);
+    if (!result) throw notFound("program");
+    return ok(reply, result, 201);
+  });
+
+  // ---- Inbox-placement seed test (#7) ---------------------------------------
+  // Send the rendered first-touch to operator-provided seed inboxes (Gmail/Outlook/Yahoo)
+  // so placement (primary vs spam) can be checked before spending a campaign. NOTE:
+  // automated folder DETECTION needs the seed mailboxes' IMAP or a GlockApps integration —
+  // this delivers the seed-SEND; detection is the documented next rung.
+  app.post("/recruitment/campaigns/:id/seed-test", async (request, reply) => {
+    const { merchantId } = await requireMerchant(ctx, request, "admin");
+    const id = (request.params as { id: string }).id;
+    const campaign = await ctx.db.campaigns.get(id);
+    if (!campaign || campaign.merchantId !== merchantId) throw notFound("campaign");
+    const body = parseBody(z.object({ seeds: z.array(z.string().email()).min(1).max(10) }), request);
+    const merchant = await ctx.db.merchants.require(merchantId);
+    const step = firstStep(campaign);
+    if (!step) throw badRequest("campaign has no sequence steps");
+    const tokens = { name: "there", merchant: merchant.name, offer: merchant.niche ?? "our products", angle: "Your content is a great match for our products." };
+    const mailbox = campaign.mailboxId ? await ctx.db.mailboxes.get(campaign.mailboxId) : null;
+    const sender = await ctx.mailboxResolver(campaign.mailboxId);
+    const results: Array<{ seed: string; status: string }> = [];
+    for (const seed of body.seeds) {
+      const r = await sender.send({
+        fromName: merchant.name,
+        fromEmail: mailbox?.email ?? `team@${merchant.name.toLowerCase().replace(/\s+/g, "")}.com`,
+        toEmail: seed,
+        subject: `[seed] ${renderTemplate(step.subject, tokens)}`,
+        body: renderTemplate(step.body, tokens),
+      });
+      results.push({ seed, status: r.status });
+    }
+    await writeAudit(ctx, { merchantId, actorId: null, action: "recruitment.seed_test", subjectType: "campaign", subjectId: id, metadata: { count: body.seeds.length } });
+    return ok(reply, { results, note: "Check each seed inbox for primary-vs-spam placement. Automated detection requires seed-inbox IMAP or a GlockApps integration." });
   });
 
   // ---- Inbound reply webhook (Graph / ESP inbound-parse) --------------------

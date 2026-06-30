@@ -82,3 +82,66 @@ export async function convertProspectToAffiliate(
 
   return { affiliate, relationship, created: { affiliate: createdAffiliate, relationship: createdRel } };
 }
+
+export interface ApplyResult {
+  affiliateId: string;
+  relationshipId: string;
+  status: "active" | "pending";
+  created: boolean;
+}
+
+/**
+ * Inbound "apply to join the program" (OUTREACH-SPEC §8 / the marketplaces' lowest-cost
+ * recruiting channel). A creator submits the public join form → we find-or-create their
+ * affiliate + relationship. Auto-approval programs activate immediately; manual/invite
+ * programs land "pending" for operator review. Idempotent by email.
+ */
+export async function applyToJoin(
+  deps: RecruitmentDeps,
+  merchantId: string,
+  input: { email: string; name: string; socialUrl?: string; source?: string },
+): Promise<ApplyResult | null> {
+  const merchant = await deps.db.merchants.get(merchantId);
+  if (!merchant) return null;
+  const programs = await deps.db.programs.find((p) => p.merchantId === merchantId);
+  const program = programs.find((p) => p.status === "active") ?? programs[0];
+  if (!program) return null;
+  const now = deps.clock.now().toISOString();
+  const email = input.email.toLowerCase();
+
+  let affiliate = await deps.db.affiliates.findOne((a) => a.primaryEmail.toLowerCase() === email);
+  let created = false;
+  if (!affiliate) {
+    affiliate = await deps.db.affiliates.insert({
+      id: newId("aff"),
+      name: input.name,
+      primaryEmail: input.email,
+      country: null,
+      audienceProfile: input.socialUrl ? { channels: [input.socialUrl] } : null,
+      status: "active",
+      createdAt: now,
+    });
+    created = true;
+  }
+
+  let rel = await deps.db.relationships.findOne((r) => r.affiliateId === affiliate!.id && r.merchantId === merchantId);
+  if (!rel) {
+    const status: "active" | "pending" = program.approvalMode === "auto" ? "active" : "pending";
+    rel = await deps.db.relationships.insert({
+      id: newId("rel"),
+      affiliateId: affiliate.id,
+      merchantId,
+      programId: program.id,
+      status,
+      joinedAt: now,
+      role: "seller",
+      commissionTerms: null,
+      source: input.source ?? "inbound_apply",
+      ownerUserId: null,
+      tags: ["inbound"],
+      sponsorAffiliateId: null,
+      prospectId: null,
+    });
+  }
+  return { affiliateId: affiliate.id, relationshipId: rel.id, status: rel.status as "active" | "pending", created };
+}

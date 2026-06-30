@@ -6,6 +6,7 @@ import {
   personalizeOutreach,
   convertProspectToAffiliate,
   processInboundReply,
+  applyToJoin,
   type RecruitmentDeps,
 } from "../src/index.js";
 import type { Merchant, Prospect, SequenceStep } from "@affiliate/db";
@@ -130,6 +131,28 @@ describe("convertProspectToAffiliate", () => {
     await db.programs.delete("prog1");
     const p = await db.prospects.insert(prospect({ state: "replied" }));
     expect(await convertProspectToAffiliate(makeDeps(), p.id)).toBeNull();
+  });
+});
+
+describe("applyToJoin (inbound)", () => {
+  it("auto-approval program → active affiliate immediately", async () => {
+    await db.programs.insert({ id: "prog1", merchantId: "m1", name: "P", status: "active", termsUrl: null, approvalMode: "auto", defaultCurrency: "USD", attributionPriority: "last_touch", holdDays: 14 });
+    const r = await applyToJoin(makeDeps(), "m1", { email: "new@creator.com", name: "New Creator", socialUrl: "https://instagram.com/new" });
+    expect(r).toMatchObject({ status: "active", created: true });
+    expect(await db.relationships.count(() => true)).toBe(1);
+  });
+
+  it("manual-approval program → pending for review; idempotent by email", async () => {
+    await db.programs.insert({ id: "prog2", merchantId: "m1", name: "P", status: "active", termsUrl: null, approvalMode: "manual", defaultCurrency: "USD", attributionPriority: "last_touch", holdDays: 14 });
+    const first = await applyToJoin(makeDeps(), "m1", { email: "dup@creator.com", name: "Dup" });
+    const again = await applyToJoin(makeDeps(), "m1", { email: "DUP@creator.com", name: "Dup" });
+    expect(first!.status).toBe("pending");
+    expect(again!.relationshipId).toBe(first!.relationshipId); // no duplicate
+    expect(await db.affiliates.count(() => true)).toBe(1);
+  });
+
+  it("returns null when the merchant has no program", async () => {
+    expect(await applyToJoin(makeDeps(), "m1", { email: "x@y.com", name: "X" })).toBeNull();
   });
 });
 
