@@ -35,6 +35,7 @@ export * from "./recruitment/affiliate-detection.js";
 export * from "./recruitment/audience-overlap.js";
 export * from "./recruitment/triage.js";
 export * from "./recruitment/activation-email.js";
+export * from "./recruitment/ai-sdr.js";
 
 // ---- Creator identity graph (profile-graph plan) ----------------------------
 export * from "./profile/identity.js";

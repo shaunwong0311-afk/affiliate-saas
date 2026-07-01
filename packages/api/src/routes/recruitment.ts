@@ -2,7 +2,7 @@ import { z } from "zod";
 import { newId } from "@affiliate/core";
 import { parseInboundWebhook } from "@affiliate/integrations";
 import type { OutreachCampaign, Suppression } from "@affiliate/db";
-import { runSourcing, processBacklog, launchCampaign, handleReply, recordOutcome, draftOutreach, expandFrontier, convertProspectToAffiliate, previewOutreach, processInboundReply, activationMetrics, draftDm, bestDmTarget, dmFollowupTargets, abResults, applyToJoin, firstStep } from "@affiliate/recruitment";
+import { runSourcing, processBacklog, launchCampaign, handleReply, recordOutcome, draftOutreach, expandFrontier, convertProspectToAffiliate, previewOutreach, processInboundReply, activationMetrics, draftDm, bestDmTarget, dmFollowupTargets, abResults, applyToJoin, firstStep, getAutomationState } from "@affiliate/recruitment";
 import { renderTemplate } from "@affiliate/integrations";
 import type { Profile } from "@affiliate/core";
 import type { RouteModule } from "./helpers.js";
@@ -211,7 +211,8 @@ export const recruitmentRoutes: RouteModule = (app, ctx) => {
     const prospect = await ctx.db.prospects.get(id);
     if (!prospect || prospect.merchantId !== merchantId) throw notFound("prospect");
     const body = parseBody(z.object({ raw: z.string() }), request);
-    const result = await handleReply(ctx, id, body.raw);
+    const state = await getAutomationState(ctx, merchantId);
+    const result = await handleReply(ctx, id, body.raw, { meetingTier: state.meetingTier, aiSdrMode: state.aiSdrMode });
     return ok(reply, result);
   });
 
@@ -376,7 +377,8 @@ export const recruitmentRoutes: RouteModule = (app, ctx) => {
     await writeAudit(ctx, { merchantId, actorId: null, action: "recruitment.dm.sent", subjectType: "prospect", subjectId: id });
     // If they pasted a DM reply, route it through the same two-track handler.
     if (body.reply?.trim()) {
-      const outcome = await handleReply(ctx, id, body.reply);
+      const state = await getAutomationState(ctx, merchantId);
+      const outcome = await handleReply(ctx, id, body.reply, { meetingTier: state.meetingTier, aiSdrMode: state.aiSdrMode });
       return ok(reply, { recorded: true, outcome });
     }
     if (prospect.state === "scored" || prospect.state === "queued") await ctx.db.prospects.update(id, { state: "contacted", updatedAt: ctx.clock.now().toISOString() });

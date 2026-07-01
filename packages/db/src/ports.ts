@@ -43,6 +43,8 @@ import type {
   Meeting,
   AutomationState,
   FrontierMerchant,
+  MerchantFaq,
+  Handoff,
   ApiKey,
   WebhookSubscription,
 } from "./entities.js";
@@ -130,6 +132,8 @@ export interface Database {
   meetings: Repo<Meeting>;
   automationStates: Repo<AutomationState>;
   frontierMerchants: Repo<FrontierMerchant>;
+  merchantFaqs: Repo<MerchantFaq>;
+  handoffs: Repo<Handoff>;
 
   // API surface
   apiKeys: Repo<ApiKey>;

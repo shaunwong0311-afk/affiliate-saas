@@ -143,8 +143,8 @@ describe("recruitment pipeline", () => {
     // Two-track routing: a B-tier interested reply goes to the automated self-serve
     // track (signup link), not a human meeting.
     const bTier = await db.prospects.insert({ ...prospect, id: newId("prosp"), email: "yes@trailtester.com", tier: "B" });
-    const selfServe = await handleReply(deps, bTier.id, "This sounds great, what's the commission rate?");
-    expect(["self_serve", "ai_sdr"]).toContain(selfServe.action);
+    const selfServe = await handleReply(deps, bTier.id, "This sounds great, sign me up!");
+    expect(selfServe.action).toBe("self_serve");
     expect(selfServe.signupUrl).toBeTruthy();
 
     // An A-tier interested reply books a meeting (the managed, human-closed track).

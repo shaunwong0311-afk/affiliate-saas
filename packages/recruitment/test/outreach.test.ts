@@ -162,7 +162,9 @@ describe("processInboundReply", () => {
     const r = await processInboundReply(makeDeps(), { toEmail: "team@lumen.com", fromEmail: "hi@trailgeek.com", subject: "re", body: "This sounds great, how does it work?", messageId: "m1", receivedAt: new Date().toISOString() });
     expect(r.matched).toBe(true);
     expect(r.prospectId).toBe(p.id);
-    expect(["self_serve", "ai_sdr"]).toContain(r.outcome?.action);
+    // With no KB/offer configured, an open "how does it work?" correctly routes to a human
+    // handoff rather than a canned answer; with a KB it would be answered (see ai-sdr.test).
+    expect(["self_serve", "ai_sdr", "handoff"]).toContain(r.outcome?.action);
   });
 
   it("returns unmatched when no prospect owns the sender address", async () => {

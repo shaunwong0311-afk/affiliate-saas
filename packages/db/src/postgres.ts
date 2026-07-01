@@ -63,6 +63,8 @@ const TABLES: Record<string, { table: string; idCol: string }> = {
   meetings: { table: "kv_meetings", idCol: "id" },
   automationStates: { table: "kv_automation_states", idCol: "id" },
   frontierMerchants: { table: "kv_frontier_merchants", idCol: "id" },
+  merchantFaqs: { table: "kv_merchant_faqs", idCol: "id" },
+  handoffs: { table: "kv_handoffs", idCol: "id" },
   apiKeys: { table: "kv_api_keys", idCol: "id" },
   webhookSubscriptions: { table: "kv_webhook_subscriptions", idCol: "id" },
 };

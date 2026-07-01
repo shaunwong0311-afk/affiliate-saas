@@ -10,6 +10,7 @@ import type {
   InboundReply,
   LlmClient,
   MailboxSender,
+  Notifier,
   RedirectResolver,
   RelevanceScorer,
   CalendarBooking,
@@ -80,5 +81,10 @@ export interface RecruitmentDeps {
   replyPoller?: (mailbox: Mailbox) => Promise<InboundReply[]>;
   /** Meeting booking for the managed (A-tier) track. Optional. */
   calendar?: CalendarBooking;
+  /**
+   * Push notifier for human handoffs (Slack/webhook/push). Optional — the in-app handoff
+   * queue is always written; this is the extra nudge so warm A-tier replies aren't missed.
+   */
+  notifier?: Notifier;
   clock: Clock;
 }

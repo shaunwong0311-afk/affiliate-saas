@@ -111,3 +111,9 @@ export {
   type TransactionalEmail,
   type TransactionalResult,
 } from "./esp.js";
+export {
+  StubNotifier,
+  SlackWebhookNotifier,
+  type Notifier,
+  type HandoffNotification,
+} from "./notifier.js";

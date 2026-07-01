@@ -10,9 +10,10 @@ import {
   ingestReplies,
 } from "@affiliate/recruitment";
 import { parseInboundWebhook } from "@affiliate/integrations";
-import { verifyHmacSignature } from "@affiliate/core";
+import { verifyHmacSignature, newId } from "@affiliate/core";
+import type { MerchantFaq } from "@affiliate/db";
 import type { RouteModule } from "./helpers.js";
-import { parseBody, ok } from "./helpers.js";
+import { parseBody, parseQuery, ok } from "./helpers.js";
 import { requireMerchant } from "../auth/middleware.js";
 import { notFound, badRequest, unauthorized } from "../errors.js";
 import { writeAudit } from "../services/audit.js";
@@ -40,6 +41,7 @@ export const automationRoutes: RouteModule = (app, ctx) => {
         autoSendMinScore: z.number().min(0).max(100).optional(),
         hitlTier: tier.optional(),
         meetingTier: tier.optional(),
+        aiSdrMode: z.enum(["hitl", "autopilot"]).optional(),
         sourcingLimitPerCycle: z.number().int().min(1).max(200).optional(),
       }),
       request,
@@ -120,8 +122,8 @@ export const automationRoutes: RouteModule = (app, ctx) => {
     );
     if (!prospect) return ok(reply, { matched: false });
     const state = await getAutomationState(ctx, merchantId);
-    const outcome = await handleReply(ctx, prospect.id, inbound.body, { meetingTier: state.meetingTier });
-    return ok(reply, { matched: true, action: outcome.action, classification: outcome.classification });
+    const outcome = await handleReply(ctx, prospect.id, inbound.body, { meetingTier: state.meetingTier, aiSdrMode: state.aiSdrMode });
+    return ok(reply, { matched: true, action: outcome.action, classification: outcome.classification, needsHuman: outcome.needsHuman ?? false, handoffId: outcome.handoff?.id ?? null });
   });
 
   // ---- Manual reply ingest (operator pastes a reply) -----------------------
@@ -132,7 +134,7 @@ export const automationRoutes: RouteModule = (app, ctx) => {
     if (!prospect || prospect.merchantId !== merchantId) throw notFound("prospect");
     const body = parseBody(z.object({ raw: z.string().min(1) }), request);
     const state = await getAutomationState(ctx, merchantId);
-    const outcome = await handleReply(ctx, id, body.raw, { meetingTier: state.meetingTier });
+    const outcome = await handleReply(ctx, id, body.raw, { meetingTier: state.meetingTier, aiSdrMode: state.aiSdrMode });
     return ok(reply, outcome);
   });
 
@@ -143,6 +145,50 @@ export const automationRoutes: RouteModule = (app, ctx) => {
     const { merchantId } = await requireMerchant(ctx, request, "write");
     const summary = await ingestReplies(ctx, { merchantId });
     return ok(reply, summary);
+  });
+
+  // ---- AI-SDR human handoff queue ------------------------------------------
+  // Everything the AI-SDR routed to a person: gated topics, ungrounded questions, and
+  // (in HITL mode) grounded answers awaiting approval. The operator works ONE queue.
+  app.get("/recruitment/handoffs", async (request, reply) => {
+    const { merchantId } = await requireMerchant(ctx, request, "read");
+    const q = parseQuery(z.object({ status: z.enum(["open", "resolved"]).optional() }), request);
+    const handoffs = await ctx.db.handoffs.find((h) => h.merchantId === merchantId && (q.status ? h.status === q.status : true));
+    return ok(reply, handoffs.sort((a, b) => b.createdAt.localeCompare(a.createdAt)));
+  });
+
+  // Resolve a handoff (the human actioned it).
+  app.post("/recruitment/handoffs/:id/resolve", async (request, reply) => {
+    const { merchantId } = await requireMerchant(ctx, request, "write");
+    const id = (request.params as { id: string }).id;
+    const handoff = await ctx.db.handoffs.get(id);
+    if (!handoff || handoff.merchantId !== merchantId) throw notFound("handoff");
+    const updated = await ctx.db.handoffs.update(id, { status: "resolved", resolvedAt: ctx.clock.now().toISOString() });
+    return ok(reply, updated);
+  });
+
+  // ---- Merchant KB (the AI-SDR's grounded FAQ source) -----------------------
+  app.get("/recruitment/faqs", async (request, reply) => {
+    const { merchantId } = await requireMerchant(ctx, request, "read");
+    const faqs = await ctx.db.merchantFaqs.find((f) => f.merchantId === merchantId);
+    return ok(reply, faqs);
+  });
+
+  app.post("/recruitment/faqs", async (request, reply) => {
+    const { merchantId } = await requireMerchant(ctx, request, "write");
+    const body = parseBody(z.object({ question: z.string().min(1), answer: z.string().min(1) }), request);
+    const faq: MerchantFaq = { id: newId("faq"), merchantId, question: body.question, answer: body.answer, createdAt: ctx.clock.now().toISOString() };
+    await ctx.db.merchantFaqs.insert(faq);
+    return ok(reply, faq, 201);
+  });
+
+  app.delete("/recruitment/faqs/:id", async (request, reply) => {
+    const { merchantId } = await requireMerchant(ctx, request, "write");
+    const id = (request.params as { id: string }).id;
+    const faq = await ctx.db.merchantFaqs.get(id);
+    if (!faq || faq.merchantId !== merchantId) throw notFound("faq");
+    await ctx.db.merchantFaqs.delete(id);
+    return ok(reply, { id, deleted: true });
   });
 
   void tickScheduler;

@@ -1,6 +1,18 @@
-import { newId, type Tier } from "@affiliate/core";
+import {
+  newId,
+  type Tier,
+  topicGate,
+  buildMerchantKb,
+  answerFromKb,
+  buildGroundedSdrPrompt,
+  isNeedsHuman,
+  summarizeReply,
+  AUTO_ANSWER_TOPICS,
+  type SdrTopic,
+  type MerchantKb,
+} from "@affiliate/core";
 import { classifyReply, type InboundReply } from "@affiliate/integrations";
-import type { Meeting, Reply } from "@affiliate/db";
+import type { Meeting, Reply, Handoff, Prospect } from "@affiliate/db";
 import type { RecruitmentDeps } from "./deps.js";
 import { suppress } from "./suppression.js";
 
@@ -24,6 +36,7 @@ export type ReplyAction =
   | "self_serve"
   | "meeting_booked"
   | "ai_sdr"
+  | "handoff"
   | "review";
 
 export interface ReplyOutcome {
@@ -32,11 +45,19 @@ export interface ReplyOutcome {
   action: ReplyAction;
   /** Self-serve signup link (long-tail track). */
   signupUrl?: string;
-  /** AI-SDR generated answer to a question. */
+  /** AI-SDR generated answer to a question (grounded in the merchant KB). */
   answer?: string;
+  /** Whether a grounded answer is cleared for automatic sending (autopilot + allow-listed only). */
+  autoSend?: boolean;
   /** Booked meeting (managed track). */
   meeting?: Meeting;
   bookingUrl?: string;
+  /** Human-handoff packet, when a person is needed (gated topic, ungrounded, or approval). */
+  handoff?: Handoff;
+  /** True when this reply is routed to a human rather than auto-handled. */
+  needsHuman?: boolean;
+  /** The AI-SDR topic classification (for observability). */
+  topic?: SdrTopic;
 }
 
 const tierRank: Record<Tier, number> = { A: 3, B: 2, C: 1 };
@@ -46,6 +67,12 @@ export interface RouteOptions {
   meetingTier?: Tier;
   /** Base URL for self-serve signup links. */
   signupBaseUrl?: string;
+  /**
+   * AI-SDR autonomy. "hitl" (default): grounded answers become a suggested reply on a handoff
+   * for a human to approve; "autopilot": deterministic allow-listed answers are cleared to
+   * auto-send. Topic-gated/ungrounded replies always go to a human regardless of mode.
+   */
+  aiSdrMode?: "hitl" | "autopilot";
 }
 
 export async function routeReply(deps: RecruitmentDeps, prospectId: string, raw: string, opts: RouteOptions = {}): Promise<ReplyOutcome> {
@@ -107,16 +134,154 @@ export async function routeReply(deps: RecruitmentDeps, prospectId: string, raw:
       createdAt: now,
     };
     await deps.db.meetings.insert(meeting);
-    return { reply, classification, action: "meeting_booked", meeting, bookingUrl: bookingUrl ?? undefined };
+    // A warm high-value reply is the most time-sensitive thing in the funnel — also drop it
+    // in the operator handoff queue + push (A-tier = high urgency) so it never goes cold.
+    const handoff = await createHandoff(deps, {
+      prospect,
+      reply,
+      topic: "meeting",
+      intent: classification,
+      reason: "high_value",
+      summary: summarizeReply(raw, "meeting"),
+      suggestedReply: null,
+    });
+    return { reply, classification, action: "meeting_booked", meeting, bookingUrl: bookingUrl ?? undefined, handoff, needsHuman: true };
   }
 
-  // Long-tail self-serve track. For a question, the AI-SDR drafts an answer.
+  // Long-tail self-serve track — topic-gate FIRST, then a grounded AI-SDR answer.
   const signupUrl = `${opts.signupBaseUrl ?? "https://app.vantage.dev/join"}/${prospect.merchantId.slice(-6)}?p=${prospectId.slice(-8)}`;
-  if (classification === "question") {
-    const answer = await aiSdrAnswer(deps, prospect.identity, raw, signupUrl);
-    return { reply, classification, action: "ai_sdr", answer, signupUrl };
+  const gate = topicGate(raw);
+  if (gate.mustBeHuman) {
+    // Rate negotiation / custom deal / legal / meeting / payment issue → always a human.
+    const handoff = await createHandoff(deps, {
+      prospect,
+      reply,
+      topic: gate.topic,
+      intent: classification,
+      reason: "gated_topic",
+      summary: summarizeReply(raw, gate.topic),
+      suggestedReply: null,
+    });
+    return { reply, classification, action: "handoff", handoff, needsHuman: true, topic: gate.topic };
   }
-  return { reply, classification, action: "self_serve", signupUrl };
+  // Answer if it's phrased as a question OR carries a specific answerable topic — the keyword
+  // classifier tags "what's your commission?" as *interested*, so we can't gate on that alone.
+  if (classification === "question" || gate.topic !== "general_question") {
+    return answerQuestion(deps, prospect, reply, raw, gate.topic, signupUrl, opts);
+  }
+  // Pure interested with nothing to answer → straight to self-serve signup.
+  return { reply, classification, action: "self_serve", signupUrl, topic: gate.topic };
+}
+
+/**
+ * Grounded AI-SDR answer for a long-tail question. Tries a DETERMINISTIC KB answer first
+ * (allow-listed structured topics — zero hallucination surface), then a grounded LLM for
+ * open product/general questions (told to emit NEEDS_HUMAN rather than guess). No grounded
+ * answer → human handoff. A grounded answer is auto-send-cleared only in autopilot mode AND
+ * only for the deterministic allow-list; otherwise it's queued as a suggested reply.
+ */
+async function answerQuestion(
+  deps: RecruitmentDeps,
+  prospect: Prospect,
+  reply: Reply,
+  raw: string,
+  topic: SdrTopic,
+  signupUrl: string,
+  opts: RouteOptions,
+): Promise<ReplyOutcome> {
+  const kb = await loadMerchantKb(deps, prospect.merchantId);
+  let answer = answerFromKb(kb, topic, raw);
+  let deterministic = answer != null;
+
+  if (!answer && (topic === "general_question" || topic === "product_question") && deps.llm.model !== "deterministic-llm-v1") {
+    const prompt = buildGroundedSdrPrompt(kb, raw);
+    try {
+      const out = await deps.llm.complete(prompt.user, { system: prompt.system, maxTokens: 256 });
+      if (!isNeedsHuman(out)) {
+        answer = out.trim();
+        deterministic = false;
+      }
+    } catch {
+      /* fall through to a human handoff */
+    }
+  }
+
+  if (!answer) {
+    const handoff = await createHandoff(deps, { prospect, reply, topic, intent: reply.classification, reason: "ungrounded", summary: summarizeReply(raw, topic), suggestedReply: null });
+    return { reply, classification: reply.classification, action: "handoff", handoff, needsHuman: true, topic };
+  }
+
+  const mode = opts.aiSdrMode ?? "hitl";
+  // Autopilot only auto-sends the deterministic, allow-listed answers — never a generative one.
+  if (mode === "autopilot" && deterministic && AUTO_ANSWER_TOPICS.includes(topic)) {
+    return { reply, classification: reply.classification, action: "ai_sdr", answer, autoSend: true, signupUrl, topic };
+  }
+  // HITL (default) or a generative answer → queue for a human to approve + send.
+  const handoff = await createHandoff(deps, { prospect, reply, topic, intent: reply.classification, reason: "approval", summary: summarizeReply(raw, topic), suggestedReply: answer });
+  return { reply, classification: reply.classification, action: "ai_sdr", answer, autoSend: false, handoff, needsHuman: true, signupUrl, topic };
+}
+
+/** Assemble the grounded merchant KB from the real Program/Offer facts + curated FAQs. */
+async function loadMerchantKb(deps: RecruitmentDeps, merchantId: string): Promise<MerchantKb> {
+  const merchant = await deps.db.merchants.get(merchantId);
+  const programs = await deps.db.programs.find((p) => p.merchantId === merchantId);
+  const program = programs.find((p) => p.status === "active") ?? programs[0] ?? null;
+  const offers = program ? await deps.db.offers.find((o) => o.programId === program.id && o.status === "active") : [];
+  const faqs = await deps.db.merchantFaqs.find((f) => f.merchantId === merchantId);
+  return buildMerchantKb({
+    merchantName: merchant?.name ?? "the brand",
+    program: program ? { approvalMode: program.approvalMode, holdDays: program.holdDays, termsUrl: program.termsUrl } : null,
+    offers,
+    faqs: faqs.map((f) => ({ question: f.question, answer: f.answer })),
+  });
+}
+
+/** Create + persist a handoff packet and fire the push notifier (best-effort). */
+async function createHandoff(
+  deps: RecruitmentDeps,
+  args: {
+    prospect: Prospect;
+    reply: Reply | null;
+    topic: SdrTopic;
+    intent: Reply["classification"];
+    reason: Handoff["reason"];
+    summary: string;
+    suggestedReply: string | null;
+  },
+): Promise<Handoff> {
+  const now = deps.clock.now().toISOString();
+  const handoff: Handoff = {
+    id: newId("ho"),
+    merchantId: args.prospect.merchantId,
+    prospectId: args.prospect.id,
+    replyId: args.reply?.id ?? null,
+    topic: args.topic,
+    intent: args.intent,
+    tier: args.prospect.tier ?? null,
+    reason: args.reason,
+    summary: args.summary,
+    suggestedReply: args.suggestedReply,
+    transcript: args.reply?.raw ?? "",
+    status: "open",
+    assignedUserId: null,
+    createdAt: now,
+    resolvedAt: null,
+  };
+  await deps.db.handoffs.insert(handoff);
+  if (deps.notifier) {
+    await deps.notifier
+      .notify({
+        merchantId: handoff.merchantId,
+        handoffId: handoff.id,
+        tier: handoff.tier,
+        topic: handoff.topic,
+        prospectName: args.prospect.identity,
+        summary: handoff.summary,
+        urgency: handoff.tier === "A" ? "high" : "normal",
+      })
+      .catch(() => {});
+  }
+  return handoff;
 }
 
 /**
@@ -157,7 +322,7 @@ export async function ingestReplies(
   const mailboxes = await deps.db.mailboxes.find(
     (m) => m.status !== "disconnected" && !!m.credentialsRef && (!opts.merchantId || m.merchantId === opts.merchantId),
   );
-  const meetingTierByMerchant = new Map<string, Tier>();
+  const routeOptsByMerchant = new Map<string, RouteOptions>();
   let polled = 0;
   let matched = 0;
   let mailboxesPolled = 0;
@@ -170,18 +335,22 @@ export async function ingestReplies(
       continue; // isolate one mailbox's transport failure from the rest
     }
     mailboxesPolled++;
-    if (!meetingTierByMerchant.has(mailbox.merchantId)) {
+    if (!routeOptsByMerchant.has(mailbox.merchantId)) {
       const state = await deps.db.automationStates.get(mailbox.merchantId);
-      meetingTierByMerchant.set(mailbox.merchantId, (state?.meetingTier as Tier) ?? "A");
+      routeOptsByMerchant.set(mailbox.merchantId, {
+        meetingTier: (state?.meetingTier as Tier) ?? "A",
+        aiSdrMode: state?.aiSdrMode ?? "hitl",
+        signupBaseUrl: opts.signupBaseUrl,
+      });
     }
-    const meetingTier = meetingTierByMerchant.get(mailbox.merchantId)!;
+    const routeOpts = routeOptsByMerchant.get(mailbox.merchantId)!;
     for (const inbound of replies) {
       polled++;
       if (inbound.messageId) {
         const seen = await deps.db.replies.findOne((r) => r.inboundMessageId === inbound.messageId);
         if (seen) continue;
       }
-      const res = await processInboundReply(deps, inbound, { meetingTier, signupBaseUrl: opts.signupBaseUrl });
+      const res = await processInboundReply(deps, inbound, routeOpts);
       if (res.matched && res.outcome) {
         matched++;
         if (inbound.messageId) await deps.db.replies.update(res.outcome.reply.id, { inboundMessageId: inbound.messageId });
@@ -209,20 +378,5 @@ async function classify(deps: RecruitmentDeps, raw: string): Promise<Reply["clas
     return c ?? (classifyReply(raw) as Reply["classification"]);
   } catch {
     return classifyReply(raw) as Reply["classification"];
-  }
-}
-
-/** AI-SDR: answer a routine question and drive to self-serve signup. */
-async function aiSdrAnswer(deps: RecruitmentDeps, name: string, question: string, signupUrl: string): Promise<string> {
-  if (deps.llm.model === "deterministic-llm-v1") {
-    return `Hi ${name}, great question — happy to help. You can see the program terms and join here: ${signupUrl}`;
-  }
-  try {
-    return await deps.llm.complete(
-      `You are an affiliate-program SDR replying to a creator's question. Be concise, warm, and end by inviting them to join at ${signupUrl}.\n\nTheir question: ${question}`,
-      { system: "Answer in 2-3 sentences, in the merchant's voice. No AI tells.", maxTokens: 256 },
-    );
-  } catch {
-    return `Thanks for asking! You can review everything and join here: ${signupUrl}`;
   }
 }

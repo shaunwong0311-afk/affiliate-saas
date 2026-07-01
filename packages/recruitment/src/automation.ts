@@ -31,6 +31,7 @@ export async function getAutomationState(deps: RecruitmentDeps, merchantId: stri
     autoSendMinScore: 70,
     hitlTier: "A", // A-tier always needs a human before the first send
     meetingTier: "A",
+    aiSdrMode: "hitl", // AI-SDR drafts; a human approves — until the merchant graduates to autopilot
     sourcingLimitPerCycle: 20,
     lastCycleAt: null,
     updatedAt: now,

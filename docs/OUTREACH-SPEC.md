@@ -283,7 +283,7 @@ if we stop wanting to maintain OAuth plumbing or move upmarket to locked-down en
 
 ## 16. Build log + research decisions + REMAINING QUEUE (resume here after compaction)
 
-**Built + committed (green, 335 tests):** Phase 1 (SMTP send-as-merchant, Smart Connect,
+**Built + committed (green, 359 tests):** Phase 1 (SMTP send-as-merchant, Smart Connect,
 personalization plans, conversion seam, inbound `applyToJoin`, reply processing) · competitive-gap
 A–D (List-Unsubscribe RFC 8058, DKIM verify, cadence cap, activation metrics + fast-start,
 send-time/timezone, A/B variants, seed-send, DM-assist + `dm-followup` queue) · **mailbox OAuth
@@ -296,29 +296,28 @@ mailparser optional deps, PEEK-only so the merchant's inbox flags are untouched;
 `api/services/activation-email.ts` `sendActivationEmail` — passwordless 7-day magic link, pre-generated
 site-wide tracking link, minted personal referral/attribution code, REAL commission line + REAL
 first-sale bonus only when configured, 14-day fast-start; idempotent via `relationship.activationEmailSentAt`;
-fired on approve / auto-apply / inbound join / prospect conversion).
+fired on approve / auto-apply / inbound join / prospect conversion) · **AI-SDR reply handler**
+(`core/recruitment/ai-sdr.ts` — `topicGate` (structural human-gate on rate/custom-deal/legal/meeting/
+payment), `buildMerchantKb` + `serializeKb` (KB-in-context, not RAG), `answerFromKb` (deterministic
+grounded answers for commission/cookie/payout/how-to-join + FAQ keyword match), `buildGroundedSdrPrompt`+
+`isNeedsHuman` (LLM answers ONLY from KB else declines); `integrations/notifier.ts` `Notifier` port +
+`StubNotifier`/`SlackWebhookNotifier`; `db` `MerchantFaq`+`Handoff` entities + `AutomationState.aiSdrMode`;
+`reply-router.ts` topic-gate → grounded answer → handoff packet + notify, HITL(default)/autopilot;
+routes: `GET /recruitment/handoffs`, `/handoffs/:id/resolve`, `GET|POST|DELETE /recruitment/faqs`,
+`aiSdrMode` in automation PUT). NOTE deferred: physical auto-SEND of autopilot answers (needs the
+outbound-reply/threading transport) — today autopilot marks `autoSend:true` + HITL queues a suggested reply.
 
 **REMAINING QUEUE — priority order (this is the "what's next"):**
 
-1. **#11 AI-SDR reply handler**. RESEARCH DECISION: **KB-in-context, NOT RAG** (small per-merchant KB;
-   prompt-cache per merchant). Serialize `Program`/`Offer` facts as JSON + a new small `merchantFaqs`
-   entity. **Topic gate FIRST (structural, not a prompt plea):** rate-negotiation / custom-deal / legal /
-   meeting → ALWAYS human, never auto-answer. **Grounding:** answer only from the KB, else `needs_human`
-   (kills fact hallucination). Auto-answer allow-list: published-rate lookup, cookie window, payout
-   schedule, how-to-join, product FAQ. HITL-first per merchant → graduate to autopilot. **Handoff packet**
-   (transcript + AI summary + intent + tier + suggested reply) + **Notifier port** (in-app queue + Slack/
-   push for A-tier) with a deterministic stub. Lands in `reply-router.ts` (topic gate between `classify`
-   and the track split), `core` (`buildMerchantKb` + `topicGate`), `db` (`merchantFaqs`, `handoffs`),
-   `integrations` (`Notifier` port).
-2. **#6 per-client deliverability monitoring** + auto-pause: async bounce/complaint ingestion, per-mailbox
+1. **#6 per-client deliverability monitoring** + auto-pause: async bounce/complaint ingestion, per-mailbox
    health (surface `deliverabilityHealth`), warmup-on-a-schedule, act (pause/throttle) on thresholds.
-3. **#7 pre-send content gate** on EVERY personalized email (spam-word/link/length/subject scan + optional
+2. **#7 pre-send content gate** on EVERY personalized email (spam-word/link/length/subject scan + optional
    cheap-LLM "spammy/off-brand?" check). NOTE: seed-test = infra/placement on a representative sample
    (already built); this per-email gate is the complement for unique LLM content.
-4. **#5 DM as an automated sequence step** — a `channel:"dm"` step auto-creates a fully-prepared DM task
+3. **#5 DM as an automated sequence step** — a `channel:"dm"` step auto-creates a fully-prepared DM task
    (drafted message + deep link + context) so the human only presses send. Needs a persisted DM-task
    entity + scheduler wiring. (Semi-assisted only — NEVER auto-DM; ToS.)
-5. **#8 web dashboards** (activation, deliverability, funnel, A/B, DM-queue) with charts. Endpoints exist
+4. **#8 web dashboards** (activation, deliverability, funnel, A/B, DM-queue) with charts. Endpoints exist
    (`/recruitment/activation`, `/campaigns/:id/ab`, `/dm-followup`, `deliverabilityHealth`). Big frontend.
 
 **Deferred/lower:** #3 live cadence validation (needs real keys); #10 first-party advocate capture (only

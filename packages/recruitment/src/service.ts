@@ -230,7 +230,7 @@ export async function handleReply(
   deps: RecruitmentDeps,
   prospectId: string,
   raw: string,
-  opts?: { meetingTier?: "A" | "B" | "C"; signupBaseUrl?: string },
+  opts?: { meetingTier?: "A" | "B" | "C"; signupBaseUrl?: string; aiSdrMode?: "hitl" | "autopilot" },
 ): Promise<ReplyOutcome> {
   return routeReply(deps, prospectId, raw, opts);
 }

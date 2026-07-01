@@ -462,6 +462,54 @@ export interface AutomationState {
   sourcingLimitPerCycle: number;
   lastCycleAt: Timestamp | null;
   updatedAt: Timestamp;
+  /**
+   * AI-SDR autonomy. "hitl" (default): grounded answers are queued as a suggested reply on
+   * a handoff for a human to approve; "autopilot": allow-listed grounded answers are marked
+   * safe to auto-send. Topic-gated/ungrounded replies ALWAYS go to a human regardless.
+   */
+  aiSdrMode?: "hitl" | "autopilot";
+}
+
+/**
+ * A small per-merchant knowledge-base entry (OUTREACH-SPEC §16 #11). The AI-SDR answers
+ * ONLY from grounded facts: the serialized Program/Offer + these curated FAQs. Kept small
+ * and in-context (not RAG) — a merchant's KB is a handful of Q&As, prompt-cached per merchant.
+ */
+export interface MerchantFaq {
+  id: Id;
+  merchantId: Id;
+  question: string;
+  answer: string;
+  createdAt: Timestamp;
+}
+
+/**
+ * A human-handoff packet (OUTREACH-SPEC §16 #11). Created whenever a reply must go to a
+ * person: a gated topic (rate negotiation / custom deal / legal / meeting), an ungrounded
+ * question the AI-SDR won't guess at, or (in HITL mode) a grounded answer awaiting approval.
+ * Carries everything the human needs to close in one glance + drives the Notifier.
+ */
+export interface Handoff {
+  id: Id;
+  merchantId: Id;
+  prospectId: Id;
+  replyId: Id | null;
+  /** The gate/topic that routed this to a human (from `topicGate`). */
+  topic: string;
+  intent: Reply["classification"];
+  tier: Tier | null;
+  /** Why a human is needed (gated topic, ungrounded, awaiting approval). */
+  reason: "gated_topic" | "ungrounded" | "approval" | "high_value";
+  /** Short AI (or deterministic) summary of what the prospect said/wants. */
+  summary: string;
+  /** Drafted reply for the human to approve + send (present when the AI had a grounded answer). */
+  suggestedReply: string | null;
+  /** The inbound reply text (the conversation the human is stepping into). */
+  transcript: string;
+  status: "open" | "resolved";
+  assignedUserId: Id | null;
+  createdAt: Timestamp;
+  resolvedAt: Timestamp | null;
 }
 
 /**

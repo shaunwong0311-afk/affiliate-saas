@@ -52,6 +52,9 @@ import {
   CachingEnricher,
   StubCalendarBooking,
   ConsoleTransactionalMailer,
+  StubNotifier,
+  SlackWebhookNotifier,
+  type Notifier,
   type MailboxSender,
   type EmailFinder,
   type EmailVerifier,
@@ -107,6 +110,8 @@ export interface AppContext {
   calendar: CalendarBooking;
   /** Transactional mail (magic links, payout notices) — routed via an ESP, never the box IP. */
   transactionalMailer: TransactionalMailer;
+  /** Push notifier for AI-SDR human handoffs (Slack when keyed; in-process stub otherwise). */
+  notifier: Notifier;
   clock: Clock;
 }
 
@@ -323,6 +328,9 @@ export function createContext(overrides: Partial<AppContext> = {}): AppContext {
     enricher,
     calendar: overrides.calendar ?? new StubCalendarBooking(),
     transactionalMailer: overrides.transactionalMailer ?? new ConsoleTransactionalMailer(),
+    notifier:
+      overrides.notifier ??
+      (process.env.SLACK_WEBHOOK_URL ? new SlackWebhookNotifier({ webhookUrl: process.env.SLACK_WEBHOOK_URL, http: jsonHttp }) : new StubNotifier()),
     clock: overrides.clock ?? systemClock,
   };
 }
