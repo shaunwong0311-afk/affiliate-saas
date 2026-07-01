@@ -11,6 +11,7 @@ import { requireMerchant } from "../auth/middleware.js";
 import { badRequest, notFound } from "../errors.js";
 import { writeAudit } from "../services/audit.js";
 import { assertWithinEntitlement, recordUsage } from "../services/entitlements.js";
+import { sendActivationEmail } from "../services/activation-email.js";
 
 const outcomeLabel = z.enum([
   "bad_fit",
@@ -153,7 +154,10 @@ export const recruitmentRoutes: RouteModule = (app, ctx) => {
       subjectId: id,
       metadata: { affiliateId: result.affiliate.id, relationshipId: result.relationship.id },
     });
-    return ok(reply, { affiliateId: result.affiliate.id, relationshipId: result.relationship.id }, 201);
+    // The conversion made an active relationship → send the activation welcome now
+    // (best-effort + idempotent).
+    const welcome = await sendActivationEmail(ctx, result.relationship.id).catch(() => ({ sent: false as const }));
+    return ok(reply, { affiliateId: result.affiliate.id, relationshipId: result.relationship.id, welcomeEmailSent: welcome.sent }, 201);
   });
 
   // Preview the exact personalized email for a prospect under a campaign (incl. LLM).
@@ -416,6 +420,8 @@ export const recruitmentRoutes: RouteModule = (app, ctx) => {
     const body = parseBody(z.object({ email: z.string().email(), name: z.string().min(1), socialUrl: z.string().url().optional() }), request);
     const result = await applyToJoin(ctx, merchantId, body);
     if (!result) throw notFound("program");
+    // Auto-approval → active immediately → welcome now. Manual → welcome fires on approve.
+    if (result.status === "active") await sendActivationEmail(ctx, result.relationshipId).catch(() => {});
     return ok(reply, result, 201);
   });
 

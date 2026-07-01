@@ -52,6 +52,8 @@ export interface AffiliateRelationship {
    * a producing affiliate can be traced back to the source that found it.
    */
   prospectId: Id | null;
+  /** When the activation/welcome email was sent — idempotency marker (never re-send). */
+  activationEmailSentAt?: Timestamp | null;
 }
 
 export type RelationshipStatus = "pending" | "active" | "paused" | "banned" | "rejected";

@@ -6,6 +6,7 @@ import { parseBody, parseQuery, ok, paginationSchema, paginate } from "./helpers
 import { requireMerchant } from "../auth/middleware.js";
 import { notFound, badRequest } from "../errors.js";
 import { writeAudit } from "../services/audit.js";
+import { sendActivationEmail } from "../services/activation-email.js";
 
 const roleEnum = z.enum(["seller", "recruiter", "both"]);
 const relationshipStatusEnum = z.enum(["pending", "active", "paused", "banned", "rejected"]);
@@ -164,7 +165,10 @@ export const affiliateRoutes: RouteModule = (app, ctx) => {
       subjectType: "relationship",
       subjectId: relationshipId,
     });
-    return ok(reply, updated);
+    // Fire the activation welcome the moment they're approved (best-effort — never fail
+    // the approval on a mail hiccup; it's idempotent so a retry won't double-send).
+    const welcome = await sendActivationEmail(ctx, relationshipId).catch(() => ({ sent: false as const }));
+    return ok(reply, { ...updated, welcomeEmailSent: welcome.sent });
   });
 
   // ---- Reject ---------------------------------------------------------------
@@ -230,6 +234,9 @@ export const affiliateRoutes: RouteModule = (app, ctx) => {
       subjectId: relationship.id,
       metadata: { affiliateId: affiliate.id, programId: program.id, siteUrl: body.siteUrl ?? null },
     });
+    // Auto-approval programs activate immediately → send the welcome now. Manual programs
+    // send it later, on approve. Best-effort + idempotent.
+    if (status === "active") await sendActivationEmail(ctx, relationship.id).catch(() => {});
     return ok(reply, { relationshipId: relationship.id, status }, 201);
   });
 
