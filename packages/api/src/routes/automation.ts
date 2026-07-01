@@ -6,6 +6,8 @@ import {
   tickScheduler,
   sourceYield,
   deliverabilityHealth,
+  mailboxHealth,
+  monitorDeliverability,
   handleReply,
   ingestReplies,
 } from "@affiliate/recruitment";
@@ -71,6 +73,26 @@ export const automationRoutes: RouteModule = (app, ctx) => {
   app.get("/recruitment/deliverability", async (request, reply) => {
     const { merchantId } = await requireMerchant(ctx, request, "read");
     return ok(reply, await deliverabilityHealth(ctx, merchantId));
+  });
+
+  // Per-mailbox deliverability health (the dashboard rows: bounce rate, warmup, cap, status).
+  app.get("/recruitment/deliverability/mailboxes", async (request, reply) => {
+    const { merchantId } = await requireMerchant(ctx, request, "read");
+    const now = ctx.clock.now();
+    const mailboxes = await ctx.db.mailboxes.find((m) => m.merchantId === merchantId && m.status !== "disconnected");
+    const rows = await Promise.all(mailboxes.map((m) => mailboxHealth(ctx, m, now)));
+    return ok(reply, rows);
+  });
+
+  // Run the per-mailbox monitor now (warmup advance + auto-pause on bounce breach). The
+  // scheduler runs this each cycle; this is the on-demand trigger.
+  app.post("/recruitment/deliverability/monitor", async (request, reply) => {
+    const { merchantId } = await requireMerchant(ctx, request, "write");
+    const result = await monitorDeliverability(ctx, merchantId, ctx.clock.now());
+    if (result.paused.length) {
+      await writeAudit(ctx, { merchantId, actorId: null, action: "deliverability.mailboxes_auto_paused", subjectType: "mailbox", subjectId: result.paused[0], metadata: { paused: result.paused, warmed: result.warmed } });
+    }
+    return ok(reply, result);
   });
 
   app.get("/recruitment/source-yield", async (request, reply) => {

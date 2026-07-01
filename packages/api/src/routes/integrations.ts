@@ -177,10 +177,15 @@ export const integrationRoutes: RouteModule = (app, ctx) => {
     const ref = credsRef(id);
     await ctx.secrets.put(ref, JSON.stringify(creds));
     const test = await new SmtpSender({ host: body.host, port: body.port, user: body.user, pass: body.pass, secure: body.secure }).verify();
+    // On a successful connect, start the warmup clock (not_started → warming) so the ramp +
+    // graduation schedule begins; clear any prior auto-pause.
+    const startWarmup = test.ok && mailbox.warmupStatus === "not_started";
     const updated = await ctx.db.mailboxes.update(id, {
       provider: "smtp",
       credentialsRef: ref,
       status: test.ok ? "connected" : "error",
+      autoPausedReason: null,
+      ...(startWarmup ? { warmupStatus: "warming" as const, warmupStartedAt: ctx.clock.now().toISOString() } : {}),
     });
     await writeAudit(ctx, { merchantId, actorId: null, action: "mailbox.connected", subjectType: "mailbox", subjectId: id, metadata: { provider: "smtp", ok: test.ok } });
     return ok(reply, { mailbox: updated, test });
@@ -202,6 +207,17 @@ export const integrationRoutes: RouteModule = (app, ctx) => {
       return ok(reply, test);
     }
     return ok(reply, { ok: mailbox.status === "connected" });
+  });
+
+  // Resume a mailbox the deliverability monitor auto-paused (after fixing the list/source).
+  app.post("/mailboxes/:id/resume", async (request, reply) => {
+    const { merchantId } = await requireMerchant(ctx, request, "admin");
+    const id = (request.params as { id: string }).id;
+    const mailbox = await ctx.db.mailboxes.get(id);
+    if (!mailbox || mailbox.merchantId !== merchantId) throw notFound("mailbox");
+    const updated = await ctx.db.mailboxes.update(id, { status: "connected", autoPausedReason: null });
+    await writeAudit(ctx, { merchantId, actorId: null, action: "mailbox.resumed", subjectType: "mailbox", subjectId: id });
+    return ok(reply, updated);
   });
 
   app.delete("/mailboxes/:id", async (request, reply) => {
@@ -260,7 +276,14 @@ export const integrationRoutes: RouteModule = (app, ctx) => {
       };
       const ref = credsRef(st.mailboxId);
       await ctx.secrets.put(ref, JSON.stringify(creds));
-      await ctx.db.mailboxes.update(st.mailboxId, { provider: provider === "microsoft" ? "microsoft" : "gmail", credentialsRef: ref, status: "connected" });
+      const startWarmup = mailbox.warmupStatus === "not_started";
+      await ctx.db.mailboxes.update(st.mailboxId, {
+        provider: provider === "microsoft" ? "microsoft" : "gmail",
+        credentialsRef: ref,
+        status: "connected",
+        autoPausedReason: null,
+        ...(startWarmup ? { warmupStatus: "warming" as const, warmupStartedAt: ctx.clock.now().toISOString() } : {}),
+      });
       await writeAudit(ctx, { merchantId: st.merchantId, actorId: null, action: "mailbox.connected", subjectType: "mailbox", subjectId: st.mailboxId, metadata: { provider, oauth: true } });
       return reply.redirect(`${appUrl}/#/integrations?connected=${provider}`);
     } catch {

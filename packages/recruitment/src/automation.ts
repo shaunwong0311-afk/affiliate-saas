@@ -6,7 +6,7 @@ import { expandFrontier } from "./frontier.js";
 import { queueFirstTouch, send } from "./pipeline.js";
 import { nextStep, isWithinSendWindow, personalizationDepth } from "./sequencing.js";
 import { renderTemplate } from "@affiliate/integrations";
-import { deliverabilityHealth, pickSendableMailbox } from "./deliverability.js";
+import { deliverabilityHealth, pickSendableMailbox, monitorDeliverability } from "./deliverability.js";
 import { lowYieldSources } from "./learning.js";
 
 /**
@@ -60,16 +60,22 @@ export interface CycleSummary {
   /** Recursive frontier: new competitor seeds promoted this cycle + frontier backlog. */
   frontierPromoted: number;
   frontierPending: number;
+  /** Deliverability monitor: mailboxes auto-paused (bounce breach) + graduated warmup this cycle. */
+  mailboxesPaused: number;
+  mailboxesWarmed: number;
 }
 
 /** Run one autonomous cycle for a merchant. Idempotent and safe to call repeatedly. */
 export async function autonomousCycle(deps: RecruitmentDeps, merchantId: string): Promise<CycleSummary> {
   const state = await getAutomationState(deps, merchantId);
   const now = deps.clock.now();
-  const empty: CycleSummary = { status: state.status, sourced: 0, scored: 0, real: 0, synthetic: 0, autoSent: 0, followUpsSent: 0, heldForReview: 0, circuitOpen: false, prunedSources: [], frontierPromoted: 0, frontierPending: 0 };
+  const empty: CycleSummary = { status: state.status, sourced: 0, scored: 0, real: 0, synthetic: 0, autoSent: 0, followUpsSent: 0, heldForReview: 0, circuitOpen: false, prunedSources: [], frontierPromoted: 0, frontierPending: 0, mailboxesPaused: 0, mailboxesWarmed: 0 };
   if (state.status !== "running") return empty;
 
   const pruned = await lowYieldSources(deps, merchantId);
+  // Per-mailbox deliverability monitor FIRST — auto-pause any burning mailbox + advance warmup
+  // before we pick a sender, so a breaching mailbox drops out of this cycle's rotation.
+  const monitor = await monitorDeliverability(deps, merchantId, now);
   const health = await deliverabilityHealth(deps, merchantId);
 
   // 1) Source + enrich + score (skip pruned low-yield sources).
@@ -124,6 +130,8 @@ export async function autonomousCycle(deps: RecruitmentDeps, merchantId: string)
     prunedSources: [...pruned],
     frontierPromoted: expansion?.promoted.length ?? 0,
     frontierPending: expansion?.frontierPending ?? 0,
+    mailboxesPaused: monitor.paused.length,
+    mailboxesWarmed: monitor.warmed.length,
   };
 }
 

@@ -131,6 +131,10 @@ export interface Mailbox {
   credentialsRef: string;
   /** IMAP reply-poll cursor: replies are fetched with received-time > this. Advanced each poll. */
   lastPolledAt?: Timestamp | null;
+  /** When warmup started — the clock the warming→ready schedule (~21 days) counts from. */
+  warmupStartedAt?: Timestamp | null;
+  /** Set when the deliverability monitor auto-paused this mailbox (bounce breach). Cleared on resume. */
+  autoPausedReason?: string | null;
 }
 
 export interface SendingDomain {
