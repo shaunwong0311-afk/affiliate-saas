@@ -47,6 +47,18 @@ export {
 } from "./enrichers.js";
 export { buildDiscoveryQueries, type PlannedQuery } from "./query-strategy.js";
 export { detectMailProvider, type DetectedProvider, type MailProviderKind, type ConnectMethod } from "./mail-detect.js";
+export {
+  microsoftOAuth,
+  googleOAuth,
+  buildConsentUrl,
+  exchangeCode,
+  refreshAccessToken,
+  MICROSOFT_SCOPES,
+  GOOGLE_SCOPES,
+  type OAuthProviderConfig,
+  type TokenSet,
+  type PostForm,
+} from "./oauth.js";
 export { HashingEmbedder, DeterministicLlm, classifyReply, renderTemplate } from "./llm.js";
 export { AnthropicLlmClient } from "./anthropic-llm.js";
 export { OpenAiCompatibleLlmClient } from "./openai-llm.js";

@@ -18,6 +18,13 @@ export interface AppConfig {
    * with ALLOW_SYNTHETIC_DISCOVERY=true (e.g. a sales demo) or off in dev.
    */
   allowSyntheticDiscovery: boolean;
+  /** Public base URL of THIS API (for OAuth redirect URIs + magic/unsub links). */
+  publicApiUrl: string;
+  /** Mailbox-OAuth client credentials (per provider). Absent → that provider's connect is off. */
+  oauth: {
+    microsoft?: { clientId: string; clientSecret: string };
+    google?: { clientId: string; clientSecret: string };
+  };
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
@@ -38,5 +45,16 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     exposeMagicLink: !isProduction,
     allowSyntheticDiscovery:
       env.ALLOW_SYNTHETIC_DISCOVERY != null ? env.ALLOW_SYNTHETIC_DISCOVERY === "true" : !isProduction,
+    publicApiUrl: env.PUBLIC_API_URL ?? "http://localhost:8787",
+    oauth: {
+      microsoft:
+        env.MS_OAUTH_CLIENT_ID && env.MS_OAUTH_CLIENT_SECRET
+          ? { clientId: env.MS_OAUTH_CLIENT_ID, clientSecret: env.MS_OAUTH_CLIENT_SECRET }
+          : undefined,
+      google:
+        env.GOOGLE_OAUTH_CLIENT_ID && env.GOOGLE_OAUTH_CLIENT_SECRET
+          ? { clientId: env.GOOGLE_OAUTH_CLIENT_ID, clientSecret: env.GOOGLE_OAUTH_CLIENT_SECRET }
+          : undefined,
+    },
   };
 }

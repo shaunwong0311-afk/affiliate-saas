@@ -9,6 +9,7 @@ import {
   PayoutRailRegistry,
   MockMailboxSender,
   buildMailboxSender,
+  refreshAccessToken,
   type MailboxCredentials,
   StubEmailFinder,
   HunterFinder,
@@ -64,6 +65,7 @@ import {
   type TransactionalMailer,
 } from "@affiliate/integrations";
 import { loadConfig, type AppConfig } from "./config.js";
+import { oauthProviderFor } from "./services/oauth.js";
 
 /**
  * AppContext is the dependency container wired once at startup. Everything is an
@@ -248,6 +250,19 @@ export function createContext(overrides: Partial<AppContext> = {}): AppContext {
         creds = JSON.parse(raw) as MailboxCredentials;
       } catch {
         return mailer;
+      }
+      // OAuth rails: refresh the access token if it's expired/expiring, and persist it.
+      if ((creds.kind === "microsoft" || creds.kind === "gmail_oauth") && creds.refreshToken && creds.expiresAt && new Date(creds.expiresAt).getTime() < Date.now() + 60_000) {
+        const cfg = oauthProviderFor(config, creds.kind === "microsoft" ? "microsoft" : "google");
+        if (cfg) {
+          try {
+            const t = await refreshAccessToken(cfg, creds.refreshToken);
+            creds = { ...creds, accessToken: t.accessToken, refreshToken: t.refreshToken ?? creds.refreshToken, expiresAt: t.expiresAt };
+            await secrets.put(mailbox.credentialsRef, JSON.stringify(creds));
+          } catch {
+            /* refresh failed → build with the stale token; the send fails + surfaces as an error */
+          }
+        }
       }
       return buildMailboxSender(creds, { http: jsonHttp });
     });

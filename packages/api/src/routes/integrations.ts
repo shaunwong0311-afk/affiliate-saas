@@ -1,12 +1,13 @@
 import { z } from "zod";
 import { newId } from "@affiliate/core";
-import { detectMailProvider, SmtpSender, type MailboxCredentials } from "@affiliate/integrations";
+import { detectMailProvider, SmtpSender, buildConsentUrl, exchangeCode, type MailboxCredentials } from "@affiliate/integrations";
 import type { MerchantIntegration, Mailbox, SendingDomain } from "@affiliate/db";
 import type { RouteModule } from "./helpers.js";
 import { parseBody, ok } from "./helpers.js";
 import { requireMerchant } from "../auth/middleware.js";
-import { notFound } from "../errors.js";
+import { badRequest, notFound } from "../errors.js";
 import { writeAudit } from "../services/audit.js";
+import { oauthProviderFor, signOAuthState, verifyOAuthState, type OAuthProviderName } from "../services/oauth.js";
 
 /** Secret-store key for a mailbox's encrypted credentials (never stored in the row). */
 const credsRef = (mailboxId: string) => `mailbox:${mailboxId}:creds`;
@@ -217,6 +218,54 @@ export const integrationRoutes: RouteModule = (app, ctx) => {
       subjectId: id,
     });
     return ok(reply, { id, deleted: true });
+  });
+
+  // ---- Mailbox OAuth connect (Microsoft Graph / Gmail) ----------------------
+  // Returns the provider consent URL to redirect the merchant to. State is a signed,
+  // short-lived token carrying the mailbox target (anti-CSRF).
+  app.post("/mailboxes/:id/connect/:provider", async (request, reply) => {
+    const { merchantId } = await requireMerchant(ctx, request, "admin");
+    const id = (request.params as { id: string }).id;
+    const provider = (request.params as { provider: string }).provider as OAuthProviderName;
+    if (provider !== "microsoft" && provider !== "google") throw badRequest("unknown provider");
+    const mailbox = await ctx.db.mailboxes.get(id);
+    if (!mailbox || mailbox.merchantId !== merchantId) throw notFound("mailbox");
+    const cfg = oauthProviderFor(ctx.config, provider);
+    if (!cfg) throw badRequest(`${provider} OAuth is not configured on this server`);
+    const state = signOAuthState({ mailboxId: id, merchantId, provider }, ctx.config.jwtSecret);
+    return ok(reply, { consentUrl: buildConsentUrl(cfg, state, { loginHint: mailbox.email }) });
+  });
+
+  // The provider redirects the merchant's browser here after consent (public — no JWT;
+  // the signed state carries the identity). We exchange the code + store the tokens.
+  app.get("/oauth/:provider/callback", async (request, reply) => {
+    const provider = (request.params as { provider: string }).provider as OAuthProviderName;
+    const q = request.query as { code?: string; state?: string; error?: string };
+    const appUrl = ctx.config.corsOrigins[0] ?? "http://localhost:5173";
+    if (q.error) return reply.redirect(`${appUrl}/#/integrations?oauth_error=${encodeURIComponent(q.error)}`);
+    const st = q.state ? verifyOAuthState(q.state, ctx.config.jwtSecret) : null;
+    const cfg = oauthProviderFor(ctx.config, provider);
+    if (!st || st.provider !== provider || !q.code || !cfg) {
+      return reply.type("text/html").send("<p>Invalid or expired connection request. Please try connecting again.</p>");
+    }
+    const mailbox = await ctx.db.mailboxes.get(st.mailboxId);
+    if (!mailbox || mailbox.merchantId !== st.merchantId) return reply.type("text/html").send("<p>Mailbox not found.</p>");
+    try {
+      const tokens = await exchangeCode(cfg, q.code);
+      const creds: MailboxCredentials = {
+        kind: provider === "microsoft" ? "microsoft" : "gmail_oauth",
+        accessToken: tokens.accessToken,
+        refreshToken: tokens.refreshToken ?? undefined,
+        expiresAt: tokens.expiresAt,
+      };
+      const ref = credsRef(st.mailboxId);
+      await ctx.secrets.put(ref, JSON.stringify(creds));
+      await ctx.db.mailboxes.update(st.mailboxId, { provider: provider === "microsoft" ? "microsoft" : "gmail", credentialsRef: ref, status: "connected" });
+      await writeAudit(ctx, { merchantId: st.merchantId, actorId: null, action: "mailbox.connected", subjectType: "mailbox", subjectId: st.mailboxId, metadata: { provider, oauth: true } });
+      return reply.redirect(`${appUrl}/#/integrations?connected=${provider}`);
+    } catch {
+      return reply.type("text/html").send("<p>Connection failed — the authorization may have expired. Close this window and try again.</p>");
+    }
   });
 
   // ---- Sending domains ------------------------------------------------------
