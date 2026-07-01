@@ -45,6 +45,7 @@ import type {
   FrontierMerchant,
   MerchantFaq,
   Handoff,
+  DmTask,
   ApiKey,
   WebhookSubscription,
 } from "./entities.js";
@@ -134,6 +135,7 @@ export interface Database {
   frontierMerchants: Repo<FrontierMerchant>;
   merchantFaqs: Repo<MerchantFaq>;
   handoffs: Repo<Handoff>;
+  dmTasks: Repo<DmTask>;
 
   // API surface
   apiKeys: Repo<ApiKey>;

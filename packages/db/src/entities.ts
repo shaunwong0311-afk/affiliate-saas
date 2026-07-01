@@ -477,6 +477,30 @@ export interface AutomationState {
 }
 
 /**
+ * A prepared DM task (OUTREACH-SPEC §16 #5). When a sequence reaches a `channel:"dm"` step the
+ * engine auto-drafts everything — the message, the best handle from the identity graph, and a
+ * deep link to the native composer — and drops it here for the operator. Semi-assisted by design:
+ * we NEVER auto-send a DM (against every platform's ToS); the human presses send. "skipped" marks
+ * a step we couldn't prepare (no DM-able handle) so the cadence still advances past it.
+ */
+export interface DmTask {
+  id: Id;
+  merchantId: Id;
+  prospectId: Id;
+  campaignId: Id;
+  step: number;
+  platform: string;
+  handle: string;
+  deepLink: string | null;
+  opensComposer: boolean;
+  message: string;
+  context: string;
+  status: "pending" | "sent" | "skipped";
+  createdAt: Timestamp;
+  sentAt: Timestamp | null;
+}
+
+/**
  * A small per-merchant knowledge-base entry (OUTREACH-SPEC §16 #11). The AI-SDR answers
  * ONLY from grounded facts: the serialized Program/Offer + these curated FAQs. Kept small
  * and in-context (not RAG) — a merchant's KB is a handful of Q&As, prompt-cached per merchant.

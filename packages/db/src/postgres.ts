@@ -65,6 +65,7 @@ const TABLES: Record<string, { table: string; idCol: string }> = {
   frontierMerchants: { table: "kv_frontier_merchants", idCol: "id" },
   merchantFaqs: { table: "kv_merchant_faqs", idCol: "id" },
   handoffs: { table: "kv_handoffs", idCol: "id" },
+  dmTasks: { table: "kv_dm_tasks", idCol: "id" },
   apiKeys: { table: "kv_api_keys", idCol: "id" },
   webhookSubscriptions: { table: "kv_webhook_subscriptions", idCol: "id" },
 };

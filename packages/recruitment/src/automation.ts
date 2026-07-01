@@ -8,6 +8,9 @@ import { nextStep, isWithinSendWindow, personalizationDepth } from "./sequencing
 import { renderTemplate } from "@affiliate/integrations";
 import { deliverabilityHealth, pickSendableMailbox, monitorDeliverability } from "./deliverability.js";
 import { lowYieldSources } from "./learning.js";
+import { draftDm } from "./dm.js";
+import { evidenceSummary } from "./personalization.js";
+import type { DmTask } from "@affiliate/db";
 
 /**
  * The autonomous "from-scratch" engine (the agreed L4-with-gates target). One
@@ -63,13 +66,15 @@ export interface CycleSummary {
   /** Deliverability monitor: mailboxes auto-paused (bounce breach) + graduated warmup this cycle. */
   mailboxesPaused: number;
   mailboxesWarmed: number;
+  /** DM sequence steps that auto-created a prepared DM task for the operator this cycle. */
+  dmTasksCreated: number;
 }
 
 /** Run one autonomous cycle for a merchant. Idempotent and safe to call repeatedly. */
 export async function autonomousCycle(deps: RecruitmentDeps, merchantId: string): Promise<CycleSummary> {
   const state = await getAutomationState(deps, merchantId);
   const now = deps.clock.now();
-  const empty: CycleSummary = { status: state.status, sourced: 0, scored: 0, real: 0, synthetic: 0, autoSent: 0, followUpsSent: 0, heldForReview: 0, circuitOpen: false, prunedSources: [], frontierPromoted: 0, frontierPending: 0, mailboxesPaused: 0, mailboxesWarmed: 0 };
+  const empty: CycleSummary = { status: state.status, sourced: 0, scored: 0, real: 0, synthetic: 0, autoSent: 0, followUpsSent: 0, heldForReview: 0, circuitOpen: false, prunedSources: [], frontierPromoted: 0, frontierPending: 0, mailboxesPaused: 0, mailboxesWarmed: 0, dmTasksCreated: 0 };
   if (state.status !== "running") return empty;
 
   const pruned = await lowYieldSources(deps, merchantId);
@@ -110,10 +115,13 @@ export async function autonomousCycle(deps: RecruitmentDeps, merchantId: string)
     heldForReview = await deps.db.prospects.count((p) => p.merchantId === merchantId && p.state === "scored");
   }
 
-  // 3) Advance multi-step sequences (follow-ups / breakup) with hard stops.
+  // 3) Advance multi-step sequences (follow-ups / breakup / DM steps) with hard stops.
   let followUpsSent = 0;
+  let dmTasksCreated = 0;
   if (campaign && !health.circuitOpen) {
-    followUpsSent = await advanceSequences(deps, merchantId, campaign, now);
+    const adv = await advanceSequences(deps, merchantId, campaign, now);
+    followUpsSent = adv.emailsSent;
+    dmTasksCreated = adv.dmTasksCreated;
   }
 
   await setAutomationState(deps, merchantId, { lastCycleAt: now.toISOString() });
@@ -132,28 +140,59 @@ export async function autonomousCycle(deps: RecruitmentDeps, merchantId: string)
     frontierPending: expansion?.frontierPending ?? 0,
     mailboxesPaused: monitor.paused.length,
     mailboxesWarmed: monitor.warmed.length,
+    dmTasksCreated,
   };
 }
 
-/** Send the next sequence step to prospects mid-cadence whose delay has elapsed. */
-export async function advanceSequences(deps: RecruitmentDeps, merchantId: string, campaign: OutreachCampaign, now: Date): Promise<number> {
-  if (!isWithinSendWindow(campaign, now)) return 0;
+/**
+ * Advance mid-cadence prospects whose delay has elapsed. Email steps send as the merchant;
+ * `channel:"dm"` steps auto-create a fully-prepared DM task (draft + best handle + deep link)
+ * for the operator to send by hand — NEVER auto-DM (ToS). The cadence pointer advances across
+ * BOTH channels, so an email→DM→email sequence flows; a DM step with no DM-able handle records
+ * a "skipped" task so the prospect doesn't get stuck on it.
+ */
+export async function advanceSequences(
+  deps: RecruitmentDeps,
+  merchantId: string,
+  campaign: OutreachCampaign,
+  now: Date,
+): Promise<{ emailsSent: number; dmTasksCreated: number }> {
+  if (!isWithinSendWindow(campaign, now)) return { emailsSent: 0, dmTasksCreated: 0 };
   const active = await deps.db.prospects.find(
     (p) => p.merchantId === merchantId && (p.state === "contacted" || p.state === "in_sequence") && !!p.email,
   );
-  let sent = 0;
+  let emailsSent = 0;
+  let dmTasksCreated = 0;
   for (const p of active) {
-    const msgs = (await deps.db.outreachMessages.find((m) => m.prospectId === p.id && m.campaignId === campaign.id && m.status === "sent")).sort(
-      (a, b) => b.step - a.step,
-    );
-    const last = msgs[0];
-    if (!last) continue;
-    const next = nextStep(campaign, last.step);
-    if (!next) continue; // sequence exhausted (breakup already sent)
-    const lastSentMs = last.sentAt ? new Date(last.sentAt).getTime() : 0;
-    if (now.getTime() - lastSentMs < next.delayDays * 86_400_000) continue; // not due yet
-    if (!(await capacityAvailable(deps, merchantId, campaign, now))) break;
+    const sentMsgs = (await deps.db.outreachMessages.find((m) => m.prospectId === p.id && m.campaignId === campaign.id && m.status === "sent")).sort((a, b) => b.step - a.step);
+    const dmTasks = (await deps.db.dmTasks.find((t) => t.prospectId === p.id && t.campaignId === campaign.id)).sort((a, b) => b.step - a.step);
+    // Cadence position = the furthest step reached on EITHER channel.
+    const lastStep = Math.max(sentMsgs[0]?.step ?? 0, dmTasks[0]?.step ?? 0);
+    if (lastStep === 0) continue; // never first-touched
+    const next = nextStep(campaign, lastStep);
+    if (!next) continue; // sequence exhausted
 
+    const lastActivityMs = Math.max(
+      sentMsgs[0]?.sentAt ? new Date(sentMsgs[0].sentAt).getTime() : 0,
+      dmTasks[0]?.createdAt ? new Date(dmTasks[0].createdAt).getTime() : 0,
+    );
+    if (now.getTime() - lastActivityMs < next.delayDays * 86_400_000) continue; // not due yet
+
+    if (next.channel === "dm") {
+      if (dmTasks.some((t) => t.step === next.step)) continue; // already prepared (idempotent)
+      const merchant = await deps.db.merchants.require(merchantId);
+      const draft = await draftDm(deps, merchant, p);
+      const base = { id: newId("dmt"), merchantId, prospectId: p.id, campaignId: campaign.id, step: next.step, createdAt: now.toISOString(), sentAt: null };
+      const task: DmTask = draft
+        ? { ...base, platform: draft.target.platform, handle: draft.target.handle, deepLink: draft.target.deepLink, opensComposer: draft.target.opensComposer, message: draft.message, context: evidenceSummary(merchant, p), status: "pending" }
+        : { ...base, platform: "", handle: "", deepLink: null, opensComposer: false, message: "", context: "no DM-able handle in the profile graph", status: "skipped" };
+      await deps.db.dmTasks.insert(task);
+      if (draft) dmTasksCreated += 1;
+      continue;
+    }
+
+    // Email step.
+    if (!(await capacityAvailable(deps, merchantId, campaign, now))) break;
     const depth = personalizationDepth(p.tier);
     const tokens = { name: p.identity, merchant: "", offer: "", angle: depth === "deep" ? "Following up — still a strong fit." : "Circling back." };
     const message = await deps.db.outreachMessages.insert({
@@ -168,9 +207,9 @@ export async function advanceSequences(deps: RecruitmentDeps, merchantId: string
       status: "queued",
     });
     const result = await send(deps, message.id);
-    if (result.status === "sent") sent += 1;
+    if (result.status === "sent") emailsSent += 1;
   }
-  return sent;
+  return { emailsSent, dmTasksCreated };
 }
 
 async function activeCampaign(deps: RecruitmentDeps, merchantId: string): Promise<OutreachCampaign | null> {

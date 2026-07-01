@@ -392,6 +392,52 @@ export const recruitmentRoutes: RouteModule = (app, ctx) => {
     return ok(reply, { recorded: true });
   });
 
+  // ---- Prepared DM-task queue (sequence-generated; the human just presses send) ----
+  // A `channel:"dm"` sequence step auto-creates these — message drafted, best handle picked,
+  // deep link ready. The operator works the queue and marks each sent (or skips).
+  app.get("/recruitment/dm-tasks", async (request, reply) => {
+    const { merchantId } = await requireMerchant(ctx, request, "read");
+    const q = parseQuery(z.object({ status: z.enum(["pending", "sent", "skipped"]).optional() }), request);
+    const tasks = await ctx.db.dmTasks.find((t) => t.merchantId === merchantId && (q.status ? t.status === q.status : true));
+    const withProspect = await Promise.all(
+      tasks
+        .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+        .map(async (t) => ({ ...t, prospect: await ctx.db.prospects.get(t.prospectId).then((p) => (p ? { identity: p.identity, tier: p.tier, score: p.score } : null)) })),
+    );
+    return ok(reply, withProspect);
+  });
+
+  // Operator sent the prepared DM. Marks the task sent, advances the prospect, and — if they
+  // pasted the creator's DM reply — routes it through the same AI-SDR two-track handler.
+  app.post("/recruitment/dm-tasks/:id/sent", async (request, reply) => {
+    const { merchantId } = await requireMerchant(ctx, request, "write");
+    const id = (request.params as { id: string }).id;
+    const task = await ctx.db.dmTasks.get(id);
+    if (!task || task.merchantId !== merchantId) throw notFound("dm task");
+    const body = parseBody(z.object({ reply: z.string().optional() }), request);
+    const now = ctx.clock.now().toISOString();
+    await ctx.db.dmTasks.update(id, { status: "sent", sentAt: now });
+    await writeAudit(ctx, { merchantId, actorId: null, action: "recruitment.dm_task.sent", subjectType: "prospect", subjectId: task.prospectId, metadata: { platform: task.platform, step: task.step } });
+    const prospect = await ctx.db.prospects.get(task.prospectId);
+    if (prospect && (prospect.state === "scored" || prospect.state === "queued")) await ctx.db.prospects.update(prospect.id, { state: "contacted", updatedAt: now });
+    if (body.reply?.trim()) {
+      const state = await getAutomationState(ctx, merchantId);
+      const outcome = await handleReply(ctx, task.prospectId, body.reply, { meetingTier: state.meetingTier, aiSdrMode: state.aiSdrMode });
+      return ok(reply, { recorded: true, outcome });
+    }
+    return ok(reply, { recorded: true });
+  });
+
+  // Skip a prepared DM (not a fit / wrong handle) — advances the cadence past it.
+  app.post("/recruitment/dm-tasks/:id/skip", async (request, reply) => {
+    const { merchantId } = await requireMerchant(ctx, request, "write");
+    const id = (request.params as { id: string }).id;
+    const task = await ctx.db.dmTasks.get(id);
+    if (!task || task.merchantId !== merchantId) throw notFound("dm task");
+    const updated = await ctx.db.dmTasks.update(id, { status: "skipped" });
+    return ok(reply, updated);
+  });
+
   // ---- Activation analytics (the recruitment ROI metric) --------------------
   app.get("/recruitment/activation", async (request, reply) => {
     const { merchantId } = await requireMerchant(ctx, request, "read");
