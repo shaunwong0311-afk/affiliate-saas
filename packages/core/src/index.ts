@@ -36,6 +36,7 @@ export * from "./recruitment/audience-overlap.js";
 export * from "./recruitment/triage.js";
 export * from "./recruitment/activation-email.js";
 export * from "./recruitment/ai-sdr.js";
+export * from "./recruitment/content-gate.js";
 
 // ---- Creator identity graph (profile-graph plan) ----------------------------
 export * from "./profile/identity.js";

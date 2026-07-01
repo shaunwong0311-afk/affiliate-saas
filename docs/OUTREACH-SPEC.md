@@ -283,7 +283,7 @@ if we stop wanting to maintain OAuth plumbing or move upmarket to locked-down en
 
 ## 16. Build log + research decisions + REMAINING QUEUE (resume here after compaction)
 
-**Built + committed (green, 364 tests):** Phase 1 (SMTP send-as-merchant, Smart Connect,
+**Built + committed (green, 373 tests):** Phase 1 (SMTP send-as-merchant, Smart Connect,
 personalization plans, conversion seam, inbound `applyToJoin`, reply processing) · competitive-gap
 A–D (List-Unsubscribe RFC 8058, DKIM verify, cadence cap, activation metrics + fast-start,
 send-time/timezone, A/B variants, seed-send, DM-assist + `dm-followup` queue) · **mailbox OAuth
@@ -314,16 +314,20 @@ connect, graduate warming→ready after ~21 days); wired into `autonomousCycle`;
 `autoPausedReason`; routes `GET /recruitment/deliverability/mailboxes`, `POST /recruitment/deliverability/
 monitor`, `POST /mailboxes/:id/resume`).
 
+Also built: **pre-send content gate** (`core/recruitment/content-gate.ts` `scanContent` — pure,
+deterministic spam/deliverability scan: empty-field/severe-spam/link-flood → BLOCK; mild spam phrases/
+caps/shorteners/length/fake-Re: → WARN; wired into `pipeline.ts send()` — a block fails the message with
+`OutreachMessage.blockedReason` instead of sending; surfaced in `previewOutreach.scan` + `POST
+/recruitment/content-scan`). The optional cheap-LLM "off-brand?" pass is a documented call-site add-on.
+
 **REMAINING QUEUE — priority order (this is the "what's next"):**
 
-1. **#7 pre-send content gate** on EVERY personalized email (spam-word/link/length/subject scan + optional
-   cheap-LLM "spammy/off-brand?" check). NOTE: seed-test = infra/placement on a representative sample
-   (already built); this per-email gate is the complement for unique LLM content.
-2. **#5 DM as an automated sequence step** — a `channel:"dm"` step auto-creates a fully-prepared DM task
+1. **#5 DM as an automated sequence step** — a `channel:"dm"` step auto-creates a fully-prepared DM task
    (drafted message + deep link + context) so the human only presses send. Needs a persisted DM-task
    entity + scheduler wiring. (Semi-assisted only — NEVER auto-DM; ToS.)
-3. **#8 web dashboards** (activation, deliverability, funnel, A/B, DM-queue) with charts. Endpoints exist
-   (`/recruitment/activation`, `/campaigns/:id/ab`, `/dm-followup`, `deliverabilityHealth`). Big frontend.
+2. **#8 web dashboards** (activation, deliverability, funnel, A/B, DM-queue, handoffs) with charts. Endpoints
+   exist (`/recruitment/activation`, `/campaigns/:id/ab`, `/dm-followup`, `deliverability/mailboxes`,
+   `/handoffs`). Big frontend.
 
 **Deferred/lower:** #3 live cadence validation (needs real keys); #10 first-party advocate capture (only
 merchants with a customer base); SES dedicated-domain rail; calendar + payout rails.

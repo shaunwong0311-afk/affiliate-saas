@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { newId } from "@affiliate/core";
+import { newId, scanContent } from "@affiliate/core";
 import { parseInboundWebhook } from "@affiliate/integrations";
 import type { OutreachCampaign, Suppression } from "@affiliate/db";
 import { runSourcing, processBacklog, launchCampaign, handleReply, recordOutcome, draftOutreach, expandFrontier, convertProspectToAffiliate, previewOutreach, processInboundReply, activationMetrics, draftDm, bestDmTarget, dmFollowupTargets, abResults, applyToJoin, firstStep, getAutomationState } from "@affiliate/recruitment";
@@ -214,6 +214,13 @@ export const recruitmentRoutes: RouteModule = (app, ctx) => {
     const state = await getAutomationState(ctx, merchantId);
     const result = await handleReply(ctx, id, body.raw, { meetingTier: state.meetingTier, aiSdrMode: state.aiSdrMode });
     return ok(reply, result);
+  });
+
+  // ---- Pre-send content gate (compose-time spam/deliverability check) -------
+  app.post("/recruitment/content-scan", async (request, reply) => {
+    await requireMerchant(ctx, request, "read");
+    const body = parseBody(z.object({ subject: z.string(), body: z.string() }), request);
+    return ok(reply, scanContent({ subject: body.subject, body: body.body }));
   });
 
   // ---- Campaigns ------------------------------------------------------------

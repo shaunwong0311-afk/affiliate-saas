@@ -14,6 +14,7 @@ import {
   hasIdentitySignal,
   audienceOverlapScore,
   targetMarketForCurrency,
+  scanContent,
   type ScoringSignals,
   type AffiliateSignal,
   type Tier,
@@ -482,7 +483,7 @@ export async function previewOutreach(
   deps: RecruitmentDeps,
   prospectId: string,
   campaign: OutreachCampaign,
-): Promise<{ subject: string; body: string; mode: "template" | "llm" } | null> {
+): Promise<{ subject: string; body: string; mode: "template" | "llm"; scan: ReturnType<typeof scanContent> } | null> {
   const prospect = await deps.db.prospects.require(prospectId);
   const step = firstStep(campaign);
   if (!step) return null;
@@ -499,7 +500,9 @@ export async function previewOutreach(
           ? "Your content is a great match for our products."
           : "Thought our affiliate program might interest you.",
   };
-  return personalizeOutreach(deps, { merchant, prospect, step, tokens });
+  const rendered = await personalizeOutreach(deps, { merchant, prospect, step, tokens });
+  // Surface the pre-send content gate in the preview so the operator sees issues before launch.
+  return { ...rendered, scan: scanContent({ subject: rendered.subject, body: rendered.body }) };
 }
 
 // ---- 4b. Send a queued message as the merchant ------------------------------
@@ -517,6 +520,18 @@ export async function send(deps: RecruitmentDeps, messageId: string): Promise<Ou
   // Geo-gate EU/Canada cold outreach (Section 8.9 — GDPR/CASL are strict/high-risk).
   if (prospect.country && GEO_GATED.has(prospect.country.toUpperCase())) {
     return deps.db.outreachMessages.update(messageId, { status: "failed" });
+  }
+
+  // Pre-send content gate (§16 #7): scan the personalized subject+body BEFORE it leaves. A
+  // hard-block (empty field, egregious spam) fails the send with a reason for the operator to
+  // fix, rather than burning domain reputation. Warnings pass through. Scans the raw personalized
+  // content (the compliance footer's unsubscribe link is added after + is legitimate).
+  const scan = scanContent({ subject: message.subject, body: message.body });
+  if (!scan.ok) {
+    return deps.db.outreachMessages.update(messageId, {
+      status: "failed",
+      blockedReason: `content gate: ${scan.issues.filter((i) => i.severity === "block").map((i) => i.message).join("; ")}`,
+    });
   }
 
   const mailbox = campaign.mailboxId ? await deps.db.mailboxes.get(campaign.mailboxId) : null;

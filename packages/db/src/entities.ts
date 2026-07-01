@@ -390,6 +390,8 @@ export interface OutreachMessage {
   body: string;
   sentAt: Timestamp | null;
   status: "queued" | "sent" | "bounced" | "replied" | "failed";
+  /** Why the pre-send content gate blocked this message (when status "failed" from the gate). */
+  blockedReason?: string;
 }
 
 export interface Reply {
