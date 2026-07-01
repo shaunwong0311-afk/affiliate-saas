@@ -7,6 +7,7 @@ import {
   sourceYield,
   deliverabilityHealth,
   handleReply,
+  ingestReplies,
 } from "@affiliate/recruitment";
 import { parseInboundWebhook } from "@affiliate/integrations";
 import { verifyHmacSignature } from "@affiliate/core";
@@ -133,6 +134,15 @@ export const automationRoutes: RouteModule = (app, ctx) => {
     const state = await getAutomationState(ctx, merchantId);
     const outcome = await handleReply(ctx, id, body.raw, { meetingTier: state.meetingTier });
     return ok(reply, outcome);
+  });
+
+  // ---- Poll the merchant's connected mailboxes for new replies (SMTP-rail IMAP) ----
+  // The scheduler does this every tick; this is the on-demand "check for replies now"
+  // button. PEEK-only + Message-Id dedup, so it's safe to call repeatedly.
+  app.post("/recruitment/ingest-replies", async (request, reply) => {
+    const { merchantId } = await requireMerchant(ctx, request, "write");
+    const summary = await ingestReplies(ctx, { merchantId });
+    return ok(reply, summary);
   });
 
   void tickScheduler;

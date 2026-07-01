@@ -129,6 +129,8 @@ export interface Mailbox {
   dailyCap: number;
   warmupStatus: "not_started" | "warming" | "ready";
   credentialsRef: string;
+  /** IMAP reply-poll cursor: replies are fetched with received-time > this. Advanced each poll. */
+  lastPolledAt?: Timestamp | null;
 }
 
 export interface SendingDomain {
@@ -393,6 +395,8 @@ export interface Reply {
   classification: "interested" | "question" | "not_interested" | "out_of_office" | "unsubscribe" | "unknown";
   handledBy: string | null; // user id or 'ai_sdr'
   ts: Timestamp;
+  /** Provider Message-Id of the inbound email (IMAP/webhook), for cross-tick dedup. */
+  inboundMessageId?: string;
 }
 
 export interface Suppression {

@@ -4,12 +4,14 @@ import {
   systemClock,
   type Clock,
 } from "@affiliate/core";
-import { createMemoryDatabase, type Database } from "@affiliate/db";
+import { createMemoryDatabase, type Database, type Mailbox } from "@affiliate/db";
 import {
   PayoutRailRegistry,
   MockMailboxSender,
   buildMailboxSender,
   refreshAccessToken,
+  ImapReplyIngestion,
+  type InboundReply,
   type MailboxCredentials,
   StubEmailFinder,
   HunterFinder,
@@ -84,6 +86,9 @@ export interface AppContext {
   /** Resolves the per-campaign send-as-the-merchant sender from the connected mailbox's
    * encrypted credentials (SMTP/Graph/Gmail). Falls back to `mailer` when none is connected. */
   mailboxResolver: (mailboxId: string | null) => Promise<MailboxSender>;
+  /** Pulls new inbound replies for a mailbox (SMTP-rail IMAP poll; PEEK-only). Returns []
+   * for mailboxes it can't poll (OAuth rails, no IMAP config). The scheduler dedups + routes. */
+  replyPoller: (mailbox: Mailbox) => Promise<InboundReply[]>;
   emailFinder: EmailFinder;
   embedder: Embedder;
   llm: LlmClient;
@@ -267,6 +272,37 @@ export function createContext(overrides: Partial<AppContext> = {}): AppContext {
       return buildMailboxSender(creds, { http: jsonHttp });
     });
 
+  // Inbound: pull replies for a mailbox over IMAP (the SMTP rail's read side). Loads the
+  // mailbox's encrypted IMAP creds, fetches mail newer than its cursor WITHOUT touching the
+  // \Seen flag (it's the merchant's real inbox), and normalizes to InboundReply. OAuth rails
+  // return [] here — their inbound arrives via Graph/Gmail (a later rung) or the webhook.
+  const replyPoller =
+    overrides.replyPoller ??
+    (async (mailbox: Mailbox): Promise<InboundReply[]> => {
+      if (!mailbox.credentialsRef) return [];
+      const raw = await secrets.get(mailbox.credentialsRef);
+      if (!raw) return [];
+      let creds: MailboxCredentials;
+      try {
+        creds = JSON.parse(raw) as MailboxCredentials;
+      } catch {
+        return [];
+      }
+      if (creds.kind !== "smtp" || !creds.imapHost || !creds.user || creds.pass == null) return [];
+      const since = mailbox.lastPolledAt ? new Date(mailbox.lastPolledAt) : null;
+      const poller = new ImapReplyIngestion({
+        config: {
+          host: creds.imapHost,
+          port: creds.imapPort ?? 993,
+          user: creds.user,
+          pass: creds.pass,
+          secure: (creds.imapPort ?? 993) === 993,
+        },
+        since,
+      });
+      return poller.poll();
+    });
+
   return {
     config,
     db,
@@ -274,6 +310,7 @@ export function createContext(overrides: Partial<AppContext> = {}): AppContext {
     rails: overrides.rails ?? new PayoutRailRegistry(),
     mailer,
     mailboxResolver,
+    replyPoller,
     emailFinder,
     embedder,
     llm,

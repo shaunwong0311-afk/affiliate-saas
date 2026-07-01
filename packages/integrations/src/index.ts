@@ -93,10 +93,15 @@ export {
 } from "./calendar.js";
 export {
   ImapReplyIngestion,
+  defaultImapSessionFactory,
   extractReplyText,
   parseInboundWebhook,
   type ReplyIngestionSource,
   type InboundReply,
+  type ImapConfig,
+  type ImapMessage,
+  type ImapSession,
+  type ImapSessionFactory,
 } from "./reply-ingestion.js";
 export {
   ConsoleTransactionalMailer,

@@ -18,6 +18,7 @@ import { InMemoryQueue, type JobQueue } from "./queue.js";
 import type { RecruitmentDeps } from "./deps.js";
 import { enrich, score, send } from "./pipeline.js";
 import { autonomousCycle } from "./automation.js";
+import { ingestReplies } from "./reply-router.js";
 
 /**
  * Stage workers over a durable queue (Section 8.7). Each stage is registered as a
@@ -53,13 +54,17 @@ export function buildQueue(): JobQueue {
  * breaker and the HITL tier). In production this is a cron/interval; here it is a
  * single `tick()` plus a `loop()` so it is testable and embeddable.
  */
-export async function tickScheduler(deps: RecruitmentDeps): Promise<{ merchants: number; cycles: unknown[] }> {
+export async function tickScheduler(deps: RecruitmentDeps): Promise<{ merchants: number; cycles: unknown[]; replies: { mailboxes: number; polled: number; matched: number } }> {
   const states = await deps.db.automationStates.find((s) => s.status === "running");
   const cycles: unknown[] = [];
   for (const state of states) {
     cycles.push(await autonomousCycle(deps, state.merchantId));
   }
-  return { merchants: states.length, cycles };
+  // Pull inbound replies (SMTP-rail IMAP poll) across ALL connected mailboxes — replies
+  // must be ingested even for merchants whose outbound automation is paused, so a human
+  // who paused sending still sees answers + sequences still stop on reply.
+  const replies = await ingestReplies(deps).catch(() => ({ mailboxes: 0, polled: 0, matched: 0 }));
+  return { merchants: states.length, cycles, replies };
 }
 
 export interface SchedulerHandle {

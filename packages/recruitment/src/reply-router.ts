@@ -141,6 +141,59 @@ export async function processInboundReply(
   return { matched: true, prospectId: prospect.id, outcome };
 }
 
+/**
+ * Poll every connected mailbox for new inbound replies and route them (the SMTP-rail
+ * automation loop; the webhook path is the push equivalent). For each mailbox: pull via
+ * `deps.replyPoller` (loads IMAP creds, fetches mail newer than the mailbox cursor without
+ * mutating flags), dedup by Message-Id (so the day-granular IMAP window can't double-route),
+ * route through `processInboundReply` with the merchant's own meeting tier, stamp the reply's
+ * `inboundMessageId`, then advance the mailbox cursor. Safe to call every scheduler tick.
+ */
+export async function ingestReplies(
+  deps: RecruitmentDeps,
+  opts: { signupBaseUrl?: string; merchantId?: string } = {},
+): Promise<{ mailboxes: number; polled: number; matched: number }> {
+  if (!deps.replyPoller) return { mailboxes: 0, polled: 0, matched: 0 };
+  const mailboxes = await deps.db.mailboxes.find(
+    (m) => m.status !== "disconnected" && !!m.credentialsRef && (!opts.merchantId || m.merchantId === opts.merchantId),
+  );
+  const meetingTierByMerchant = new Map<string, Tier>();
+  let polled = 0;
+  let matched = 0;
+  let mailboxesPolled = 0;
+  for (const mailbox of mailboxes) {
+    const pollStart = deps.clock.now().toISOString();
+    let replies;
+    try {
+      replies = await deps.replyPoller(mailbox);
+    } catch {
+      continue; // isolate one mailbox's transport failure from the rest
+    }
+    mailboxesPolled++;
+    if (!meetingTierByMerchant.has(mailbox.merchantId)) {
+      const state = await deps.db.automationStates.get(mailbox.merchantId);
+      meetingTierByMerchant.set(mailbox.merchantId, (state?.meetingTier as Tier) ?? "A");
+    }
+    const meetingTier = meetingTierByMerchant.get(mailbox.merchantId)!;
+    for (const inbound of replies) {
+      polled++;
+      if (inbound.messageId) {
+        const seen = await deps.db.replies.findOne((r) => r.inboundMessageId === inbound.messageId);
+        if (seen) continue;
+      }
+      const res = await processInboundReply(deps, inbound, { meetingTier, signupBaseUrl: opts.signupBaseUrl });
+      if (res.matched && res.outcome) {
+        matched++;
+        if (inbound.messageId) await deps.db.replies.update(res.outcome.reply.id, { inboundMessageId: inbound.messageId });
+      }
+    }
+    // Advance the cursor to the poll start (a small look-back overlap next time is
+    // harmless — Message-Id dedup absorbs it, and it guards against clock skew).
+    await deps.db.mailboxes.update(mailbox.id, { lastPolledAt: pollStart });
+  }
+  return { mailboxes: mailboxesPolled, polled, matched };
+}
+
 /** Use the real LLM for intent when available; fall back to the keyword classifier. */
 async function classify(deps: RecruitmentDeps, raw: string): Promise<Reply["classification"]> {
   if (deps.llm.model === "deterministic-llm-v1") {

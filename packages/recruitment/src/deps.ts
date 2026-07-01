@@ -1,5 +1,5 @@
 import type { Clock } from "@affiliate/core";
-import type { Database } from "@affiliate/db";
+import type { Database, Mailbox } from "@affiliate/db";
 import type {
   AccountEnricher,
   DiscoverySource,
@@ -7,6 +7,7 @@ import type {
   EmailVerifier,
   Embedder,
   HttpFetcher,
+  InboundReply,
   LlmClient,
   MailboxSender,
   RedirectResolver,
@@ -69,6 +70,14 @@ export interface RecruitmentDeps {
    * adapter). Optional — absent → the default `mailer` is used (the dev/test mock).
    */
   mailboxResolver?: (mailboxId: string | null) => Promise<MailboxSender>;
+  /**
+   * Pulls new inbound replies for a mailbox (the SMTP-rail IMAP poll — loads the mailbox's
+   * encrypted IMAP creds, fetches mail newer than its cursor WITHOUT touching flags). Optional
+   * — absent → reply ingestion only happens via the inbound-parse webhook. The scheduler dedups
+   * by Message-Id and routes each through `processInboundReply`. Returns [] for mailboxes it
+   * can't poll (OAuth rails, missing IMAP config).
+   */
+  replyPoller?: (mailbox: Mailbox) => Promise<InboundReply[]>;
   /** Meeting booking for the managed (A-tier) track. Optional. */
   calendar?: CalendarBooking;
   clock: Clock;
