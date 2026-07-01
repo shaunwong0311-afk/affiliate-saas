@@ -107,9 +107,20 @@ links. Keep this discipline in all discovery/enrichment work.
 
 ## Current state (as of this writing)
 
-All built and green (**306 tests**, root + web typecheck clean, demo runs). The full
-**discovery + enrich + score + recursive-frontier** AND the **outreach/recruit→close**
+All built and green (**377 tests**, root + web typecheck clean, vite build clean, demo runs).
+The full **discovery + enrich + score + recursive-frontier** AND the **outreach/recruit→close**
 half now exist end-to-end behind ports; runs on labeled demo data until keys are set.
+
+The **`docs/OUTREACH-SPEC.md` §16 queue is COMPLETE** — all seven items shipped: IMAP reply
+poller (SMTP-rail inbound, PEEK-only, wired into the scheduler), activation welcome email
+(magic link + tracking link + referral code + fast-start, idempotent), **AI-SDR** (topic-gate +
+KB-in-context grounded answers + handoff packet + `Notifier` port, HITL/autopilot), per-client
+**deliverability monitor** (per-mailbox bounce auto-pause + scheduled warmup), **pre-send content
+gate** (`scanContent` blocks spam before send), **DM as a sequence step** (`channel:"dm"` →
+prepared `DmTask`, never auto-DM), and the **web Outreach dashboards** (Handoffs, DM Queue,
+Deliverability, Activation). Remaining is the deferred "act-on-it" tail in §16 (autopilot physical
+auto-send needs the outbound-reply transport; OAuth consent + IMAP live validation need real keys;
+calendar + payout rails; branching sequences).
 
 The **email-outreach build** (spec: `docs/OUTREACH-SPEC.md`) — the engine can now SEND,
 PERSONALIZE, and PROCESS REPLIES as the merchant:
