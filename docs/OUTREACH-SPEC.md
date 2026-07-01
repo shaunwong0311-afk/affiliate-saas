@@ -327,11 +327,20 @@ an email; NEVER auto-DM. Cadence pointer advances across BOTH email + DM steps (
 a no-handle DM step records a `skipped` task so it doesn't stick; idempotent. `CycleSummary.dmTasksCreated`.
 Routes `GET /recruitment/dm-tasks`, `/dm-tasks/:id/sent` (+ optional pasted reply → AI-SDR), `/dm-tasks/:id/skip`).
 
-**REMAINING QUEUE — priority order (this is the "what's next"):**
+Also built: **web dashboards** (`web/pages/` — new **Outreach** nav section: `Handoffs.tsx` (AI-SDR
+work queue — tier/reason badges, transcript, suggested-reply copy, resolve), `DmQueue.tsx` (prepared DM
+tasks — drafted message, deep link to composer, mark-sent/skip), `Deliverability.tsx` (per-mailbox bounce
+meters vs the 2% ceiling, warmup/cap, auto-pause + resume, run-monitor), `Activation.tsx` (recruited→
+click→sale funnel bars, fast-start, median-days-to-sale, A/B subject variants, recruits table); CSS/SVG
+charts, no chart lib; wired into `App.tsx` nav + routes; web tsc + vite build clean).
 
-1. **#8 web dashboards** (activation, deliverability, funnel, A/B, DM-queue, handoffs) with charts. Endpoints
-   exist (`/recruitment/activation`, `/campaigns/:id/ab`, `/dm-followup`, `deliverability/mailboxes`,
-   `/handoffs`). Big frontend.
+**QUEUE COMPLETE.** All of #2/#4+#9/#11/#6/#7/#5/#8 shipped (377 tests, root + web green, vite builds).
 
-**Deferred/lower:** #3 live cadence validation (needs real keys); #10 first-party advocate capture (only
-merchants with a customer base); SES dedicated-domain rail; calendar + payout rails.
+**Deferred/lower (the remaining act-on-it stubs + polish):**
+- **Autopilot physical auto-SEND** of AI-SDR answers — needs the outbound-reply/threading transport
+  (today autopilot marks `autoSend:true`; HITL queues a suggested reply for one-click human send).
+- **Mailbox OAuth consent round-trip** live test (senders + connect flow built; needs real MS/Google apps).
+- **IMAP live validation** (`npm install imapflow mailparser` + real creds) — logic-tested only.
+- #3 live cadence validation (needs real provider keys); #10 first-party advocate capture (customer-base
+  merchants only); SES dedicated-domain rail; calendar booking + payout rails; branching/conditional
+  sequences (open/click branching); optional cheap-LLM pass on the content gate.

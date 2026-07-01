@@ -6,6 +6,10 @@ import { Dashboard } from "./pages/Dashboard";
 import { Recruitment } from "./pages/Recruitment";
 import { Automation } from "./pages/Automation";
 import { NicheMap } from "./pages/NicheMap";
+import { Handoffs } from "./pages/Handoffs";
+import { DmQueue } from "./pages/DmQueue";
+import { Deliverability } from "./pages/Deliverability";
+import { Activation } from "./pages/Activation";
 import { Programs } from "./pages/Programs";
 import { Affiliates } from "./pages/Affiliates";
 import { AffiliateDetail } from "./pages/AffiliateDetail";
@@ -41,6 +45,15 @@ const MERCHANT_NAV: { section: string; items: NavItem[] }[] = [
       { label: "Automation", ico: "⚡", path: "/automation" },
       { label: "Affiliates", ico: "⦿", path: "/affiliates" },
       { label: "Reporting", ico: "▥", path: "/reporting" },
+    ],
+  },
+  {
+    section: "Outreach",
+    items: [
+      { label: "Handoffs", ico: "⇥", path: "/handoffs" },
+      { label: "DM Queue", ico: "✉", path: "/dm-queue" },
+      { label: "Deliverability", ico: "◊", path: "/deliverability" },
+      { label: "Activation", ico: "↗", path: "/activation" },
     ],
   },
   {
@@ -83,6 +96,10 @@ const ROUTES: { pattern: string; render: (params: Record<string, string>) => JSX
   { pattern: "/recruitment", render: () => <Recruitment /> },
   { pattern: "/niche-map", render: () => <NicheMap /> },
   { pattern: "/automation", render: () => <Automation /> },
+  { pattern: "/handoffs", render: () => <Handoffs /> },
+  { pattern: "/dm-queue", render: () => <DmQueue /> },
+  { pattern: "/deliverability", render: () => <Deliverability /> },
+  { pattern: "/activation", render: () => <Activation /> },
   { pattern: "/affiliates", render: () => <Affiliates /> },
   { pattern: "/affiliates/:id", render: (p) => <AffiliateDetail relationshipId={p.id!} /> },
   { pattern: "/conversions", render: () => <Conversions /> },
