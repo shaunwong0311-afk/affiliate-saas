@@ -46,6 +46,7 @@ import type {
   MerchantFaq,
   Handoff,
   DmTask,
+  SecretRow,
   ApiKey,
   WebhookSubscription,
 } from "./entities.js";
@@ -86,6 +87,7 @@ export interface Database {
   // Integrations
   integrations: Repo<MerchantIntegration>;
   mailboxes: Repo<Mailbox>;
+  secrets: Repo<SecretRow>;
   sendingDomains: Repo<SendingDomain>;
   webhookDeliveries: Repo<WebhookDelivery>;
 

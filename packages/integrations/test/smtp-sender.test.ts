@@ -65,6 +65,29 @@ describe("SmtpSender", () => {
     expect(fail.status).toBe("failed");
   });
 
+  it("never mistakes the SMTP port in a connection error for a 5xx bounce code", async () => {
+    // "587" used to match the old \b5\d\d\b regex → one outage mass-suppressed prospects.
+    const r = await new SmtpSender({ host: "h", port: 587, user: "u", pass: "p" }, () => fakeTransport({ throwMsg: "connect ECONNREFUSED 192.168.1.10:587" })).send(email);
+    expect(r.status).toBe("failed");
+  });
+
+  it("classifies from the real SMTP responseCode, and never treats auth errors as bounces", async () => {
+    const throwing = (err: Error & { code?: string; responseCode?: number }): SmtpTransport => ({
+      async sendMail() {
+        throw err;
+      },
+      async verify() {
+        return true;
+      },
+    });
+    // Recipient-level 550 with a responseCode → hard bounce.
+    const rej = Object.assign(new Error("Recipient address rejected"), { responseCode: 550 });
+    expect((await new SmtpSender({ host: "h", port: 587, user: "u", pass: "p" }, () => throwing(rej)).send(email)).status).toBe("bounced");
+    // EAUTH carries a 535 responseCode but is a MAILBOX problem, not a recipient bounce.
+    const auth = Object.assign(new Error("Invalid login: 535-5.7.8 Username and Password not accepted"), { code: "EAUTH", responseCode: 535 });
+    expect((await new SmtpSender({ host: "h", port: 587, user: "u", pass: "p" }, () => throwing(auth)).send(email)).status).toBe("failed");
+  });
+
   it("verify() reports connection/auth health (for the connect test step)", async () => {
     expect(await new SmtpSender({ host: "h", port: 587, user: "u", pass: "p" }, () => fakeTransport()).verify()).toEqual({ ok: true });
     const bad = await new SmtpSender({ host: "h", port: 587, user: "u", pass: "p" }, () => fakeTransport({ verifyOk: false })).verify();

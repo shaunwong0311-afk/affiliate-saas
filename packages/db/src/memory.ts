@@ -106,6 +106,7 @@ export function createMemoryDatabase(): Database {
     entitlements: byId(),
     integrations: byId(),
     mailboxes: byId(),
+    secrets: byId(),
     sendingDomains: byId(),
     webhookDeliveries: byId(),
     affiliates: byId(),

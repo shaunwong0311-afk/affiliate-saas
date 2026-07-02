@@ -7,6 +7,8 @@ import { routeReply, type ReplyOutcome } from "./reply-router.js";
 import { isGoodLocalSendTime } from "./send-timing.js";
 import { isSuppressed } from "./suppression.js";
 import { existingAffiliateEmails } from "./guards.js";
+import { isWithinSendWindow } from "./sequencing.js";
+import { deliverabilityHealth, capacityAvailable } from "./deliverability.js";
 
 /**
  * High-level recruitment orchestration used by the API routes. Composes the
@@ -155,11 +157,16 @@ export interface LaunchSummary {
   skipped: number;
   /** Held back because it wasn't a good local send time for the recipient (try next run). */
   deferred: number;
+  /** Why nothing was attempted (outside send window / circuit open), when applicable. */
+  blockedReason?: string;
 }
 
 /**
- * Launch a campaign: queue + send the first touch to scored, contactable
- * prospects at or above a minimum tier. Sends happen as the merchant.
+ * Launch a campaign: queue + send the first touch to scored, contactable prospects at or
+ * above a minimum tier. Sends happen as the merchant. Manual launches obey the SAME guards
+ * as the autonomous cycle — send window, deliverability circuit breaker, and the campaign
+ * mailbox's remaining effective (warmup-ramped) daily cap — so an operator can't blast a
+ * cold or paused mailbox at 3am by calling the API in a loop.
  */
 export async function launchCampaign(
   deps: RecruitmentDeps,
@@ -167,6 +174,12 @@ export async function launchCampaign(
   opts?: { minTier?: "A" | "B" | "C"; max?: number; respectLocalTime?: boolean },
 ): Promise<LaunchSummary> {
   const campaign: OutreachCampaign = await deps.db.campaigns.require(campaignId);
+  const now = deps.clock.now();
+  const none: LaunchSummary = { queued: 0, sent: 0, bounced: 0, skipped: 0, deferred: 0 };
+  if (!isWithinSendWindow(campaign, now)) return { ...none, blockedReason: "outside the campaign send window" };
+  const health = await deliverabilityHealth(deps, campaign.merchantId);
+  if (health.circuitOpen) return { ...none, blockedReason: "deliverability circuit breaker is open" };
+
   const tierRank = { A: 3, B: 2, C: 1 };
   const min = tierRank[opts?.minTier ?? "C"];
   const prospects = await deps.db.prospects.find(
@@ -179,8 +192,13 @@ export async function launchCampaign(
   let bounced = 0;
   let skipped = 0;
   let deferred = 0;
-  const now = deps.clock.now();
   for (const p of ordered) {
+    // The campaign mailbox's remaining warmup-ramped cap is re-checked per send, so repeated
+    // manual launches can never exceed the mailbox's daily budget.
+    if (!(await capacityAvailable(deps, campaign.merchantId, campaign, now))) {
+      deferred += ordered.length - (queued + skipped + deferred);
+      break;
+    }
     // Send-time optimization: hold prospects whose local time isn't a good send window
     // (picked up on the next run). Unknown geo never defers.
     if (opts?.respectLocalTime && !isGoodLocalSendTime(p.country, now)) {

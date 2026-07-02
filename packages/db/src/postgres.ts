@@ -28,6 +28,7 @@ const TABLES: Record<string, { table: string; idCol: string }> = {
   entitlements: { table: "kv_entitlements", idCol: "id" },
   integrations: { table: "kv_integrations", idCol: "id" },
   mailboxes: { table: "kv_mailboxes", idCol: "id" },
+  secrets: { table: "kv_secrets", idCol: "id" },
   sendingDomains: { table: "kv_sending_domains", idCol: "id" },
   webhookDeliveries: { table: "kv_webhook_deliveries", idCol: "id" },
   affiliates: { table: "kv_affiliates", idCol: "id" },

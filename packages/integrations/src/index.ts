@@ -63,7 +63,7 @@ export { HashingEmbedder, DeterministicLlm, classifyReply, renderTemplate } from
 export { AnthropicLlmClient } from "./anthropic-llm.js";
 export { OpenAiCompatibleLlmClient } from "./openai-llm.js";
 export { EmbeddingRelevanceScorer, LlmRelevanceScorer, type RelevanceScorer } from "./relevance.js";
-export { InMemorySecretStore, EnvSecretStore } from "./secrets.js";
+export { InMemorySecretStore, EnvSecretStore, DbSecretStore, type SecretRepo } from "./secrets.js";
 export * from "./http.js";
 export { PlaywrightFetcher, EscalatingFetcher, looksBlocked } from "./browser-fetch.js";
 export {

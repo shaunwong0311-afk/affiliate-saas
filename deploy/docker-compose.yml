@@ -56,7 +56,7 @@ services:
     build:
       context: ..
       dockerfile: deploy/Dockerfile
-    command: ["node", "--import", "tsx", "packages/recruitment/src/worker.ts"]
+    command: ["node", "--import", "tsx", "packages/api/src/worker.ts"]
     environment:
       DATABASE_URL: postgres://vantage:vantage@postgres:5432/vantage
       REDIS_URL: redis://redis:6379

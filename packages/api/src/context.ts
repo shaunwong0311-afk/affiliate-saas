@@ -22,6 +22,9 @@ import {
   EmbeddingRelevanceScorer,
   LlmRelevanceScorer,
   InMemorySecretStore,
+  DbSecretStore,
+  ResendMailer,
+  PostmarkMailer,
   CompetitorAffiliateSource,
   CreatorDiscoverySource,
   SerpDiscoverySource,
@@ -246,20 +249,36 @@ export function createContext(overrides: Partial<AppContext> = {}): AppContext {
   // (SMTP for cPanel/host + Gmail app-password; Graph/Gmail OAuth later), loading its
   // encrypted credentials from the SecretStore. Falls back to the mock when unconnected.
   const mailer = overrides.mailer ?? new MockMailboxSender();
-  const secrets = overrides.secrets ?? new InMemorySecretStore();
+  // Secrets persist WITH the database (encrypted at the app level) — an in-memory-only store
+  // would orphan every connected mailbox on restart and silently degrade sends to the mock.
+  const secrets = overrides.secrets ?? new DbSecretStore(db.secrets, process.env.SECRETS_ENC_KEY ?? config.jwtSecret);
+  const prod = config.isProduction;
+  // A sender that refuses to send, with the reason surfaced on the message row. In production
+  // a broken mailbox must FAIL — silently "sending" via the mock would fabricate sent state.
+  const failingSender = (reason: string): MailboxSender => ({
+    provider: "unavailable",
+    async send() {
+      return { messageId: "", status: "failed", reason };
+    },
+  });
   const mailboxResolver =
     overrides.mailboxResolver ??
     (async (mailboxId: string | null): Promise<MailboxSender> => {
-      if (!mailboxId) return mailer;
+      if (!mailboxId) return prod ? failingSender("campaign has no connected mailbox") : mailer;
       const mailbox = await db.mailboxes.get(mailboxId);
-      if (!mailbox || mailbox.status === "disconnected" || !mailbox.credentialsRef) return mailer;
+      if (!mailbox) return prod ? failingSender("mailbox not found") : mailer;
+      // An auto-paused ("error") or disconnected mailbox must never transmit — in ANY env.
+      if (mailbox.status === "error" || mailbox.status === "disconnected") {
+        return failingSender(`mailbox ${mailbox.status === "error" ? "auto-paused by the deliverability monitor" : "disconnected"}`);
+      }
+      if (!mailbox.credentialsRef) return prod ? failingSender("mailbox has no credentials connected") : mailer;
       const raw = await secrets.get(mailbox.credentialsRef);
-      if (!raw) return mailer;
+      if (!raw) return prod ? failingSender("mailbox credentials missing from the secret store") : mailer;
       let creds: MailboxCredentials;
       try {
         creds = JSON.parse(raw) as MailboxCredentials;
       } catch {
-        return mailer;
+        return prod ? failingSender("mailbox credentials unreadable") : mailer;
       }
       // OAuth rails: refresh the access token if it's expired/expiring, and persist it.
       if ((creds.kind === "microsoft" || creds.kind === "gmail_oauth") && creds.refreshToken && creds.expiresAt && new Date(creds.expiresAt).getTime() < Date.now() + 60_000) {
@@ -327,10 +346,29 @@ export function createContext(overrides: Partial<AppContext> = {}): AppContext {
     fetcher,
     enricher,
     calendar: overrides.calendar ?? new StubCalendarBooking(),
-    transactionalMailer: overrides.transactionalMailer ?? new ConsoleTransactionalMailer(),
+    transactionalMailer: overrides.transactionalMailer ?? buildTransactionalMailer(prod, jsonHttp),
     notifier:
       overrides.notifier ??
       (process.env.SLACK_WEBHOOK_URL ? new SlackWebhookNotifier({ webhookUrl: process.env.SLACK_WEBHOOK_URL, http: jsonHttp }) : new StubNotifier()),
     clock: overrides.clock ?? systemClock,
   };
+}
+
+/**
+ * Transactional mail (activation welcomes, magic links, payout notices) — env-gated ESP:
+ * RESEND_API_KEY → Resend, POSTMARK_SERVER_TOKEN → Postmark (ESP_PROVIDER breaks ties when
+ * both are set). Without a key this mail never leaves the process, so production boots with
+ * a loud warning — otherwise recruits silently never receive their welcome/portal emails.
+ */
+function buildTransactionalMailer(prod: boolean, http: FetchJsonClient): TransactionalMailer {
+  const resendKey = process.env.RESEND_API_KEY;
+  const postmarkToken = process.env.POSTMARK_SERVER_TOKEN;
+  const preferred = (process.env.ESP_PROVIDER ?? "").toLowerCase();
+  if (resendKey && (preferred !== "postmark" || !postmarkToken)) return new ResendMailer({ apiKey: resendKey, http });
+  if (postmarkToken) return new PostmarkMailer({ serverToken: postmarkToken, http });
+  if (prod) {
+    // eslint-disable-next-line no-console
+    console.warn("[boot] No transactional ESP configured (RESEND_API_KEY / POSTMARK_SERVER_TOKEN) — activation + magic-link emails will NOT be delivered.");
+  }
+  return new ConsoleTransactionalMailer();
 }

@@ -120,6 +120,18 @@ export interface MerchantIntegration {
   lastSyncAt: Timestamp | null;
 }
 
+/**
+ * An app-level-encrypted secret (mailbox/integration credentials). The row id IS the
+ * `credentialsRef` other entities point at; `value` is an AES-256-GCM envelope, never
+ * plaintext. Persisting these alongside the rest of the store means a restart does not
+ * orphan every connected mailbox (which would silently route sends to the mock).
+ */
+export interface SecretRow {
+  id: Id;
+  value: string;
+  updatedAt: Timestamp;
+}
+
 export interface Mailbox {
   id: Id;
   merchantId: Id;
@@ -390,8 +402,10 @@ export interface OutreachMessage {
   body: string;
   sentAt: Timestamp | null;
   status: "queued" | "sent" | "bounced" | "replied" | "failed";
-  /** Why the pre-send content gate blocked this message (when status "failed" from the gate). */
+  /** Why this message failed to send (content gate, transport failure, paused mailbox, …). */
   blockedReason?: string;
+  /** Provider Message-Id from the actual send — threads follow-ups + correlates replies. */
+  providerMessageId?: string;
 }
 
 export interface Reply {

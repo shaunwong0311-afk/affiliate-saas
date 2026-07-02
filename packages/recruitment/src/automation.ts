@@ -4,12 +4,11 @@ import type { RecruitmentDeps } from "./deps.js";
 import { runSourcing, processBacklog } from "./service.js";
 import { expandFrontier } from "./frontier.js";
 import { queueFirstTouch, send } from "./pipeline.js";
-import { nextStep, isWithinSendWindow, personalizationDepth } from "./sequencing.js";
-import { renderTemplate } from "@affiliate/integrations";
-import { deliverabilityHealth, pickSendableMailbox, monitorDeliverability } from "./deliverability.js";
+import { nextStep, isWithinSendWindow, personalizationDepth, pickVariant } from "./sequencing.js";
+import { deliverabilityHealth, capacityAvailable, monitorDeliverability } from "./deliverability.js";
 import { lowYieldSources } from "./learning.js";
 import { draftDm } from "./dm.js";
-import { evidenceSummary } from "./personalization.js";
+import { evidenceSummary, personalizeOutreach } from "./personalization.js";
 import type { DmTask } from "@affiliate/db";
 
 /**
@@ -193,19 +192,56 @@ export async function advanceSequences(
 
     // Email step.
     if (!(await capacityAvailable(deps, merchantId, campaign, now))) break;
+    // Retry-not-duplicate: if a message already exists at this step, re-send THAT row instead
+    // of inserting a new one every cycle. Content-gate blocks are deterministic → skip forever
+    // (the failed message + blockedReason are the operator's fix-it surface).
+    const existing = (await deps.db.outreachMessages.find((m) => m.prospectId === p.id && m.campaignId === campaign.id && m.step === next.step))[0];
+    if (existing) {
+      if ((existing.blockedReason ?? "").startsWith("content gate")) continue;
+      if (existing.status === "queued" || existing.status === "failed") {
+        const retried = await send(deps, existing.id);
+        if (retried.status === "sent") emailsSent += 1;
+      }
+      continue;
+    }
+
+    const merchant = await deps.db.merchants.require(merchantId);
     const depth = personalizationDepth(p.tier);
-    const tokens = { name: p.identity, merchant: "", offer: "", angle: depth === "deep" ? "Following up — still a strong fit." : "Circling back." };
+    const tokens = {
+      name: p.identity,
+      merchant: merchant.name,
+      offer: merchant.niche ?? "our products",
+      angle: depth === "deep" ? "Following up — still a strong fit." : "Circling back.",
+    };
+    // Follow-ups get the SAME quality as the first touch: step variants (A/B) + the merchant's
+    // personalization plan — not a bare token render with blank {{merchant}}/{{offer}}.
+    let effectiveStep = next;
+    let abLabel: string | null = null;
+    if (next.variants?.length) {
+      const picked = pickVariant(next.variants, p.id);
+      effectiveStep = { ...next, subject: picked.value.subject, body: picked.value.body };
+      abLabel = `ab:v${picked.index}`;
+    }
+    const personalized = await personalizeOutreach(deps, { merchant, prospect: p, step: effectiveStep, tokens });
+    // Same-thread follow-up: when the prior step's provider Message-Id is known, land in the
+    // same conversation ("Re: <original subject>"); send() threads via In-Reply-To.
+    const priorThreaded = sentMsgs.find((m) => !!m.providerMessageId);
+    const subject = priorThreaded ? `Re: ${priorThreaded.subject.replace(/^(re|fwd):\s*/i, "")}` : personalized.subject;
+
     const message = await deps.db.outreachMessages.insert({
       id: newId("omsg"),
       prospectId: p.id,
       campaignId: campaign.id,
       step: next.step,
-      variant: depth,
-      subject: renderTemplate(next.subject, tokens),
-      body: renderTemplate(next.body, tokens),
+      variant: personalized.mode === "llm" ? "llm" : abLabel ?? depth,
+      subject,
+      body: personalized.body,
       sentAt: null,
       status: "queued",
     });
+    if (personalized.mode === "llm") {
+      await deps.db.usageEvents.insert({ id: newId("use"), merchantId, kind: "personalization", quantity: 1, sourceId: message.id, ts: now.toISOString() });
+    }
     const result = await send(deps, message.id);
     if (result.status === "sent") emailsSent += 1;
   }
@@ -216,11 +252,5 @@ async function activeCampaign(deps: RecruitmentDeps, merchantId: string): Promis
   return deps.db.campaigns.findOne((c) => c.merchantId === merchantId && c.status === "active");
 }
 
-/** True if a mailbox has remaining daily capacity and we're in the send window. */
-async function capacityAvailable(deps: RecruitmentDeps, merchantId: string, campaign: OutreachCampaign, now: Date): Promise<boolean> {
-  if (!isWithinSendWindow(campaign, now)) return false;
-  const mailbox = await pickSendableMailbox(deps, merchantId, now);
-  return mailbox != null;
-}
 
 export type { Prospect };

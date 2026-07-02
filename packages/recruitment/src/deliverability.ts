@@ -1,5 +1,6 @@
-import type { Mailbox } from "@affiliate/db";
+import type { Mailbox, OutreachCampaign } from "@affiliate/db";
 import type { RecruitmentDeps } from "./deps.js";
+import { isWithinSendWindow } from "./sequencing.js";
 
 /**
  * Deliverability operations (Section 8.4 / Section 14 #1 risk). The silent failure
@@ -24,6 +25,38 @@ export function warmupTransition(current: Mailbox["warmupStatus"], ageDays: numb
   return current;
 }
 
+/** Warmup age in days for cap purposes: the warmup clock when running, else fully warmed
+ * only when the mailbox is actually `ready` (a warming mailbox with no clock is day 0). */
+export function mailboxAgeDays(mailbox: Mailbox, now: Date): number {
+  if (mailbox.warmupStartedAt) return (now.getTime() - new Date(mailbox.warmupStartedAt).getTime()) / 86_400_000;
+  return mailbox.warmupStatus === "ready" ? 21 : 0;
+}
+
+/** Remaining send capacity today for ONE mailbox (the one a campaign actually sends through).
+ * Applies the real warmup ramp and refuses paused/disconnected mailboxes. */
+export async function mailboxRemainingToday(deps: RecruitmentDeps, mailbox: Mailbox, now: Date): Promise<number> {
+  if (mailbox.status !== "connected" && mailbox.status !== "warming") return 0;
+  const cap = effectiveDailyCap(mailbox, mailboxAgeDays(mailbox, now));
+  const sent = await sentTodayForMailbox(deps, mailbox.id, now);
+  return Math.max(0, cap - sent);
+}
+
+/**
+ * True if the campaign can send right now: inside the send window AND the campaign's OWN
+ * mailbox (the one send() actually transmits through) has remaining effective capacity.
+ * Checking any-sibling capacity would let the campaign mailbox blow past its cap/warmup ramp
+ * while a healthy sibling keeps the gate green. A campaign with no mailbox can only reach the
+ * dev/test mock, so it is gated on the window alone.
+ */
+export async function capacityAvailable(deps: RecruitmentDeps, merchantId: string, campaign: OutreachCampaign, now: Date): Promise<boolean> {
+  void merchantId;
+  if (!isWithinSendWindow(campaign, now)) return false;
+  if (!campaign.mailboxId) return true; // mock-only path (no mailbox to cap); send() refuses paused boxes
+  const mailbox = await deps.db.mailboxes.get(campaign.mailboxId);
+  if (!mailbox) return false;
+  return (await mailboxRemainingToday(deps, mailbox, now)) > 0;
+}
+
 /** How many messages this mailbox sent today (via its campaigns). */
 export async function sentTodayForMailbox(deps: RecruitmentDeps, mailboxId: string, now: Date): Promise<number> {
   const campaigns = await deps.db.campaigns.find((c) => c.mailboxId === mailboxId);
@@ -41,9 +74,9 @@ export async function pickSendableMailbox(deps: RecruitmentDeps, merchantId: str
   const mailboxes = await deps.db.mailboxes.find((m) => m.merchantId === merchantId && (m.status === "connected" || m.status === "warming"));
   let best: { mailbox: Mailbox; remaining: number } | null = null;
   for (const mailbox of mailboxes) {
-    const cap = effectiveDailyCap(mailbox, 21); // ageDays unknown here; treat as warmed for capacity
-    const sent = await sentTodayForMailbox(deps, mailbox.id, now);
-    const remaining = cap - sent;
+    // Real warmup age (not "assume warmed") so a day-0 warming mailbox exposes its ramp cap
+    // of 5/day here — the one place that actually grants send capacity.
+    const remaining = await mailboxRemainingToday(deps, mailbox, now);
     if (remaining <= 0) continue;
     if (!best || remaining > best.remaining) best = { mailbox, remaining };
   }
@@ -115,7 +148,7 @@ export async function mailboxHealth(deps: RecruitmentDeps, mailbox: Mailbox, now
   const sent = messages.length;
   const bounced = messages.filter((m) => m.status === "bounced").length;
   const bounceRate = sent ? bounced / sent : 0;
-  const ageDays = mailbox.warmupStartedAt ? (now.getTime() - new Date(mailbox.warmupStartedAt).getTime()) / 86_400_000 : 21;
+  const ageDays = mailboxAgeDays(mailbox, now);
   return {
     mailboxId: mailbox.id,
     email: mailbox.email,

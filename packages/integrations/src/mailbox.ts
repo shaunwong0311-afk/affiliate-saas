@@ -158,10 +158,19 @@ export class SmtpSender implements MailboxSender {
       }
       return { messageId: info.messageId ?? "", status: "sent" };
     } catch (e: unknown) {
-      // A 5xx / "user unknown" is a hard bounce → suppress; anything else (auth, TLS,
-      // network) is a transient failure → retry later, don't suppress the address.
-      const msg = e instanceof Error ? e.message : String(e);
-      const hardBounce = /\b5\d\d\b|mailbox unavailable|user unknown|no such user|recipient.*reject|does not exist/i.test(msg);
+      // A recipient-level 5xx / "user unknown" is a hard bounce → suppress; anything else
+      // (auth, TLS, network) is a transient failure → retry later, don't suppress the address.
+      // Classification order matters: connection/auth error CODES first (an EAUTH carries a 535
+      // responseCode that would otherwise read as a bounce), then the real SMTP responseCode,
+      // then textual recipient markers. NEVER regex a bare 5xx out of free text — Node network
+      // errors embed the port ("connect ECONNREFUSED 1.2.3.4:587") and would match.
+      const err = e as { message?: string; code?: string; responseCode?: number };
+      const msg = err?.message ?? String(e);
+      const transient = /^(ECONNECTION|ECONNREFUSED|ECONNRESET|ETIMEDOUT|ESOCKET|EDNS|EAUTH|EENVELOPE?TLS|ETLS)/i.test(err?.code ?? "");
+      const hardBounce =
+        !transient &&
+        ((typeof err?.responseCode === "number" && err.responseCode >= 500) ||
+          /mailbox unavailable|user unknown|no such user|recipient.*reject|does not exist|\b5\d\d[ -]\d\.\d+\.\d+\b/i.test(msg));
       return { messageId: "", status: hardBounce ? "bounced" : "failed", reason: msg.slice(0, 200) };
     }
   }

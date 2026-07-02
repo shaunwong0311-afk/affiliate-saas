@@ -17,7 +17,7 @@
     "test:watch": "vitest",
     "api": "node --import tsx packages/api/src/server.ts",
     "edge": "node --import tsx packages/tracking-edge/src/server.ts",
-    "worker": "node --import tsx packages/recruitment/src/worker.ts",
+    "worker": "node --import tsx packages/api/src/worker.ts",
     "demo": "node --import tsx packages/api/src/dev/demo.ts",
     "web:dev": "npm run dev -w @affiliate/web",
     "lint": "tsc -b --noEmit"

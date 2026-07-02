@@ -278,10 +278,15 @@ export const recruitmentRoutes: RouteModule = (app, ctx) => {
     const campaign = await ctx.db.campaigns.get(id);
     if (!campaign || campaign.merchantId !== merchantId) throw notFound("campaign");
     const body = parseBody(
-      z.object({ minTier: z.enum(["A", "B", "C"]).optional(), max: z.number().int().min(1).max(10000).optional() }),
+      z.object({
+        minTier: z.enum(["A", "B", "C"]).optional(),
+        max: z.number().int().min(1).max(10000).optional(),
+        respectLocalTime: z.boolean().optional(),
+      }),
       request,
     );
-    const result = await launchCampaign(ctx, id, { minTier: body.minTier, max: body.max });
+    // Local-send-time optimization defaults ON (unknown geo never defers, so it's safe).
+    const result = await launchCampaign(ctx, id, { minTier: body.minTier, max: body.max, respectLocalTime: body.respectLocalTime ?? true });
     return ok(reply, result);
   });
 

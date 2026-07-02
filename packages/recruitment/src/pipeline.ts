@@ -357,9 +357,16 @@ export async function enrich(
 
   const ts = deps.clock.now().toISOString();
   await deps.db.usageEvents.insert({ id: newId("use"), merchantId: prospect.merchantId, kind: "enrichment", quantity: 1, sourceId: prospectId, ts });
+  // Persist the resolved geo/language onto the PROSPECT row (not just the evidence profile) —
+  // this is what arms the GDPR/CASL geo gate and the local-send-time gate in send()/launch.
+  // Only clean ISO-shaped codes; anything else stays null rather than guessed.
+  const geo = profile?.audience.primaryGeo;
+  const lang = profile?.audience.language;
   return deps.db.prospects.update(prospectId, {
     email: chosenEmail,
     evidence: { ...(prospect.evidence ?? {}), contactSource, profile, contactEmails: pageEmails, contactUrls, contactForm, contactFormUrl, affiliateLinks },
+    ...(geo && /^[A-Za-z]{2}$/.test(geo) ? { country: geo.toUpperCase() } : {}),
+    ...(lang && /^[A-Za-z]{2}/.test(lang) ? { language: lang.slice(0, 2).toLowerCase() } : {}),
     state: "enriched",
     updatedAt: ts,
   });
@@ -427,6 +434,13 @@ export async function queueFirstTouch(
   }
   const step = firstStep(campaign);
   if (!step) return null;
+  // A content-gate-blocked first touch is deterministic — re-queuing would fail identically and
+  // grow a failed row per cycle. Hold the prospect until the operator fixes the copy (the failed
+  // message + blockedReason are the operator surface).
+  const gateBlocked = await deps.db.outreachMessages.findOne(
+    (m) => m.prospectId === prospectId && m.campaignId === campaign.id && m.step === step.step && m.status === "failed" && (m.blockedReason ?? "").startsWith("content gate"),
+  );
+  if (gateBlocked) return null;
   const merchant = await deps.db.merchants.require(prospect.merchantId);
 
   const depth = personalizationDepth(prospect.tier);
@@ -512,22 +526,28 @@ export async function send(deps: RecruitmentDeps, messageId: string): Promise<Ou
   const campaign = await deps.db.campaigns.require(message.campaignId);
   const merchant = await deps.db.merchants.require(prospect.merchantId);
   if (!prospect.email) return message;
+  const now0 = deps.clock.now().toISOString();
 
   if (await isSuppressed(deps, prospect.merchantId, prospect.email)) {
-    return deps.db.outreachMessages.update(messageId, { status: "failed" });
+    return deps.db.outreachMessages.update(messageId, { status: "failed", blockedReason: "suppressed contact" });
   }
 
   // Geo-gate EU/Canada cold outreach (Section 8.9 — GDPR/CASL are strict/high-risk).
+  // A gated geo is a permanent no-cold-email condition → the prospect exits the funnel.
   if (prospect.country && GEO_GATED.has(prospect.country.toUpperCase())) {
-    return deps.db.outreachMessages.update(messageId, { status: "failed" });
+    await deps.db.prospects.update(prospect.id, { state: "dead", updatedAt: now0 });
+    return deps.db.outreachMessages.update(messageId, { status: "failed", blockedReason: `geo-gated (${prospect.country.toUpperCase()} — GDPR/CASL)` });
   }
 
   // Pre-send content gate (§16 #7): scan the personalized subject+body BEFORE it leaves. A
   // hard-block (empty field, egregious spam) fails the send with a reason for the operator to
   // fix, rather than burning domain reputation. Warnings pass through. Scans the raw personalized
   // content (the compliance footer's unsubscribe link is added after + is legitimate).
+  // A blocked FIRST touch reverts the prospect to `scored` so it isn't stranded in `queued`
+  // (queueFirstTouch skips re-queuing while a content-gate-failed message exists at that step).
   const scan = scanContent({ subject: message.subject, body: message.body });
   if (!scan.ok) {
+    if (prospect.state === "queued") await deps.db.prospects.update(prospect.id, { state: "scored", updatedAt: now0 });
     return deps.db.outreachMessages.update(messageId, {
       status: "failed",
       blockedReason: `content gate: ${scan.issues.filter((i) => i.severity === "block").map((i) => i.message).join("; ")}`,
@@ -535,6 +555,12 @@ export async function send(deps: RecruitmentDeps, messageId: string): Promise<Ou
   }
 
   const mailbox = campaign.mailboxId ? await deps.db.mailboxes.get(campaign.mailboxId) : null;
+  // A mailbox the deliverability monitor auto-paused (status "error") must never send —
+  // even when the resolver would happily build a working transport for it.
+  if (mailbox && (mailbox.status === "error" || mailbox.status === "disconnected")) {
+    if (prospect.state === "queued") await deps.db.prospects.update(prospect.id, { state: "scored", updatedAt: now0 });
+    return deps.db.outreachMessages.update(messageId, { status: "failed", blockedReason: `mailbox ${mailbox.status === "error" ? "auto-paused" : "disconnected"}` });
+  }
   const unsubUrl = unsubscribeLink(prospect.merchantId, prospect.email);
   // CAN-SPAM compliant footer: valid physical address + one-click unsubscribe.
   const footer =
@@ -547,16 +573,29 @@ export async function send(deps: RecruitmentDeps, messageId: string): Promise<Ou
     "List-Unsubscribe": `<${unsubUrl}>`,
     "List-Unsubscribe-Post": "List-Unsubscribe=One-Click",
   };
+  // Thread follow-ups into the same conversation: reference the previous step's provider
+  // Message-Id so step 2+ lands as a reply, not a fresh cold email.
+  let inReplyTo: string | undefined;
+  if (message.step > 1) {
+    const prior = (await deps.db.outreachMessages.find(
+      (m) => m.prospectId === prospect.id && m.campaignId === campaign.id && m.status === "sent" && m.step < message.step && !!m.providerMessageId,
+    )).sort((a, b) => b.step - a.step)[0];
+    inReplyTo = prior?.providerMessageId ?? undefined;
+  }
   // Send AS the merchant: resolve their connected mailbox (SMTP/Graph/Gmail). Falls back to
   // the default mailer (the dev/test mock) when no resolver is wired or the mailbox is gone.
   const sender = deps.mailboxResolver ? await deps.mailboxResolver(campaign.mailboxId).catch(() => deps.mailer) : deps.mailer;
   const result = await sender.send({
     fromName: merchant.name,
-    fromEmail: mailbox?.email ?? `team@${merchant.name.toLowerCase().replace(/\s+/g, "")}.com`,
+    // Never invent a plausible-looking from domain: without a connected mailbox the send can
+    // only be the dev/test mock, so use an RFC 2606 reserved address that cannot be mistaken
+    // for (or delivered as) a real identity.
+    fromEmail: mailbox?.email ?? "no-reply@example.invalid",
     toEmail: prospect.email,
     subject: message.subject,
     body: message.body + footer,
     headers,
+    inReplyTo,
   });
 
   const now = deps.clock.now().toISOString();
@@ -565,11 +604,18 @@ export async function send(deps: RecruitmentDeps, messageId: string): Promise<Ou
     await deps.db.prospects.update(prospect.id, { state: "bounced", suppressionStatus: "bounced", updatedAt: now });
     return deps.db.outreachMessages.update(messageId, { status: "bounced", sentAt: now });
   }
+  // A transient transport failure (SMTP outage, expired token, network) is NOT a send: keep the
+  // message retryable, do NOT advance the prospect, do NOT bill. A failed first touch returns the
+  // prospect to `scored` so the next cycle retries with a fresh message.
+  if (result.status === "failed") {
+    if (prospect.state === "queued") await deps.db.prospects.update(prospect.id, { state: "scored", updatedAt: now });
+    return deps.db.outreachMessages.update(messageId, { status: "failed", blockedReason: `send failed: ${result.reason ?? "transport error"}` });
+  }
 
   const nextState = prospect.state === "queued" ? "contacted" : "in_sequence";
   await deps.db.prospects.update(prospect.id, { state: nextState, updatedAt: now });
   await deps.db.usageEvents.insert({ id: newId("use"), merchantId: prospect.merchantId, kind: "send", quantity: 1, sourceId: message.id, ts: now });
-  return deps.db.outreachMessages.update(messageId, { status: "sent", sentAt: now });
+  return deps.db.outreachMessages.update(messageId, { status: "sent", sentAt: now, providerMessageId: result.messageId || undefined });
 }
 
 // ---- 5. Reply handling ------------------------------------------------------

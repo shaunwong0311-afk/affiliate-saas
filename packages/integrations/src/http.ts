@@ -114,7 +114,8 @@ export class FetchJsonClient {
       const res = await fetch(url, {
         method: "POST",
         headers: { "Content-Type": "application/json", ...headers },
-        body: JSON.stringify(body),
+        // A string body is sent as-is (raw MIME / form payloads); objects are JSON-encoded.
+        body: typeof body === "string" ? body : JSON.stringify(body),
         signal: controller.signal,
       });
       let json: any = null;
