@@ -99,11 +99,15 @@ describe("signed reply webhook", () => {
     const unsigned = await call("POST", `/recruitment/reply-webhook/${merchantId}`, undefined, { token: "", rawBody: payload });
     expect(unsigned.status).toBe(401);
 
-    // Correctly signed → accepted.
+    // Correctly signed → accepted (200, not 401). The prospect was never CONTACTED, so the
+    // inbox-noise guard correctly declines to route the mail (a creator's newsletter or
+    // unrelated correspondence must never flip prospect state) — the signature acceptance
+    // is what this test guards.
     const sig = createHmac("sha256", postbackSecret).update(payload, "utf8").digest("hex");
     const signed = await call("POST", `/recruitment/reply-webhook/${merchantId}`, undefined, { token: "", rawBody: payload, headers: { "x-vantage-signature": sig } });
     expect(signed.status).toBe(200);
-    expect(signed.data.matched).toBe(true);
+    expect(signed.data.matched).toBe(false);
+    expect(signed.data.ignoredReason).toMatch(/never contacted/);
   });
 });
 

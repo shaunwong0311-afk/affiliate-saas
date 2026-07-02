@@ -163,6 +163,8 @@ export async function advanceSequences(
   let emailsSent = 0;
   let dmTasksCreated = 0;
   for (const p of active) {
+    // Out-of-office snooze: never follow up while they're away.
+    if (p.snoozedUntil && new Date(p.snoozedUntil).getTime() > now.getTime()) continue;
     const sentMsgs = (await deps.db.outreachMessages.find((m) => m.prospectId === p.id && m.campaignId === campaign.id && m.status === "sent")).sort((a, b) => b.step - a.step);
     const dmTasks = (await deps.db.dmTasks.find((t) => t.prospectId === p.id && t.campaignId === campaign.id)).sort((a, b) => b.step - a.step);
     // Cadence position = the furthest step reached on EITHER channel.

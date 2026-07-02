@@ -115,6 +115,8 @@ export interface AppContext {
   transactionalMailer: TransactionalMailer;
   /** Push notifier for AI-SDR human handoffs (Slack when keyed; in-process stub otherwise). */
   notifier: Notifier;
+  /** Public web-app origin — self-serve signup links the reply router hands out. */
+  publicAppUrl: string;
   clock: Clock;
 }
 
@@ -350,6 +352,7 @@ export function createContext(overrides: Partial<AppContext> = {}): AppContext {
     notifier:
       overrides.notifier ??
       (process.env.SLACK_WEBHOOK_URL ? new SlackWebhookNotifier({ webhookUrl: process.env.SLACK_WEBHOOK_URL, http: jsonHttp }) : new StubNotifier()),
+    publicAppUrl: overrides.publicAppUrl ?? config.corsOrigins[0] ?? "",
     clock: overrides.clock ?? systemClock,
   };
 }

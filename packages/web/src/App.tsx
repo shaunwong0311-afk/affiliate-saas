@@ -10,6 +10,7 @@ import { Handoffs } from "./pages/Handoffs";
 import { DmQueue } from "./pages/DmQueue";
 import { Deliverability } from "./pages/Deliverability";
 import { Activation } from "./pages/Activation";
+import { Join } from "./pages/Join";
 import { Programs } from "./pages/Programs";
 import { Affiliates } from "./pages/Affiliates";
 import { AffiliateDetail } from "./pages/AffiliateDetail";
@@ -171,6 +172,11 @@ function Topbar() {
 export function App() {
   const { path, navigate: go } = useHashRoute();
   const { me, loading, isAffiliate } = useAuth();
+
+  // PUBLIC routes render outside the authenticated shell (no session required) — this is
+  // where the self-serve signup links the reply router hands out actually land.
+  const joinMatch = matchRoute("/join/:merchantId", path);
+  if (joinMatch) return <Join merchantId={joinMatch.merchantId!} />;
 
   if (loading) return <Spinner label="initializing vantage…" />;
   if (!me) {

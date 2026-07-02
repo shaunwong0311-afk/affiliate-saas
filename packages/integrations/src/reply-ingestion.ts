@@ -12,6 +12,10 @@ export interface InboundReply {
   body: string;
   /** Provider message id, for dedup. */
   messageId: string;
+  /** In-Reply-To header — correlates the mail to OUR outreach (vs unrelated inbox traffic). */
+  inReplyTo?: string | null;
+  /** References header chain, same purpose. */
+  references?: string | null;
   receivedAt: string;
 }
 
@@ -21,18 +25,29 @@ export interface ReplyIngestionSource {
   poll(): Promise<InboundReply[]>;
 }
 
-/** Strip quoted history and signatures so the classifier sees only the new text. */
+/**
+ * Strip quoted history, signatures, and OUR OWN outreach footer so the classifier sees only
+ * the sender's new text. Handles bottom-posted replies (new text below the quote) by skipping
+ * quoted/header lines instead of stopping at the first one. CRITICAL: never falls back to the
+ * raw email — the raw includes our own "Unsubscribe: reply STOP…" footer, and classifying that
+ * used to globally suppress prospects who bottom-posted "I'm interested!". No extractable new
+ * text → "" → the caller routes to human review instead of guessing.
+ */
 export function extractReplyText(raw: string): string {
   const lines = raw.split(/\r?\n/);
   const out: string[] = [];
   for (const line of lines) {
-    if (/^\s*>/.test(line)) break; // quoted previous message
-    if (/^On .* wrote:$/.test(line)) break; // gmail/outlook quote header
-    if (/^-{2,}\s*$/.test(line)) break; // signature delimiter
-    if (/^From:\s/.test(line) || /^Sent:\s/.test(line)) break; // forwarded header
+    // `>`-quoted lines are SKIPPED (not a stop): bottom-posters put their reply below them.
+    if (/^\s*>/.test(line)) continue;
+    // An unprefixed quote header / signature delimiter / our own footer means everything
+    // below is the original message (Outlook-style top-posting) — stop collecting.
+    if (/^On .{0,200} wrote:\s*$/.test(line)) break;
+    if (/^(From|Sent):\s/.test(line)) break;
+    if (/^(-{2,}|—+)\s*$/.test(line)) break;
+    if (/^Unsubscribe: reply STOP/i.test(line)) break;
     out.push(line);
   }
-  return out.join("\n").trim() || raw.trim();
+  return out.join("\n").trim();
 }
 
 /**
@@ -57,6 +72,8 @@ export interface ImapMessage {
   subject: string;
   text: string;
   messageId: string;
+  inReplyTo?: string | null;
+  references?: string | null;
   receivedAt: string;
 }
 
@@ -102,6 +119,8 @@ export class ImapReplyIngestion implements ReplyIngestionSource {
         subject: m.subject,
         body: extractReplyText(m.text),
         messageId: m.messageId || `${m.from}:${m.subject}:${m.receivedAt}`,
+        inReplyTo: m.inReplyTo ?? null,
+        references: m.references ?? null,
         receivedAt: m.receivedAt,
       }));
     } finally {
@@ -153,6 +172,8 @@ export const defaultImapSessionFactory: ImapSessionFactory = async (cfg) => {
           subject: parsed.subject ?? env.subject ?? "",
           text: parsed.text ?? "",
           messageId: (parsed.messageId ?? env.messageId ?? "").replace(/^<|>$/g, ""),
+          inReplyTo: (parsed.inReplyTo ?? env.inReplyTo ?? null) || null,
+          references: Array.isArray(parsed.references) ? parsed.references.join(" ") : (parsed.references ?? null),
           receivedAt,
         });
       }
@@ -165,7 +186,8 @@ export const defaultImapSessionFactory: ImapSessionFactory = async (cfg) => {
   };
 };
 
-/** Parse an ESP inbound-parse webhook payload into a normalized reply. */
+/** Parse an ESP inbound-parse webhook payload into a normalized reply. An empty extracted
+ * body is kept (routed to human review), never re-hydrated from the raw email. */
 export function parseInboundWebhook(payload: any): InboundReply | null {
   if (!payload) return null;
   const toEmail = payload.to ?? payload.recipient ?? payload.To ?? "";
@@ -173,6 +195,15 @@ export function parseInboundWebhook(payload: any): InboundReply | null {
   const subject = payload.subject ?? payload.Subject ?? "";
   const body = extractReplyText(payload.text ?? payload["body-plain"] ?? payload.body ?? "");
   const messageId = payload.messageId ?? payload["Message-Id"] ?? `${fromEmail}:${subject}`;
-  if (!fromEmail || !body) return null;
-  return { toEmail, fromEmail, subject, body, messageId, receivedAt: new Date().toISOString() };
+  if (!fromEmail) return null;
+  return {
+    toEmail,
+    fromEmail,
+    subject,
+    body,
+    messageId,
+    inReplyTo: payload.inReplyTo ?? payload["In-Reply-To"] ?? null,
+    references: payload.references ?? payload.References ?? null,
+    receivedAt: new Date().toISOString(),
+  };
 }

@@ -86,5 +86,10 @@ export interface RecruitmentDeps {
    * queue is always written; this is the extra nudge so warm A-tier replies aren't missed.
    */
   notifier?: Notifier;
+  /**
+   * Public web-app origin (e.g. https://app.example.com) used to build the self-serve
+   * signup links the reply router hands out. Optional — absent → relative links.
+   */
+  publicAppUrl?: string;
   clock: Clock;
 }

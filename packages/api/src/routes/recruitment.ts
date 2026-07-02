@@ -528,7 +528,18 @@ export const recruitmentRoutes: RouteModule = (app, ctx) => {
     }
     const inbound = parseInboundWebhook(request.body);
     if (!inbound) return ok(reply, { matched: false, reason: "unparseable payload" });
-    const result = await processInboundReply(ctx, inbound);
-    return ok(reply, { matched: result.matched, action: result.outcome?.action ?? null });
+    // Resolve the owning merchant from the RECIPIENT mailbox — without this, a reply to
+    // merchant A's mailbox could route to merchant B's prospect for the same creator.
+    const to = (inbound.toEmail ?? "").toLowerCase();
+    const mailbox = to ? await ctx.db.mailboxes.findOne((m) => m.email.toLowerCase() === to) : null;
+    if (!mailbox) return ok(reply, { matched: false, reason: "recipient does not match a connected mailbox" });
+    const state = await getAutomationState(ctx, mailbox.merchantId);
+    const result = await processInboundReply(ctx, inbound, {
+      merchantId: mailbox.merchantId,
+      meetingTier: state.meetingTier,
+      aiSdrMode: state.aiSdrMode,
+      signupBaseUrl: ctx.config.corsOrigins[0],
+    });
+    return ok(reply, { matched: result.matched, action: result.outcome?.action ?? null, ignoredReason: result.ignoredReason ?? null });
   });
 };

@@ -10,6 +10,7 @@ import {
   monitorDeliverability,
   handleReply,
   ingestReplies,
+  processInboundReply,
 } from "@affiliate/recruitment";
 import { parseInboundWebhook } from "@affiliate/integrations";
 import { verifyHmacSignature, newId } from "@affiliate/core";
@@ -139,12 +140,17 @@ export const automationRoutes: RouteModule = (app, ctx) => {
     }
     const inbound = parseInboundWebhook(request.body);
     if (!inbound) throw badRequest("unparseable reply payload");
-    const prospect = await ctx.db.prospects.findOne(
-      (p) => p.merchantId === merchantId && p.email != null && p.email.toLowerCase() === inbound.fromEmail.toLowerCase(),
-    );
-    if (!prospect) return ok(reply, { matched: false });
     const state = await getAutomationState(ctx, merchantId);
-    const outcome = await handleReply(ctx, prospect.id, inbound.body, { meetingTier: state.meetingTier, aiSdrMode: state.aiSdrMode });
+    // processInboundReply centralizes Message-Id dedup (provider retries can't double-route),
+    // tenant scoping, and the outreach-correlation/state guard.
+    const res = await processInboundReply(ctx, inbound, {
+      merchantId,
+      meetingTier: state.meetingTier,
+      aiSdrMode: state.aiSdrMode,
+      signupBaseUrl: ctx.config.corsOrigins[0],
+    });
+    if (!res.matched) return ok(reply, { matched: false, ignoredReason: res.ignoredReason ?? null });
+    const outcome = res.outcome!;
     return ok(reply, { matched: true, action: outcome.action, classification: outcome.classification, needsHuman: outcome.needsHuman ?? false, handoffId: outcome.handoff?.id ?? null });
   });
 

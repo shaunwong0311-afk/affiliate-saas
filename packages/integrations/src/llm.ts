@@ -54,6 +54,10 @@ export class DeterministicLlm implements LlmClient {
 /** Keyword-grounded reply classifier (Section 8.5). */
 export function classifyReply(text: string): string {
   const t = text.toLowerCase();
+  // Honor the footer-advertised opt-out DETERMINISTICALLY: a bare "STOP"/"unsubscribe" (alone
+  // or as the whole first line) always classifies unsubscribe, whatever any LLM would say.
+  const firstLine = text.trim().split(/\r?\n/)[0]?.trim() ?? "";
+  if (/^(stop|unsubscribe)[.!]?$/i.test(firstLine)) return "unsubscribe";
   if (/\b(unsubscribe|remove me|stop emailing|opt out)\b/.test(t)) return "unsubscribe";
   if (/\b(out of office|on vacation|away until|auto[- ]?reply)\b/.test(t)) return "out_of_office";
   if (/\b(not interested|no thanks|not a fit|please stop|already partnered)\b/.test(t)) return "not_interested";

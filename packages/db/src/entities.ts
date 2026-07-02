@@ -297,6 +297,8 @@ export interface Prospect {
   country: string | null;
   language: string | null;
   suppressionStatus: "none" | "suppressed" | "bounced";
+  /** Sequence paused until this time (out-of-office snooze). Null/past = active. */
+  snoozedUntil?: Timestamp | null;
   scoreBreakdown: unknown | null;
   /**
    * TRUE when this prospect was produced by a deterministic/synthetic source

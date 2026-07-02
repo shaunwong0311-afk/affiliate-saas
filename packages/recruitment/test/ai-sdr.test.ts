@@ -73,10 +73,13 @@ describe("AI-SDR reply routing", () => {
     expect(notifier.sent[0].urgency).toBe("high");
   });
 
-  it("a pure interested reply with nothing to answer goes straight to self-serve", async () => {
+  it("a pure interested reply routes self-serve WITH a sendable draft (never silence)", async () => {
     const p = await db.prospects.insert(prospect());
     const out = await handleReply(makeDeps(), p.id, "Sounds good, sign me up!");
     expect(out.action).toBe("self_serve");
-    expect(await db.handoffs.count(() => true)).toBe(0);
+    expect(out.signupUrl).toContain(`/#/join/${p.merchantId}`); // full merchant id — a real, resolvable link
+    // Until the outbound-reply transport auto-sends, a human gets a ready-to-send draft
+    // containing the signup link — "sign me up!" must never dead-end in silence.
+    expect(out.handoff?.suggestedReply).toContain(out.signupUrl!);
   });
 });
