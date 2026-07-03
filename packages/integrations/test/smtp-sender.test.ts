@@ -105,6 +105,49 @@ describe("SmtpSender", () => {
   });
 });
 
+describe("OAuth-rail parity (Graph / Gmail)", () => {
+  const withHeaders = { ...email, inReplyTo: "<prev@x.com>", headers: { "List-Unsubscribe": "<https://x/u>", "List-Unsubscribe-Post": "List-Unsubscribe=One-Click" } };
+
+  function capturingHttp(status = 202) {
+    const calls: { url: string; body: unknown; headers: Record<string, string> }[] = [];
+    return {
+      calls,
+      async post(url: string, body: unknown, headers: Record<string, string>) {
+        calls.push({ url, body, headers });
+        return { status, json: status < 300 ? {} : { error: { code: "ErrorInvalidRecipients" } } };
+      },
+    };
+  }
+
+  it("Graph sends RAW MIME carrying List-Unsubscribe + threading, and returns a stamped message id", async () => {
+    const http = capturingHttp(202);
+    const { MicrosoftGraphSender } = await import("../src/index.js");
+    const r = await new MicrosoftGraphSender({ accessToken: "t", http }).send(withHeaders);
+    expect(r.status).toBe("sent");
+    expect(r.messageId).toMatch(/@/); // a real Message-Id we can thread/correlate on
+    expect(http.calls[0].headers["Content-Type"]).toBe("text/plain"); // raw MIME, not the structured object
+    const mime = Buffer.from(http.calls[0].body as string, "base64").toString("utf8");
+    expect(mime).toContain("List-Unsubscribe: <https://x/u>");
+    expect(mime).toContain("In-Reply-To: <prev@x.com>");
+    expect(mime).toContain("References: <prev@x.com>");
+  });
+
+  it("Graph maps a recipient-level error to a hard bounce (not a generic failure)", async () => {
+    const { MicrosoftGraphSender } = await import("../src/index.js");
+    const r = await new MicrosoftGraphSender({ accessToken: "t", http: capturingHttp(400) }).send(email);
+    expect(r.status).toBe("bounced");
+  });
+
+  it("Gmail MIME includes List-Unsubscribe + References", async () => {
+    const http = capturingHttp(200);
+    const { GmailSender } = await import("../src/index.js");
+    await new GmailSender({ accessToken: "t", http }).send(withHeaders);
+    const raw = Buffer.from((http.calls[0].body as { raw: string }).raw, "base64url").toString("utf8");
+    expect(raw).toContain("List-Unsubscribe:");
+    expect(raw).toContain("References: <prev@x.com>");
+  });
+});
+
 describe("buildMailboxSender", () => {
   it("builds an SMTP sender from smtp credentials", () => {
     const creds: MailboxCredentials = { kind: "smtp", host: "h", port: 587, user: "u", pass: "p" };

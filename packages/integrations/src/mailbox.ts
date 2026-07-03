@@ -33,6 +33,16 @@ export class NotConfiguredError extends Error {
   }
 }
 
+/**
+ * True when a provider error payload names a recipient/address problem (a hard bounce we
+ * should suppress) vs a transient/auth failure (retry, don't suppress). Errs toward "failed".
+ */
+function providerErrorIsBounce(status: number, json: unknown): boolean {
+  if (status < 400) return false;
+  const blob = JSON.stringify(json ?? "").toLowerCase();
+  return /invalidrecipient|recipient.*(not found|reject|invalid)|address.*(invalid|rejected|not found)|no such user|mailbox.*(unavailable|not found)|failedrecipient/i.test(blob);
+}
+
 /** Gmail API sender — real shape; requires an OAuth access token + HTTP client. */
 export class GmailSender implements MailboxSender {
   readonly provider = "gmail";
@@ -40,36 +50,43 @@ export class GmailSender implements MailboxSender {
 
   async send(email: OutboundEmail): Promise<SendResult> {
     if (!this.opts.http) throw new NotConfiguredError(this.provider);
+    // buildRfc822 carries List-Unsubscribe + In-Reply-To/References, so bulk-sender headers
+    // and follow-up threading survive on the Gmail rail exactly as on SMTP.
     const raw = Buffer.from(buildRfc822(email)).toString("base64url");
     const res = await this.opts.http.post(
       "https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
       { raw },
       { Authorization: `Bearer ${this.opts.accessToken}`, "Content-Type": "application/json" },
     );
-    return res.status < 300
-      ? { messageId: res.json.id, status: "sent" }
-      : { messageId: "", status: "failed", reason: `gmail ${res.status}` };
+    if (res.status < 300) return { messageId: res.json?.id ?? "", status: "sent" };
+    return { messageId: "", status: providerErrorIsBounce(res.status, res.json) ? "bounced" : "failed", reason: `gmail ${res.status}` };
   }
 }
 
-/** Microsoft Graph sender — skeleton. */
+/**
+ * Microsoft Graph sender. Sends RAW MIME (base64) so the RFC 8058 List-Unsubscribe headers
+ * and In-Reply-To/References threading survive — Graph's structured `message` object only
+ * accepts `internetMessageHeaders` for `x-`-prefixed customs, which would silently DROP
+ * List-Unsubscribe. Recipient-level Graph errors map to a hard bounce.
+ */
 export class MicrosoftGraphSender implements MailboxSender {
   readonly provider = "microsoft";
   constructor(private readonly opts: { accessToken: string; http?: HttpClient }) {}
   async send(email: OutboundEmail): Promise<SendResult> {
     if (!this.opts.http) throw new NotConfiguredError(this.provider);
+    // Graph's sendMail returns 202 with no message id, so we STAMP our own Message-Id in the
+    // MIME and return it — that's what lets follow-ups thread + inbound replies correlate.
+    const domain = email.fromEmail.split("@")[1] ?? "mail.local";
+    const messageId = email.messageId ?? `<${createHash("sha1").update(email.toEmail + email.subject + email.body).digest("hex").slice(0, 24)}@${domain}>`;
+    // POST /me/sendMail with a base64 MIME body (Content-Type text/plain) preserves all headers.
+    const mime = Buffer.from(buildRfc822({ ...email, messageId })).toString("base64");
     const res = await this.opts.http.post(
       "https://graph.microsoft.com/v1.0/me/sendMail",
-      {
-        message: {
-          subject: email.subject,
-          body: { contentType: "Text", content: email.body },
-          toRecipients: [{ emailAddress: { address: email.toEmail } }],
-        },
-      },
-      { Authorization: `Bearer ${this.opts.accessToken}`, "Content-Type": "application/json" },
+      mime,
+      { Authorization: `Bearer ${this.opts.accessToken}`, "Content-Type": "text/plain" },
     );
-    return res.status < 300 ? { messageId: `graph_${Date.now()}`, status: "sent" } : { messageId: "", status: "failed" };
+    if (res.status < 300) return { messageId, status: "sent" };
+    return { messageId: "", status: providerErrorIsBounce(res.status, res.json) ? "bounced" : "failed", reason: `graph ${res.status}` };
   }
 }
 
@@ -238,7 +255,10 @@ function buildRfc822(email: OutboundEmail): string {
     `From: ${email.fromName} <${email.fromEmail}>`,
     `To: ${email.toEmail}`,
     `Subject: ${email.subject}`,
+    email.messageId ? `Message-Id: ${email.messageId}` : "",
+    // Threading: set both In-Reply-To AND References (mail clients thread on References).
     email.inReplyTo ? `In-Reply-To: ${email.inReplyTo}` : "",
+    email.inReplyTo ? `References: ${email.inReplyTo}` : "",
     ...extra,
     "Content-Type: text/plain; charset=UTF-8",
     "",

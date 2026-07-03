@@ -66,6 +66,9 @@ export interface OutboundEmail {
   body: string;
   /** For threading follow-ups. */
   inReplyTo?: string | null;
+  /** A caller-supplied Message-Id to stamp on the outgoing MIME (rails that don't return one,
+   *  e.g. Graph, use this so follow-ups can still thread + replies can be correlated). */
+  messageId?: string;
   /** Extra RFC822 headers — e.g. the one-click List-Unsubscribe (RFC 8058) required by
    *  Gmail/Yahoo bulk-sender rules. Senders include these on the outgoing message. */
   headers?: Record<string, string>;
