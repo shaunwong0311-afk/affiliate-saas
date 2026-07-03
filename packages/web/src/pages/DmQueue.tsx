@@ -2,6 +2,15 @@ import { useState } from "react";
 import { api, shortDate } from "../api";
 import { useApi, Card, Badge, PageHeader, EmptyState, Stat } from "../ui";
 
+interface DmFollowupTarget {
+  prospectId: string;
+  identity: string;
+  tier: "A" | "B" | "C" | null;
+  score: number | null;
+  daysSinceEmail: number | null;
+  target: { platform: string; handle: string; profileUrl: string; deepLink: string | null; opensComposer: boolean };
+}
+
 interface DmTask {
   id: string;
   prospectId: string;
@@ -22,6 +31,7 @@ const PLATFORM_ICON: Record<string, string> = { instagram: "◉", twitter: "𝕏
 export function DmQueue() {
   const [status, setStatus] = useState<"pending" | "sent" | "skipped">("pending");
   const { data, loading, error, reload } = useApi<DmTask[]>(() => api.get(`/recruitment/dm-tasks?status=${status}`), [status]);
+  const followup = useApi<DmFollowupTarget[]>(() => api.get("/recruitment/dm-followup"));
   const [busy, setBusy] = useState<string | null>(null);
   const [copied, setCopied] = useState<string | null>(null);
 
@@ -64,6 +74,29 @@ export function DmQueue() {
       </div>
 
       {error && <div className="err-banner">{error}</div>}
+
+      {followup.data && followup.data.length > 0 && (
+        <div className="mt-24">
+          <Card flush title="Worth a DM nudge" sub="high-value prospects you emailed who haven't replied — reach them on the channel they answer">
+            <table className="table">
+              <thead><tr><th>Prospect</th><th>Tier</th><th>Platform</th><th className="num">Days since email</th><th className="num" /></tr></thead>
+              <tbody>
+                {followup.data.map((t) => (
+                  <tr key={t.prospectId}>
+                    <td><strong>{t.identity}</strong> <span className="faint mono" style={{ fontSize: 12 }}>@{t.target.handle}</span></td>
+                    <td>{t.tier ? <Badge kind={t.tier === "A" ? "neg" : t.tier === "B" ? "warn" : ""}>{t.tier}</Badge> : <span className="faint">—</span>}</td>
+                    <td className="muted" style={{ fontSize: 12 }}>{t.target.platform}</td>
+                    <td className="num mono">{t.daysSinceEmail != null ? Math.round(t.daysSinceEmail) : "—"}</td>
+                    <td className="num">
+                      <a className="btn sm ghost" href={t.target.deepLink ?? t.target.profileUrl} target="_blank" rel="noreferrer">{t.target.opensComposer ? "Open DM ↗" : "Open profile ↗"}</a>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </Card>
+        </div>
+      )}
 
       <div className="mt-24">
         {loading ? null : rows.length === 0 ? (

@@ -3,7 +3,6 @@ import {
   getAutomationState,
   setAutomationState,
   autonomousCycle,
-  tickScheduler,
   sourceYield,
   deliverabilityHealth,
   mailboxHealth,
@@ -11,6 +10,7 @@ import {
   handleReply,
   ingestReplies,
   processInboundReply,
+  sendReplyToProspect,
 } from "@affiliate/recruitment";
 import { parseInboundWebhook } from "@affiliate/integrations";
 import { verifyHmacSignature, newId } from "@affiliate/core";
@@ -195,6 +195,26 @@ export const automationRoutes: RouteModule = (app, ctx) => {
     return ok(reply, updated);
   });
 
+  // Send the (edited) reply to the creator AS the merchant, threaded onto their inbound
+  // message, and resolve the handoff — the in-product "Approve & send" the queue promises.
+  app.post("/recruitment/handoffs/:id/send-reply", async (request, reply) => {
+    const { merchantId } = await requireMerchant(ctx, request, "write");
+    const id = (request.params as { id: string }).id;
+    const handoff = await ctx.db.handoffs.get(id);
+    if (!handoff || handoff.merchantId !== merchantId) throw notFound("handoff");
+    const body = parseBody(z.object({ reply: z.string().min(1) }), request);
+    const inboundReply = handoff.replyId ? await ctx.db.replies.get(handoff.replyId) : null;
+    const result = await sendReplyToProspect(ctx, {
+      prospectId: handoff.prospectId,
+      body: body.reply,
+      inReplyToMessageId: inboundReply?.inboundMessageId ?? null,
+    });
+    if (!result.sent) throw badRequest(`could not send: ${result.reason ?? "unknown"}`);
+    const updated = await ctx.db.handoffs.update(id, { status: "resolved", resolvedAt: ctx.clock.now().toISOString() });
+    await writeAudit(ctx, { merchantId, actorId: null, action: "recruitment.handoff.replied", subjectType: "prospect", subjectId: handoff.prospectId, metadata: { handoffId: id } });
+    return ok(reply, { sent: true, handoff: updated });
+  });
+
   // ---- Merchant KB (the AI-SDR's grounded FAQ source) -----------------------
   app.get("/recruitment/faqs", async (request, reply) => {
     const { merchantId } = await requireMerchant(ctx, request, "read");
@@ -218,6 +238,4 @@ export const automationRoutes: RouteModule = (app, ctx) => {
     await ctx.db.merchantFaqs.delete(id);
     return ok(reply, { id, deleted: true });
   });
-
-  void tickScheduler;
 };

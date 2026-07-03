@@ -1,10 +1,16 @@
 import { useEffect, useState } from "react";
 
+/** The route path from the current hash, minus any `?query` (e.g. an OAuth callback's
+ *  `?connected=…`). Pages that need those params read `window.location.hash` directly. */
+function currentPath(): string {
+  return (window.location.hash.slice(1) || "/").split("?")[0] || "/";
+}
+
 /** Minimal dependency-free hash router. Paths look like #/affiliates/:id. */
 export function useHashRoute(): { path: string; navigate: (to: string) => void } {
-  const [hash, setHash] = useState(() => window.location.hash.slice(1) || "/");
+  const [hash, setHash] = useState(currentPath);
   useEffect(() => {
-    const onChange = () => setHash(window.location.hash.slice(1) || "/");
+    const onChange = () => setHash(currentPath());
     window.addEventListener("hashchange", onChange);
     return () => window.removeEventListener("hashchange", onChange);
   }, []);

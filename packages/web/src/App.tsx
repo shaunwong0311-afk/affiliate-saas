@@ -6,6 +6,7 @@ import { Dashboard } from "./pages/Dashboard";
 import { Recruitment } from "./pages/Recruitment";
 import { Automation } from "./pages/Automation";
 import { NicheMap } from "./pages/NicheMap";
+import { Campaigns } from "./pages/Campaigns";
 import { Handoffs } from "./pages/Handoffs";
 import { DmQueue } from "./pages/DmQueue";
 import { Deliverability } from "./pages/Deliverability";
@@ -51,6 +52,7 @@ const MERCHANT_NAV: { section: string; items: NavItem[] }[] = [
   {
     section: "Outreach",
     items: [
+      { label: "Campaigns", ico: "✎", path: "/campaigns" },
       { label: "Handoffs", ico: "⇥", path: "/handoffs" },
       { label: "DM Queue", ico: "✉", path: "/dm-queue" },
       { label: "Deliverability", ico: "◊", path: "/deliverability" },
@@ -97,6 +99,7 @@ const ROUTES: { pattern: string; render: (params: Record<string, string>) => JSX
   { pattern: "/recruitment", render: () => <Recruitment /> },
   { pattern: "/niche-map", render: () => <NicheMap /> },
   { pattern: "/automation", render: () => <Automation /> },
+  { pattern: "/campaigns", render: () => <Campaigns /> },
   { pattern: "/handoffs", render: () => <Handoffs /> },
   { pattern: "/dm-queue", render: () => <DmQueue /> },
   { pattern: "/deliverability", render: () => <Deliverability /> },

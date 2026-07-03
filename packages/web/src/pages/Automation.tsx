@@ -8,9 +8,11 @@ interface AutomationState {
   autoSendMinScore: number;
   hitlTier: "A" | "B" | "C";
   meetingTier: "A" | "B" | "C";
+  aiSdrMode?: "hitl" | "autopilot";
   sourcingLimitPerCycle: number;
   lastCycleAt: string | null;
 }
+interface MerchantFaq { id: string; question: string; answer: string; createdAt: string }
 interface Deliverability { sent: number; bounceRate: number; complaintRate: number; circuitOpen: boolean }
 interface SourceYieldRow { sourceType: string; sourced: number; contacted: number; producing: number; producedRevenueCents: number; yield: number }
 interface Meeting { id: string; prospectId: string; status: string; bookingUrl: string | null; notes: string | null; createdAt: string }
@@ -21,9 +23,15 @@ export function Automation() {
   const deliver = useApi<Deliverability>(() => api.get("/recruitment/deliverability"));
   const yields = useApi<SourceYieldRow[]>(() => api.get("/recruitment/source-yield"));
   const meetings = useApi<Meeting[]>(() => api.get("/recruitment/meetings"));
+  const personalization = useApi<{ plan: "template" | "hybrid" | "llm" }>(() => api.get("/recruitment/personalization"));
+  const faqs = useApi<MerchantFaq[]>(() => api.get("/recruitment/faqs"));
   const [busy, setBusy] = useState(false);
   const [lastCycle, setLastCycle] = useState<CycleSummary | null>(null);
   const [msg, setMsg] = useState<string | null>(null);
+  const [ingestMsg, setIngestMsg] = useState<string | null>(null);
+  const [ingestBusy, setIngestBusy] = useState(false);
+  const [faqForm, setFaqForm] = useState({ question: "", answer: "" });
+  const [faqBusy, setFaqBusy] = useState(false);
 
   const reloadAll = () => { auto.reload(); deliver.reload(); yields.reload(); meetings.reload(); };
 
@@ -32,6 +40,29 @@ export function Automation() {
     try { await api.put("/recruitment/automation", body); auto.reload(); }
     catch (e: any) { setMsg(e?.message ?? "failed"); }
     finally { setBusy(false); }
+  }
+  async function checkReplies() {
+    setIngestBusy(true); setIngestMsg(null);
+    try {
+      const r = await api.post<{ mailboxes: number; polled: number; matched: number }>("/recruitment/ingest-replies", {});
+      setIngestMsg(`Polled ${r.polled} message(s) across ${r.mailboxes} mailbox(es) — ${r.matched} matched to a prospect.`);
+    } catch (e: any) { setIngestMsg(e?.message ?? "failed"); }
+    finally { setIngestBusy(false); }
+  }
+  async function updatePlan(plan: "template" | "hybrid" | "llm") {
+    try { await api.put("/recruitment/personalization", { plan }); personalization.reload(); }
+    catch (e: any) { setMsg(e?.message ?? "failed"); }
+  }
+  async function addFaq() {
+    if (!faqForm.question.trim() || !faqForm.answer.trim()) { setMsg("A FAQ needs both a question and an answer."); return; }
+    setFaqBusy(true);
+    try { await api.post("/recruitment/faqs", { question: faqForm.question.trim(), answer: faqForm.answer.trim() }); setFaqForm({ question: "", answer: "" }); faqs.reload(); }
+    catch (e: any) { setMsg(e?.message ?? "failed"); }
+    finally { setFaqBusy(false); }
+  }
+  async function deleteFaq(id: string) {
+    try { await api.del(`/recruitment/faqs/${id}`); faqs.reload(); }
+    catch (e: any) { setMsg(e?.message ?? "failed"); }
   }
   async function runCycle() {
     setBusy(true); setMsg(null);
@@ -52,6 +83,7 @@ export function Automation() {
         subtitle="Connect a store + mailbox and the engine sources the open web, enriches, scores, sends as you, sequences, and routes replies — A-tier held for your approval, everything else automated. Your job: approve and monitor."
         actions={
           <>
+            <button className="btn" onClick={checkReplies} disabled={ingestBusy}>{ingestBusy ? "checking…" : "✉ Check for replies now"}</button>
             <button className="btn" onClick={runCycle} disabled={busy}>↻ Run one cycle</button>
             {running ? (
               <button className="btn" onClick={() => patch({ status: "paused" })} disabled={busy}>Pause</button>
@@ -63,6 +95,7 @@ export function Automation() {
       />
 
       {msg && <div className="err-banner">{msg}</div>}
+      {ingestMsg && <div className="mt-8" style={{ fontSize: 13, color: "var(--acc)" }}>{ingestMsg}</div>}
 
       <div className="grid grid-4">
         <Stat label="Automation" value={<Badge kind={running ? "pos" : s?.status === "paused" ? "warn" : ""}>{s?.status}</Badge>} foot={s?.lastCycleAt ? "last cycle recorded" : "no cycle yet"} footClass="muted" />
@@ -155,6 +188,66 @@ export function Automation() {
               </tbody>
             </table>
           )}
+        </Card>
+      </div>
+
+      <div className="grid grid-2 mt-24">
+        <Card title="AI-SDR" sub="how the assistant handles inbound replies">
+          <Field label="Answer mode">
+            <select className="select" value={s?.aiSdrMode ?? "hitl"} onChange={(e) => patch({ aiSdrMode: e.target.value as "hitl" | "autopilot" })} disabled={busy}>
+              <option value="hitl">HITL — draft, a human approves before sending</option>
+              <option value="autopilot">Autopilot — auto-send allow-listed grounded answers</option>
+            </select>
+          </Field>
+          <p className="faint" style={{ fontSize: 12 }}>
+            <strong>HITL</strong>: every grounded answer is queued as a suggested reply on a Handoff for one-click approval.
+            <br /><strong>Autopilot</strong>: allow-listed, KB-grounded answers send automatically; gated topics (rate/deal/legal) and anything ungrounded always still route to a human.
+          </p>
+        </Card>
+
+        <Card title="Personalization plan" sub="how outreach bodies are written (billed differently)">
+          {personalization.loading ? null : (
+            <>
+              <Field label="Plan">
+                <select className="select" value={personalization.data?.plan ?? "hybrid"} onChange={(e) => updatePlan(e.target.value as "template" | "hybrid" | "llm")}>
+                  <option value="template">Template — fixed sequence, cheapest</option>
+                  <option value="hybrid">Hybrid — template + light per-prospect tailoring</option>
+                  <option value="llm">LLM — fully written per prospect, cites real evidence</option>
+                </select>
+              </Field>
+              <p className="faint" style={{ fontSize: 12 }}>
+                <strong>Template</strong>: no per-send model cost. <strong>Hybrid</strong>: token-swapped with a light touch. <strong>LLM</strong>: each email individually written and grounded in the prospect's evidence (metered as usage).
+              </p>
+            </>
+          )}
+        </Card>
+      </div>
+
+      <div className="mt-24">
+        <Card title="AI-SDR knowledge base" sub="curated FAQs that ground the assistant's answers — it never guesses beyond your Program facts + these">
+          <div className="grid grid-2 mt-16" style={{ alignItems: "start" }}>
+            <Field label="Question"><input className="input" placeholder="Do you offer a discount code for my audience?" value={faqForm.question} onChange={(e) => setFaqForm({ ...faqForm, question: e.target.value })} /></Field>
+            <Field label="Answer"><input className="input" placeholder="Yes — every partner gets a unique 15% code at signup." value={faqForm.answer} onChange={(e) => setFaqForm({ ...faqForm, answer: e.target.value })} /></Field>
+          </div>
+          <button className="btn sm primary" onClick={addFaq} disabled={faqBusy}>{faqBusy ? "adding…" : "＋ Add FAQ"}</button>
+
+          <div className="mt-16">
+            {faqs.loading ? null : !faqs.data || faqs.data.length === 0 ? (
+              <EmptyState title="No FAQs yet" hint="Add a few Q&As so the AI-SDR can answer product/general questions instead of handing them off." />
+            ) : (
+              <div className="grid" style={{ gap: 10 }}>
+                {faqs.data.map((f) => (
+                  <div key={f.id} className="row wrap gap-8" style={{ justifyContent: "space-between", alignItems: "flex-start", padding: "10px 12px", background: "var(--ink-850)", border: "1px solid var(--line)", borderRadius: 8 }}>
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{ fontSize: 13, fontWeight: 600 }}>{f.question}</div>
+                      <div className="muted" style={{ fontSize: 12.5, marginTop: 2 }}>{f.answer}</div>
+                    </div>
+                    <button className="btn sm danger" onClick={() => deleteFaq(f.id)}>Remove</button>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
         </Card>
       </div>
     </>

@@ -328,6 +328,57 @@ async function createHandoff(
   return handoff;
 }
 
+/**
+ * Actually SEND a reply to a prospect as the merchant (the in-product "send" the Handoffs
+ * queue offers, and the transport autopilot answers use once graduated). Resolves the
+ * campaign mailbox, threads via the inbound Reply's Message-Id, and records the sent message.
+ * Returns null when it can't send (no email, no resolver, transport failure surfaced in .reason).
+ */
+export async function sendReplyToProspect(
+  deps: RecruitmentDeps,
+  args: { prospectId: string; body: string; inReplyToMessageId?: string | null; subject?: string },
+): Promise<{ sent: boolean; reason?: string; messageId?: string }> {
+  const prospect = await deps.db.prospects.require(args.prospectId);
+  if (!prospect.email) return { sent: false, reason: "prospect has no email" };
+  const merchant = await deps.db.merchants.require(prospect.merchantId);
+
+  // Resolve the mailbox from the prospect's most recent OUTBOUND message's campaign.
+  const sentMsgs = (await deps.db.outreachMessages.find((m) => m.prospectId === prospect.id && (m.status === "sent" || m.status === "replied"))).sort((a, b) => (b.sentAt ?? "").localeCompare(a.sentAt ?? ""));
+  const lastOut = sentMsgs[0];
+  const campaign = lastOut ? await deps.db.campaigns.get(lastOut.campaignId) : null;
+  const mailboxId = campaign?.mailboxId ?? null;
+  const mailbox = mailboxId ? await deps.db.mailboxes.get(mailboxId) : null;
+  const sender = deps.mailboxResolver ? await deps.mailboxResolver(mailboxId).catch(() => deps.mailer) : deps.mailer;
+
+  // Thread onto the creator's inbound message (so it lands in-conversation).
+  const inReplyTo = args.inReplyToMessageId ?? undefined;
+  const subject = args.subject ?? (lastOut ? `Re: ${lastOut.subject.replace(/^(re|fwd):\s*/i, "")}` : `Re: ${merchant.name}`);
+  const result = await sender.send({
+    fromName: merchant.name,
+    fromEmail: mailbox?.email ?? "no-reply@example.invalid",
+    toEmail: prospect.email,
+    subject,
+    body: args.body,
+    ...(inReplyTo ? { inReplyTo } : {}),
+  });
+  if (result.status !== "sent") return { sent: false, reason: result.reason ?? "send failed" };
+
+  const now = deps.clock.now().toISOString();
+  await deps.db.outreachMessages.insert({
+    id: newId("omsg"),
+    prospectId: prospect.id,
+    campaignId: campaign?.id ?? "manual",
+    step: (lastOut?.step ?? 0) + 100, // reply steps sit above sequence steps
+    variant: "reply",
+    subject,
+    body: args.body,
+    sentAt: now,
+    status: "sent",
+    providerMessageId: result.messageId || undefined,
+  });
+  return { sent: true, messageId: result.messageId };
+}
+
 /** Prospect states that can plausibly be replying to OUR outreach. A prospect we never
  * contacted sending us mail is inbox noise (their newsletter, unrelated business), not a reply. */
 const REPLYABLE_STATES = new Set(["queued", "contacted", "in_sequence", "replied"]);

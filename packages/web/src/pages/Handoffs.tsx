@@ -29,11 +29,33 @@ export function Handoffs() {
   const { data, loading, error, reload } = useApi<Handoff[]>(() => api.get(`/recruitment/handoffs?status=${status}`), [status]);
   const [busy, setBusy] = useState<string | null>(null);
   const [copied, setCopied] = useState<string | null>(null);
+  // Per-handoff editable draft (seeded from suggestedReply), send state, and result.
+  const [drafts, setDrafts] = useState<Record<string, string>>({});
+  const [sending, setSending] = useState<string | null>(null);
+  const [sendMsg, setSendMsg] = useState<Record<string, { ok: boolean; text: string }>>({});
+
+  const draftFor = (h: Handoff) => drafts[h.id] ?? h.suggestedReply ?? "";
 
   async function resolve(id: string) {
     setBusy(id);
     try { await api.post(`/recruitment/handoffs/${id}/resolve`, {}); reload(); }
     finally { setBusy(null); }
+  }
+  async function sendReply(h: Handoff) {
+    const reply = draftFor(h).trim();
+    if (!reply) { setSendMsg((m) => ({ ...m, [h.id]: { ok: false, text: "Write a reply before sending." } })); return; }
+    setSending(h.id);
+    setSendMsg((m) => { const n = { ...m }; delete n[h.id]; return n; });
+    try {
+      // Sends as the merchant, threaded onto the inbound message, and resolves the handoff
+      // server-side — so on success it drops off the open queue.
+      await api.post(`/recruitment/handoffs/${h.id}/send-reply`, { reply });
+      reload();
+    } catch (e: any) {
+      setSendMsg((m) => ({ ...m, [h.id]: { ok: false, text: e?.message ?? "could not send reply" } }));
+    } finally {
+      setSending(null);
+    }
   }
   async function copy(id: string, text: string) {
     try { await navigator.clipboard.writeText(text); setCopied(id); setTimeout(() => setCopied((c) => (c === id ? null : c)), 1600); } catch { /* ignore */ }
@@ -90,7 +112,7 @@ export function Handoffs() {
                   </details>
                 )}
 
-                {h.suggestedReply && (
+                {h.status === "resolved" && h.suggestedReply && (
                   <div style={{ marginTop: 12 }}>
                     <div className="faint" style={{ fontSize: 11, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 4 }}>Suggested reply (grounded in your program facts)</div>
                     <div style={{ padding: "10px 12px", background: "color-mix(in srgb, var(--acc) 8%, transparent)", border: "1px solid color-mix(in srgb, var(--acc) 25%, var(--line))", borderRadius: 8, fontSize: 13, whiteSpace: "pre-wrap" }}>{h.suggestedReply}</div>
@@ -98,11 +120,28 @@ export function Handoffs() {
                 )}
 
                 {h.status === "open" && (
-                  <div className="row gap-8 mt-16">
-                    {h.suggestedReply && (
-                      <button className="btn sm" onClick={() => copy(h.id, h.suggestedReply!)}>{copied === h.id ? "✓ copied" : "Copy reply"}</button>
+                  <div className="mt-16">
+                    <div className="faint" style={{ fontSize: 11, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 4 }}>
+                      {h.suggestedReply ? "Your reply — AI-drafted from your program facts, edit before sending" : "Your reply — no grounded draft; write one to send as you"}
+                    </div>
+                    <textarea
+                      className="input"
+                      rows={4}
+                      value={draftFor(h)}
+                      placeholder={h.suggestedReply ? undefined : "Write a reply to send as the merchant, threaded onto their message…"}
+                      onChange={(e) => setDrafts((d) => ({ ...d, [h.id]: e.target.value }))}
+                      style={{ width: "100%", resize: "vertical" }}
+                    />
+                    {sendMsg[h.id] && (
+                      <div className={sendMsg[h.id].ok ? "acc" : "neg"} style={{ fontSize: 12, marginTop: 6 }}>{sendMsg[h.id].text}</div>
                     )}
-                    <button className="btn sm primary" onClick={() => resolve(h.id)} disabled={busy === h.id}>Mark resolved</button>
+                    <div className="row wrap gap-8 mt-16">
+                      <button className="btn sm primary" onClick={() => sendReply(h)} disabled={sending === h.id || !draftFor(h).trim()}>
+                        {sending === h.id ? "sending…" : "Send reply"}
+                      </button>
+                      <button className="btn sm" onClick={() => copy(h.id, draftFor(h))} disabled={!draftFor(h).trim()}>{copied === h.id ? "✓ copied" : "Copy reply"}</button>
+                      <button className="btn sm ghost" onClick={() => resolve(h.id)} disabled={busy === h.id}>Mark resolved</button>
+                    </div>
                   </div>
                 )}
               </Card>

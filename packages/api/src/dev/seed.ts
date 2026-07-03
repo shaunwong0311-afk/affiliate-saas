@@ -1,6 +1,6 @@
 import { newId, newCode, type Order } from "@affiliate/core";
 import type { NormalizedOrder } from "@affiliate/integrations";
-import { runSourcing, setAutomationState, autonomousCycle, recordOutcome } from "@affiliate/recruitment";
+import { runSourcing, setAutomationState, autonomousCycle, recordOutcome, handleReply } from "@affiliate/recruitment";
 import type { AppContext } from "../context.js";
 import { hashPassword } from "../auth/jwt.js";
 import { ingestNormalizedOrder } from "../services/conversion-pipeline.js";
@@ -228,6 +228,46 @@ export async function seedDemo(ctx: AppContext): Promise<SeedResult> {
     const recruitClick = mintClickId();
     await writeClick(ctx, recruitClick, { merchantId: merchant.id, affiliateId: aff.id, offerId: offer.id, ip: "70.4.4.4", ua: "demo" });
     await ingestNormalizedOrder(ctx, { order: baseOrder("ord_recruit_1", 12_000), clickId: recruitClick, customerRef: "cust_e" } as NormalizedOrder);
+  }
+
+  // ---- Outreach queues: give the Handoffs / DM Queue pages real work in the demo -----
+  // A small merchant knowledge base — the facts the AI-SDR grounds its answers on.
+  for (const faq of [
+    { question: "What commission do partners earn?", answer: "20% on every sale, rising to 25% past $500/mo and 30% past $1,500/mo, plus a $25 first-sale bonus." },
+    { question: "How long is the tracking cookie?", answer: "30 days, last-touch — you're credited for anything a shopper buys within 30 days of clicking your link." },
+    { question: "Do you offer a discount code for my audience?", answer: "Yes — every partner gets a unique 15%-off code at signup, alongside a personal tracking link." },
+  ]) {
+    await db.merchantFaqs.insert({ id: newId("faq"), merchantId: merchant.id, question: faq.question, answer: faq.answer, createdAt: now() });
+  }
+
+  // Route a couple of inbound replies through the REAL reply-router so the handoff board has
+  // work: one warm "interested" (→ sendable-draft/meeting handoff) and one product question
+  // (→ AI-SDR handoff). Uses scored prospects the cycle produced (not the converted top one).
+  const routable = (await db.prospects.find((p) => p.merchantId === merchant.id && p.email != null && p.state !== "converted")).sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
+  if (routable[0]) await handleReply(ctx, routable[0].id, "This looks great — I'm interested, sign me up!", { meetingTier: "A" });
+  if (routable[1]) await handleReply(ctx, routable[1].id, "Sounds interesting. What commission do you pay, and how long is the cookie window?", { meetingTier: "A" });
+
+  // A prepared DM task — what a `channel:"dm"` sequence step produces (message drafted, best
+  // handle picked, deep link ready). The operator presses send; we never auto-DM.
+  const dmProspect = routable[2] ?? routable[0];
+  if (dmProspect) {
+    const handle = dmProspect.identity.toLowerCase().replace(/[^a-z0-9]+/g, "").slice(0, 20) || "creator";
+    await db.dmTasks.insert({
+      id: newId("dmt"),
+      merchantId: merchant.id,
+      prospectId: dmProspect.id,
+      campaignId: campaign.id,
+      step: 3,
+      platform: "instagram",
+      handle,
+      deepLink: `https://ig.me/m/${handle}`,
+      opensComposer: true,
+      message: `Hey ${dmProspect.identity}! Loved your recent posts — I run the affiliate program at ${merchant.name} and think you'd be a great fit. Mind if I send over the details?`,
+      context: "Prepared DM (the email touch went unanswered) — press send when ready.",
+      status: "pending",
+      createdAt: now(),
+      sentAt: null,
+    });
   }
 
   return { email, password, merchantId: merchant.id };

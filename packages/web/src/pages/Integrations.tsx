@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { api, shortDate } from "../api";
 import { useApi, Card, Spinner, ErrorBanner, PageHeader, Badge, EmptyState, Field, statusKind } from "../ui";
 
@@ -49,6 +49,25 @@ export function Integrations() {
 
   const [err, setErr] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
+  // OAuth callback banner (the /oauth/:provider/callback redirects back with ?connected= / ?oauth_error=).
+  const [oauthBanner, setOauthBanner] = useState<{ ok: boolean; text: string } | null>(null);
+
+  useEffect(() => {
+    const raw = window.location.hash; // e.g. "#/integrations?connected=microsoft"
+    const qi = raw.indexOf("?");
+    if (qi === -1) return;
+    const params = new URLSearchParams(raw.slice(qi + 1));
+    const connected = params.get("connected");
+    const oauthError = params.get("oauth_error");
+    if (connected) setOauthBanner({ ok: true, text: `${connected[0].toUpperCase()}${connected.slice(1)} mailbox connected.` });
+    else if (oauthError) setOauthBanner({ ok: false, text: `Connection failed: ${oauthError}` });
+    if (connected || oauthError) {
+      // Strip the query so a refresh doesn't re-show the banner; keep the route.
+      window.location.hash = "#/integrations";
+      if (connected) mailboxes.reload();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // store/payment connect form
   const [storeKind, setStoreKind] = useState("shopify");
@@ -119,6 +138,26 @@ export function Integrations() {
     }, mailboxes.reload);
   }
 
+  // Start OAuth for an EXISTING mailbox row (Gmail/Microsoft). Redirects to the provider
+  // consent screen; the callback returns to /#/integrations?connected=… (handled above).
+  async function startOAuth(provider: "microsoft" | "google", mailboxId: string) {
+    await run(`oauth-${mailboxId}`, async () => {
+      const { consentUrl } = await api.post<{ consentUrl: string }>(`/mailboxes/${mailboxId}/connect/${provider}`, {});
+      window.location.href = consentUrl;
+    }, () => {});
+  }
+
+  // Create the mailbox (from the detected email) then start OAuth — the connect flow for a
+  // freshly-detected Microsoft/Google inbox that has no SMTP path.
+  async function createAndConnectOAuth(provider: "microsoft" | "google") {
+    if (!mbEmail.trim()) { setErr("Enter the mailbox email first."); return; }
+    await run("oauth-new", async () => {
+      const mailbox = await api.post<{ id: string }>("/mailboxes", { provider: provider === "google" ? "gmail" : "microsoft", email: mbEmail.trim(), dailyCap: mbCap });
+      const { consentUrl } = await api.post<{ consentUrl: string }>(`/mailboxes/${mailbox.id}/connect/${provider}`, {});
+      window.location.href = consentUrl;
+    }, () => {});
+  }
+
   async function addDomain() {
     const d = domainName.trim().toLowerCase();
     if (!d) {
@@ -149,6 +188,11 @@ export function Integrations() {
       />
 
       {err && <ErrorBanner message={err} />}
+      {oauthBanner && (
+        <div className="mt-8" style={{ fontSize: 13, color: oauthBanner.ok ? "var(--acc)" : "var(--neg, #e5484d)" }}>
+          {oauthBanner.ok ? "✓ " : "✕ "}{oauthBanner.text}
+        </div>
+      )}
 
       {/* Stores & payments */}
       <Card
@@ -246,15 +290,26 @@ export function Integrations() {
                 </div>
 
                 {detected.method === "microsoft_oauth" ? (
-                  <div className="faint" style={{ fontSize: 12.5 }}>
-                    Microsoft 365 / Outlook uses one-click <strong>Connect with Microsoft</strong> (coming in this build).
-                    Basic-auth SMTP is no longer supported by Microsoft, so an app password won't work here.
+                  <div>
+                    <div className="faint" style={{ fontSize: 12.5, marginBottom: 10 }}>
+                      Microsoft 365 / Outlook connects with one click via modern OAuth. Basic-auth SMTP is no
+                      longer supported by Microsoft, so an app password won't work here.
+                    </div>
+                    <button className="btn primary" onClick={() => createAndConnectOAuth("microsoft")} disabled={busy === "oauth-new"}>
+                      {busy === "oauth-new" ? "starting…" : "Connect with Microsoft"}
+                    </button>
                   </div>
                 ) : (
                   <>
                     {detected.method === "google_app_password" && (
-                      <div className="faint" style={{ fontSize: 12, marginBottom: 10 }}>
-                        Gmail/Workspace: enable 2-Step Verification, then generate an <strong>app password</strong> and paste it below.
+                      <div style={{ marginBottom: 10 }}>
+                        <div className="faint" style={{ fontSize: 12, marginBottom: 8 }}>
+                          Gmail/Workspace: connect with one-click <strong>Google OAuth</strong>, or use an <strong>app password</strong> below
+                          (enable 2-Step Verification, then generate one).
+                        </div>
+                        <button className="btn" onClick={() => createAndConnectOAuth("google")} disabled={busy === "oauth-new"}>
+                          {busy === "oauth-new" ? "starting…" : "Connect with Google"}
+                        </button>
                       </div>
                     )}
                     <div className="grid grid-4" style={{ alignItems: "end" }}>
@@ -326,6 +381,15 @@ export function Integrations() {
                     <td className="num mono">{b.dailyCap}</td>
                     <td className="num">
                       <div className="row gap-8" style={{ justifyContent: "flex-end" }}>
+                        {(b.provider === "microsoft" || b.provider === "gmail") && (
+                          <button
+                            className="btn sm ghost"
+                            onClick={() => startOAuth(b.provider === "gmail" ? "google" : "microsoft", b.id)}
+                            disabled={busy === `oauth-${b.id}`}
+                          >
+                            {busy === `oauth-${b.id}` ? "…" : b.provider === "gmail" ? "Connect Google" : "Connect Microsoft"}
+                          </button>
+                        )}
                         <button
                           className="btn sm ghost"
                           onClick={() => run(`mb-test-${b.id}`, async () => { setTestResult(await api.post(`/mailboxes/${b.id}/test`, {})); }, mailboxes.reload)}
