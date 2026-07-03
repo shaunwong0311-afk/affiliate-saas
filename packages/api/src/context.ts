@@ -37,6 +37,7 @@ import {
   CompetitorProgramResolver,
   DbCustomerMiningSource,
   YouTubeDiscoverySource,
+  SocialCreatorDiscoverySource,
   PodcastDiscoverySource,
   ProxyHttpFetcher,
   DeterministicFetcher,
@@ -203,6 +204,12 @@ export function createContext(overrides: Partial<AppContext> = {}): AppContext {
   // by reading the RSS feed, pulls the owner email + site so they're contactable. Only
   // when real discovery is on (so dev/test make no outbound calls); reuses the fetcher.
   const podcastDiscovery = realDiscovery ? new PodcastDiscoverySource({ http: jsonHttp, fetcher: sharedFetcher }) : null;
+  // Instagram/TikTok creator discovery via the same scraping-API key used for enrichment.
+  // Key-gated (never fabricates creators); the SERP path also emits site:instagram.com /
+  // site:tiktok.com queries as the zero-extra-key fallback (see query-strategy.ts).
+  const socialDiscovery = process.env.SCRAPE_API_URL
+    ? new SocialCreatorDiscoverySource({ endpoint: process.env.SCRAPE_API_URL, apiKey: process.env.SCRAPE_API_KEY, http: jsonHttp })
+    : null;
   const discoverySources: DiscoverySource[] = overrides.discoverySources ?? [
     ...(serpSource ? [serpSource] : []),
     ...syntheticSources,
@@ -210,6 +217,7 @@ export function createContext(overrides: Partial<AppContext> = {}): AppContext {
     new BacklinkDiscoverySource(backlinkProvider, programResolver),
     ...(youtubeDiscovery ? [youtubeDiscovery] : []),
     ...(podcastDiscovery ? [podcastDiscovery] : []),
+    ...(socialDiscovery ? [socialDiscovery] : []),
   ];
 
   // Email finding: real Hunter.io when keyed, deterministic pattern stub otherwise.

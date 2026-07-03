@@ -3,6 +3,8 @@ import {
   scoreProspect,
   defaultWeights,
   blendWeights,
+  activityRecency,
+  isStale,
   type ScoringSignals,
   canTransition,
   transition,
@@ -69,6 +71,28 @@ describe("scoring", () => {
   it("leaves audienceQuality null when reach or engagement is unknown (never fabricated)", () => {
     expect(scoreProspect({ ...strongProspect, reach: null }).audienceQuality).toBeNull();
     expect(scoreProspect({ ...strongProspect, engagementRate: null }).audienceQuality).toBeNull();
+  });
+});
+
+describe("activityRecency / isStale (content freshness)", () => {
+  const NOW = new Date("2026-07-04T00:00:00.000Z");
+
+  it("is ~1 for recent content and ~0 for content years stale", () => {
+    expect(activityRecency("2026-06-20T00:00:00Z", NOW)).toBe(1); // within 30 days
+    const twoYears = activityRecency("2024-07-04T00:00:00Z", NOW);
+    expect(twoYears).not.toBeNull();
+    expect(twoYears!).toBeLessThan(0.1);
+  });
+
+  it("returns null for unknown content date — unknown never penalizes (honesty)", () => {
+    expect(activityRecency(null, NOW)).toBeNull();
+    expect(activityRecency(undefined, NOW)).toBeNull();
+    expect(isStale(null, NOW)).toBe(false);
+  });
+
+  it("flags a property dead > 12 months as stale", () => {
+    expect(isStale("2024-01-01T00:00:00Z", NOW)).toBe(true);
+    expect(isStale("2026-06-01T00:00:00Z", NOW)).toBe(false);
   });
 });
 

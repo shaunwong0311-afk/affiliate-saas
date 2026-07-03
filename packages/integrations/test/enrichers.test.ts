@@ -12,7 +12,7 @@ const ytHttp = {
       };
     }
     if (url.includes("/playlistItems")) {
-      return { status: 200, json: { items: [{ contentDetails: { videoId: "v1" } }, { contentDetails: { videoId: "v2" } }] } };
+      return { status: 200, json: { items: [{ contentDetails: { videoId: "v1", videoPublishedAt: "2026-06-01T00:00:00Z" } }, { contentDetails: { videoId: "v2", videoPublishedAt: "2026-06-20T00:00:00Z" } }] } };
     }
     if (url.includes("/videos")) {
       return {
@@ -34,6 +34,11 @@ describe("YouTubeEnricher", () => {
   it("resolves by channel id and ignores non-handles", async () => {
     expect(await new YouTubeEnricher({ apiKey: "k", http: ytHttp }).enrich({ platform: "youtube", handle: "UC123", url: "x" })).toMatchObject({ reach: 125000 });
     expect(await new YouTubeEnricher({ apiKey: "k", http: ytHttp }).enrich({ platform: "youtube", handle: null, url: "x" })).toBeNull();
+  });
+
+  it("captures the most recent upload date as the activity-freshness signal", async () => {
+    const m = await new YouTubeEnricher({ apiKey: "k", http: ytHttp }).enrich({ platform: "youtube", handle: "@creator", url: "x" });
+    expect(m?.lastContentAt).toBe("2026-06-20T00:00:00.000Z"); // the max of the two uploads
   });
 
   it("extracts the business email + website from the channel description (the contact path)", async () => {

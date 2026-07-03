@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { buildDiscoveryQueries, SerpDiscoverySource, BacklinkDiscoverySource, CompetitorProgramResolver, DataForSEOBacklinkProvider, DataForSEOSerpProvider, YouTubeDiscoverySource } from "../src/index.js";
+import { buildDiscoveryQueries, SerpDiscoverySource, BacklinkDiscoverySource, CompetitorProgramResolver, DataForSEOBacklinkProvider, DataForSEOSerpProvider, YouTubeDiscoverySource, SocialCreatorDiscoverySource } from "../src/index.js";
 import type { DiscoveryQuery, SerpProvider, SerpHit, HttpFetcher, FetchResult, BacklinkProvider, BacklinkRow } from "../src/index.js";
 
 const baseQuery: DiscoveryQuery = {
@@ -26,6 +26,12 @@ describe("buildDiscoveryQueries", () => {
     expect(qs.some((s) => s.includes("substack.com"))).toBe(true);
   });
 
+  it("emits IG/TikTok queries for the social channel (the zero-extra-key fallback)", () => {
+    const qs = buildDiscoveryQueries({ ...baseQuery, channels: ["social"] }).map((p) => p.q);
+    expect(qs.some((s) => s.includes("site:instagram.com"))).toBe(true);
+    expect(qs.some((s) => s.includes("site:tiktok.com"))).toBe(true);
+  });
+
   it("gates platform queries by channel and dedupes + caps", () => {
     const blogOnly = buildDiscoveryQueries({ ...baseQuery, channels: ["blog"] });
     expect(blogOnly.some((p) => p.channel === "youtube")).toBe(false);
@@ -45,6 +51,30 @@ class FakeSerp implements SerpProvider {
   }
 }
 const shortFetcher: HttpFetcher = { kind: "mock", async get(url: string): Promise<FetchResult> { return { status: 200, url, html: "<html></html>" }; } };
+
+describe("SocialCreatorDiscoverySource", () => {
+  it("returns distinct creators as RawCandidates (channelUrl set, non-synthetic)", async () => {
+    const actor = {
+      async get(url: string) {
+        // Return two creators for instagram, one duplicate handle across terms.
+        if (url.includes("platform=instagram")) return { status: 200, json: { data: [{ handle: "trailgeek", displayName: "Trail Geek", followers: 82000 }, { handle: "trailgeek" }, { handle: "peakpursuits" }] } };
+        return { status: 200, json: { data: [] } };
+      },
+    };
+    const src = new SocialCreatorDiscoverySource({ endpoint: "https://scrape.test/search", apiKey: "k", http: actor, platforms: ["instagram"] });
+    const out = await src.discover({ ...baseQuery, limit: 10 });
+    const igHandles = out.map((c) => c.channelUrl);
+    expect(igHandles).toContain("https://instagram.com/trailgeek");
+    expect(igHandles).toContain("https://instagram.com/peakpursuits");
+    expect(out.filter((c) => c.channelUrl?.includes("trailgeek"))).toHaveLength(1); // deduped
+    expect(out.every((c) => c.sourceType === "social_discovery" && c.synthetic === false)).toBe(true);
+  });
+
+  it("is honest-empty when no scrape endpoint/client is wired (never fabricates creators)", async () => {
+    const src = new SocialCreatorDiscoverySource({});
+    expect(await src.discover(baseQuery)).toEqual([]);
+  });
+});
 
 describe("SerpDiscoverySource — platform-aware dedup", () => {
   const hits: SerpHit[] = [

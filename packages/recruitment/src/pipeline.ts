@@ -13,6 +13,8 @@ import {
   hasIdentitySignal,
   audienceOverlapScore,
   targetMarketForCurrency,
+  activityRecency,
+  isStale,
   scanContent,
   signUnsubscribeToken,
   type ScoringSignals,
@@ -61,7 +63,7 @@ export async function discover(
     niche: merchant.niche ?? "general",
     competitors: merchant.competitors,
     keywords: [`best ${merchant.niche ?? "products"}`, `${merchant.niche ?? "product"} review`],
-    channels: ["serp", "youtube", "blog", "newsletter", "podcast", "community"],
+    channels: ["serp", "youtube", "blog", "newsletter", "podcast", "community", "social"],
     limit: opts?.limit ?? 10,
   };
 
@@ -395,6 +397,7 @@ export async function enrich(
   // the primary + high-confidence accounts and cap the work. Unknown stays null.
   let audienceReach: number | null = null;
   let audienceEngagement: number | null = null;
+  let lastContentAt: string | null = null;
   const enricher = deps.enricher;
   if (enricher && profile && !prospect.synthetic) {
     // Filter to BILLABLE (enricher-supported) accounts FIRST, then cap by confidence —
@@ -412,11 +415,17 @@ export async function enrich(
       if (m.engagementRate != null && audienceEngagement == null) audienceEngagement = m.engagementRate;
       if (profile.audience.primaryGeo == null && m.primaryGeo) profile.audience.primaryGeo = m.primaryGeo;
       if (profile.audience.language == null && m.language) profile.audience.language = m.language;
+      // Keep the MOST RECENT content date across the creator's accounts (activity signal).
+      if (m.lastContentAt && (!lastContentAt || m.lastContentAt > lastContentAt)) lastContentAt = m.lastContentAt;
       profile.audience.source = m.source;
     }
     if (audienceReach != null) profile.audience.reach = audienceReach;
     if (audienceEngagement != null) profile.audience.engagementRate = audienceEngagement;
   }
+  // Content-freshness signal: stale properties (dead >12 months) waste sends. Null recency never
+  // penalizes — unknown stays unknown. Stored on evidence + surfaced as a flag for triage/UI.
+  const recency = activityRecency(lastContentAt, deps.clock.now());
+  const stale = isStale(lastContentAt, deps.clock.now());
 
   // Geo/language alignment: if a provider gave us the creator's real geo/language,
   // turn it into the audienceOverlap signal vs the merchant's market (currency-derived).
@@ -452,7 +461,17 @@ export async function enrich(
   const lang = profile?.audience.language;
   return deps.db.prospects.update(prospectId, {
     email: chosenEmail,
-    evidence: { ...(prospect.evidence ?? {}), contactSource, profile, contactEmails: pageEmails, contactUrls, contactForm, contactFormUrl, affiliateLinks },
+    evidence: {
+      ...(prospect.evidence ?? {}),
+      contactSource,
+      profile,
+      contactEmails: pageEmails,
+      contactUrls,
+      contactForm,
+      contactFormUrl,
+      affiliateLinks,
+      ...(lastContentAt ? { lastContentAt, activityRecency: recency, stale } : {}),
+    },
     ...(geo && /^[A-Za-z]{2}$/.test(geo) ? { country: geo.toUpperCase() } : {}),
     ...(lang && /^[A-Za-z]{2}/.test(lang) ? { language: lang.slice(0, 2).toLowerCase() } : {}),
     state: "enriched",

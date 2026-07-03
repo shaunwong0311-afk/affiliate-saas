@@ -694,3 +694,104 @@ export class YouTubeDiscoverySource implements DiscoverySource {
     return out;
   }
 }
+
+/** A creator returned by the scraping-API search actor (hashtag/keyword). */
+interface ScrapedCreator {
+  handle?: string;
+  username?: string;
+  platform?: string;
+  url?: string;
+  profileUrl?: string;
+  displayName?: string;
+  fullName?: string;
+  followers?: number;
+  followerCount?: number;
+}
+
+/**
+ * Instagram / TikTok creator discovery (AUDIT-2026-07 #47) via the same scraping-API vendor
+ * (SCRAPE_API_URL) already used for enrichment. Competitor backlink mining finds affiliates
+ * who run WEBSITES + the YouTube source finds video creators; this reaches the platforms where
+ * most consumer-product affiliates actually live but have no site to backlink-mine. It searches
+ * the niche + competitor brand as hashtags/keywords, returns DISTINCT creator handles as
+ * RawCandidates with `channelUrl` set — the identity graph, ScrapeMetricsEnricher, and the
+ * compliant DM-queue path take over from there. Key-gated: with no endpoint it isn't wired at
+ * all (honest absence, never fabricated creators).
+ */
+export class SocialCreatorDiscoverySource implements DiscoverySource {
+  readonly sourceType = "social_discovery";
+  constructor(private readonly opts: { endpoint?: string; apiKey?: string; http?: SearchJsonHttp; platforms?: string[]; maxQueries?: number }) {}
+
+  async discover(query: DiscoveryQuery): Promise<RawCandidate[]> {
+    if (!this.opts.endpoint || !this.opts.http) return []; // not wired → honest empty, never invented
+    const platforms = this.opts.platforms ?? ["instagram", "tiktok"];
+    const niche = (query.niche || "products").trim();
+    // Niche keyword + competitor brand tokens as search terms (hashtag-style).
+    const terms = [niche, `best ${niche}`, ...query.competitors.slice(0, 2).map((c) => (safeHost(c) ?? c).replace(/\.[a-z.]+$/i, ""))]
+      .filter(Boolean)
+      .slice(0, this.opts.maxQueries ?? 3);
+
+    const perTerm = Math.max(1, Math.ceil(query.limit / Math.max(1, terms.length * platforms.length)));
+    const seen = new Set<string>();
+    const out: RawCandidate[] = [];
+
+    for (const platform of platforms) {
+      for (const term of terms) {
+        if (out.length >= query.limit) break;
+        let res: { status: number; json: any };
+        try {
+          res = await this.opts.http.get(
+            `${this.opts.endpoint}?type=search&platform=${platform}&q=${encodeURIComponent(term)}&limit=${perTerm}${this.opts.apiKey ? `&token=${this.opts.apiKey}` : ""}`,
+          );
+        } catch {
+          continue; // isolate source failures (Section 8.1)
+        }
+        const creators = (res.json?.data ?? res.json?.results ?? res.json ?? []) as ScrapedCreator[];
+        if (!Array.isArray(creators)) continue;
+        for (const c of creators) {
+          if (out.length >= query.limit) break;
+          const handle = (c.handle ?? c.username ?? "").replace(/^@/, "").trim();
+          if (!handle) continue;
+          const plat = (c.platform ?? platform).toLowerCase();
+          const key = `${plat}:${handle.toLowerCase()}`;
+          if (seen.has(key)) continue; // distinct creators only
+          seen.add(key);
+          const profileUrl = c.url ?? c.profileUrl ?? profileUrlFor(plat, handle);
+          if (!profileUrl) continue;
+          const followers = numOrUndef(c.followers ?? c.followerCount);
+          out.push({
+            identity: c.displayName ?? c.fullName ?? `@${handle}`,
+            siteUrl: null,
+            channelUrl: profileUrl,
+            sourceType: this.sourceType,
+            evidenceUrl: profileUrl,
+            evidenceSummary: `${plat} creator surfacing for "${term}"${followers ? ` — ~${followers.toLocaleString()} followers` : ""}.`,
+            outboundLinks: [],
+            ...(followers ? { reachHint: followers } : {}),
+            pageHtml: null,
+            synthetic: false,
+          });
+        }
+      }
+    }
+    return out;
+  }
+}
+
+function profileUrlFor(platform: string, handle: string): string | null {
+  switch (platform) {
+    case "instagram":
+      return `https://instagram.com/${handle}`;
+    case "tiktok":
+      return `https://www.tiktok.com/@${handle}`;
+    case "twitter":
+    case "x":
+      return `https://x.com/${handle}`;
+    default:
+      return null;
+  }
+}
+
+function numOrUndef(v: unknown): number | undefined {
+  return typeof v === "number" && Number.isFinite(v) ? v : undefined;
+}

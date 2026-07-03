@@ -2,7 +2,7 @@ import { z } from "zod";
 import { newId, scanContent } from "@affiliate/core";
 import { parseInboundWebhook } from "@affiliate/integrations";
 import type { OutreachCampaign, Suppression } from "@affiliate/db";
-import { runSourcing, processBacklog, launchCampaign, handleReply, recordOutcome, draftOutreach, expandFrontier, convertProspectToAffiliate, previewOutreach, processInboundReply, activationMetrics, draftDm, bestDmTarget, dmFollowupTargets, abResults, applyToJoin, firstStep, getAutomationState } from "@affiliate/recruitment";
+import { runSourcing, processBacklog, launchCampaign, handleReply, recordOutcome, draftOutreach, expandFrontier, convertProspectToAffiliate, previewOutreach, processInboundReply, activationMetrics, draftDm, bestDmTarget, dmFollowupTargets, abResults, applyToJoin, firstStep, getAutomationState, importProspects, importAffiliateRoster } from "@affiliate/recruitment";
 import { renderTemplate } from "@affiliate/integrations";
 import type { Profile } from "@affiliate/core";
 import type { RouteModule } from "./helpers.js";
@@ -441,6 +441,43 @@ export const recruitmentRoutes: RouteModule = (app, ctx) => {
     if (!task || task.merchantId !== merchantId) throw notFound("dm task");
     const updated = await ctx.db.dmTasks.update(id, { status: "skipped" });
     return ok(reply, updated);
+  });
+
+  // ---- Bulk import (migrate from another platform) --------------------------
+  // Prospect list → real prospects via the shared ingestCandidate path (dedup + merge free).
+  app.post("/recruitment/prospects/import", async (request, reply) => {
+    const { merchantId } = await requireMerchant(ctx, request, "write");
+    const body = parseBody(
+      z.object({
+        source: z.string().optional(),
+        rows: z
+          .array(z.object({ name: z.string().min(1), email: z.string().optional(), siteUrl: z.string().optional(), channelUrl: z.string().optional(), notes: z.string().optional() }))
+          .min(1)
+          .max(5000),
+      }),
+      request,
+    );
+    const result = await importProspects(ctx, merchantId, body.rows, { source: body.source });
+    await writeAudit(ctx, { merchantId, actorId: null, action: "recruitment.prospects.imported", subjectType: "merchant", subjectId: merchantId, metadata: { ...result } });
+    return ok(reply, result, 201);
+  });
+
+  // Existing affiliate roster → affiliates + relationships (also guards them from cold email;
+  // historical revenue warm-starts the learning loop).
+  app.post("/recruitment/affiliates/import", async (request, reply) => {
+    const { merchantId } = await requireMerchant(ctx, request, "write");
+    const body = parseBody(
+      z.object({
+        rows: z
+          .array(z.object({ name: z.string().min(1), email: z.string().email(), siteUrl: z.string().optional(), producedRevenueCents: z.number().int().nonnegative().optional() }))
+          .min(1)
+          .max(5000),
+      }),
+      request,
+    );
+    const result = await importAffiliateRoster(ctx, merchantId, body.rows);
+    await writeAudit(ctx, { merchantId, actorId: null, action: "recruitment.affiliates.imported", subjectType: "merchant", subjectId: merchantId, metadata: { ...result } });
+    return ok(reply, result, 201);
   });
 
   // ---- Activation analytics (the recruitment ROI metric) --------------------

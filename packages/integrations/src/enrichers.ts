@@ -86,9 +86,13 @@ export class YouTubeEnricher implements AccountEnricher {
     const links = [...description.matchAll(/https?:\/\/[^\s)>\]]+/gi)].map((m) => m[0]);
 
     let engagementRate: number | null = null;
+    let lastContentAt: string | null = null;
     const uploads = item.contentDetails?.relatedPlaylists?.uploads;
     if (uploads) {
       const pl = await this.opts.http.get(`${base}/playlistItems?part=contentDetails&playlistId=${uploads}&maxResults=10&key=${this.opts.apiKey}`);
+      // contentDetails carries videoPublishedAt — the most recent upload = the channel's freshness.
+      const dates: number[] = (pl.json?.items ?? []).map((i: any) => new Date(i.contentDetails?.videoPublishedAt ?? "").getTime()).filter((t: number) => !Number.isNaN(t));
+      if (dates.length) lastContentAt = new Date(Math.max(...dates)).toISOString();
       const ids: string[] = (pl.json?.items ?? []).map((i: any) => i.contentDetails?.videoId).filter(Boolean);
       if (ids.length) {
         const vs = await this.opts.http.get(`${base}/videos?part=statistics&id=${ids.join(",")}&key=${this.opts.apiKey}`);
@@ -102,7 +106,7 @@ export class YouTubeEnricher implements AccountEnricher {
         if (rates.length) engagementRate = rates.reduce((a: number, b: number) => a + b, 0) / rates.length;
       }
     }
-    return { reach, engagementRate, primaryGeo, language, source: "api", emails: emails.length ? [...new Set(emails)] : undefined, links: links.length ? [...new Set(links)] : undefined };
+    return { reach, engagementRate, primaryGeo, language, source: "api", lastContentAt, emails: emails.length ? [...new Set(emails)] : undefined, links: links.length ? [...new Set(links)] : undefined };
   }
 }
 

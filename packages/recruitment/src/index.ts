@@ -11,6 +11,7 @@ export * from "./dm.js";
 export * from "./sequencing.js";
 export * from "./pipeline.js";
 export * from "./service.js";
+export * from "./import.js";
 export { planDiscovery, type DiscoveryPlan, type PlannedSource, type SkippedSource } from "./discovery-planner.js";
 export { expandFrontier, type FrontierBudget, type ExpansionReport } from "./frontier.js";
 export * from "./learning.js";

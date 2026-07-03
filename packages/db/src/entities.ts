@@ -336,6 +336,12 @@ export interface Prospect {
       identityConfidence: number;
     } | null;
     pageUrl?: string | null;
+    /** Most recent content date (ISO) when a provider exposed it — activity-recency signal. */
+    lastContentAt?: string | null;
+    /** Content recency 0..1 (null when unknown). */
+    activityRecency?: number | null;
+    /** True when the property is likely abandoned (dead > 12 months). */
+    stale?: boolean;
   } | null;
   createdAt: Timestamp;
   updatedAt: Timestamp;

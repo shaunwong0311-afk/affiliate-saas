@@ -19,6 +19,33 @@ const ENGAGEMENT_FLOOR = 0.01; // 1%
 /** Small audiences swing wildly, so the flag only applies once reach is meaningful. */
 const MIN_REACH_TO_FLAG = 25_000;
 
+/** Content is considered stale (a likely-abandoned property) past this many days of silence. */
+export const STALE_AFTER_DAYS = 365;
+
+/**
+ * Activity recency 0..1 from the most recent content date: ~1.0 for the last ~30 days, decaying
+ * to ~0 by ~12 months. NULL when the date is unknown (no provider exposed it) — unknown recency
+ * must never penalize a prospect (honesty discipline). A future date clamps to 1.
+ */
+export function activityRecency(lastContentAt: string | null | undefined, now: Date): number | null {
+  if (!lastContentAt) return null;
+  const then = new Date(lastContentAt).getTime();
+  if (Number.isNaN(then)) return null;
+  const days = (now.getTime() - then) / 86_400_000;
+  if (days <= 30) return 1;
+  if (days >= STALE_AFTER_DAYS) return Math.max(0, 1 - days / STALE_AFTER_DAYS) * 0.1; // ~0 past a year, keeps ordering
+  // Linear decay from 1.0 at 30 days to ~0.1 at 365 days.
+  return Math.max(0, 1 - (days - 30) / (STALE_AFTER_DAYS - 30));
+}
+
+/** True when a property has been silent long enough to likely be abandoned (null date = not stale). */
+export function isStale(lastContentAt: string | null | undefined, now: Date): boolean {
+  if (!lastContentAt) return false;
+  const then = new Date(lastContentAt).getTime();
+  if (Number.isNaN(then)) return false;
+  return (now.getTime() - then) / 86_400_000 > STALE_AFTER_DAYS;
+}
+
 /**
  * Flag a likely low-quality/inflated audience from reach + engagement. Returns null when either
  * input is unknown (honesty discipline — unknown is never a fabricated "clean" verdict either).

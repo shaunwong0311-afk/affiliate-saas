@@ -64,6 +64,12 @@ export function buildDiscoveryQueries(query: DiscoveryQuery, opts?: { max?: numb
   }
   if (channels.has("podcast")) add(`${niche} podcast`, "podcast");
   if (channels.has("community")) add(`site:reddit.com ${niche} recommendations`, "community");
+  // Reach IG/TikTok creators through SERP even without the scrape key (the zero-extra-key
+  // fallback for the SocialCreatorDiscoverySource); the SERP source sets channelUrl for these.
+  if (channels.has("social")) {
+    add(`site:instagram.com ${niche}`, "social");
+    add(`site:tiktok.com ${niche} review`, "social");
+  }
 
   // Reserve slots for platform-targeted creator queries so a long competitor list can't
   // push them past the `max` cap (planning-level starvation — paired with the execution

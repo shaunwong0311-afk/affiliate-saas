@@ -105,7 +105,7 @@ export interface DiscoveryQuery {
   niche: string;
   competitors: string[];
   keywords: string[];
-  channels: Array<"serp" | "youtube" | "blog" | "newsletter" | "podcast" | "community">;
+  channels: Array<"serp" | "youtube" | "blog" | "newsletter" | "podcast" | "community" | "social">;
   limit: number;
 }
 
@@ -199,6 +199,9 @@ export interface AccountMetrics {
   /** Outbound links the platform exposed (e.g. the website in a channel description /
    * social bio) — fed back into the identity graph + contact traversal. */
   links?: string[];
+  /** Most recent content date (ISO) when the provider exposes it (YouTube upload, RSS
+   * pubDate). Powers the activity-recency signal — a dead property scores lower. Null unknown. */
+  lastContentAt?: string | null;
 }
 
 /**

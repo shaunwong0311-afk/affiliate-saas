@@ -77,6 +77,7 @@ export {
   CompetitorProgramResolver,
   DbCustomerMiningSource,
   YouTubeDiscoverySource,
+  SocialCreatorDiscoverySource,
   type SerpProvider,
   type SerpHit,
   type BacklinkProvider,
