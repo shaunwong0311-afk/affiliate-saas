@@ -1,5 +1,5 @@
 import { newId, competitorHostsFromLinks } from "@affiliate/core";
-import type { Merchant, Prospect } from "@affiliate/db";
+import type { FrontierMerchant, Merchant, Prospect } from "@affiliate/db";
 import { extractHrefs, type DiscoveryQuery, type RawCandidate } from "@affiliate/integrations";
 import type { RecruitmentDeps } from "./deps.js";
 import { ingestCandidate } from "./pipeline.js";
@@ -73,11 +73,13 @@ export async function expandFrontier(deps: RecruitmentDeps, merchantId: string, 
     .sort((x, y) => x.depth - y.depth || y.coPromotions - x.coPromotions)
     .slice(0, b.maxSeeds);
 
-  // 3) Mine each → ingest affiliates.
+  // 3) Mine each → ingest affiliates, kept PER NODE so the expansion step can
+  //    attribute each co-promotion to the node whose affiliates produced it.
   const mined: string[] = [];
   let discovered = 0;
-  const newAffiliates: Prospect[] = [];
+  const minedNodes: { node: FrontierMerchant; affiliates: Prospect[] }[] = [];
   for (const node of pending) {
+    const affiliates: Prospect[] = [];
     if (backlink) {
       const query: DiscoveryQuery = { merchantId, niche: merchant.niche ?? "general", competitors: [node.domain], keywords: [], channels: ["serp"], limit: 20 };
       let cands: RawCandidate[] = [];
@@ -89,47 +91,64 @@ export async function expandFrontier(deps: RecruitmentDeps, merchantId: string, 
       for (const cand of cands) {
         const p = await ingestCandidate(deps, merchant, cand);
         if (p) {
-          newAffiliates.push(p);
+          affiliates.push(p);
           discovered++;
         }
       }
     }
     await deps.db.frontierMerchants.update(node.id, { status: "mined", processedAt: now() });
     mined.push(node.domain);
+    minedNodes.push({ node, affiliates });
   }
 
-  // 4) Expand: scan affiliates' pages for the OTHER merchants they promote, and tally.
+  // 4) Expand: scan each node's affiliates for the OTHER merchants they promote. The
+  //    tally is per node — a co-promoted host inherits depth from the node whose
+  //    affiliates surfaced it (the MINIMUM across nodes when several promote the same
+  //    host, keeping that node as discoveredFrom) — so maxDepth bounds REAL hops and
+  //    the Niche Map edge points at the true parent, even on a mixed-depth batch.
   const exclude = new Set<string>([...known, ...merchant.competitors.map(normDomain)].filter(Boolean));
-  const tally = new Map<string, number>();
-  for (const aff of newAffiliates.filter((p) => p.siteUrl).slice(0, b.maxExpand)) {
-    let links: string[] = [];
-    if (deps.fetcher) {
-      try {
-        const r = await deps.fetcher.get(aff.siteUrl!);
-        if (r.status >= 200 && r.status < 300 && r.html) links = extractHrefs(r.html, aff.siteUrl);
-      } catch {
-        /* unreachable — fall back to what we already detected */
+  const tally = new Map<string, { count: number; depth: number; discoveredFrom: string }>();
+  let expanded = 0;
+  for (const { node, affiliates } of minedNodes) {
+    if (expanded >= b.maxExpand) break;
+    for (const aff of affiliates.filter((p) => p.siteUrl)) {
+      if (expanded >= b.maxExpand) break;
+      expanded++;
+      let links: string[] = [];
+      if (deps.fetcher) {
+        try {
+          const r = await deps.fetcher.get(aff.siteUrl!);
+          if (r.status >= 200 && r.status < 300 && r.html) links = extractHrefs(r.html, aff.siteUrl);
+        } catch {
+          /* unreachable — fall back to what we already detected */
+        }
+      }
+      if (links.length === 0) links = (aff.evidence?.affiliateLinks ?? []).map((l) => l.url);
+      for (const host of competitorHostsFromLinks(links, exclude)) {
+        const entry = tally.get(host) ?? { count: 0, depth: node.depth + 1, discoveredFrom: node.domain };
+        entry.count += 1;
+        if (node.depth + 1 < entry.depth) {
+          entry.depth = node.depth + 1;
+          entry.discoveredFrom = node.domain;
+        }
+        tally.set(host, entry);
       }
     }
-    if (links.length === 0) links = (aff.evidence?.affiliateLinks ?? []).map((l) => l.url);
-    for (const host of competitorHostsFromLinks(links, exclude)) tally.set(host, (tally.get(host) ?? 0) + 1);
   }
 
   // 5) Promote the frequently co-promoted merchants into new (deeper) frontier nodes.
-  const baseDepth = pending.length ? Math.min(...pending.map((n) => n.depth)) : 0;
   const promoted: ExpansionReport["promoted"] = [];
-  const ranked = [...tally.entries()].filter(([, c]) => c >= b.minCo).sort((x, y) => y[1] - x[1]);
-  for (const [domain, count] of ranked) {
+  const ranked = [...tally.entries()].filter(([, e]) => e.count >= b.minCo).sort((x, y) => y[1].count - x[1].count);
+  for (const [domain, entry] of ranked) {
     if (promoted.length >= b.maxNew) break;
     if (known.has(domain)) continue;
-    const depth = baseDepth + 1;
-    if (depth > b.maxDepth) continue; // depth cap — stop the recursion
+    if (entry.depth > b.maxDepth) continue; // depth cap — bounds real hops from the seed
     known.add(domain);
     await deps.db.frontierMerchants.insert({
-      id: newId("front"), merchantId, domain, label: domain, depth, coPromotions: count,
-      status: "pending", source: "expansion", discoveredFrom: mined[0] ?? null, createdAt: now(), processedAt: null,
+      id: newId("front"), merchantId, domain, label: domain, depth: entry.depth, coPromotions: entry.count,
+      status: "pending", source: "expansion", discoveredFrom: entry.discoveredFrom, createdAt: now(), processedAt: null,
     });
-    promoted.push({ domain, coPromotions: count, depth });
+    promoted.push({ domain, coPromotions: entry.count, depth: entry.depth });
   }
 
   const frontierPending = await deps.db.frontierMerchants.count((f) => f.merchantId === merchantId && f.status === "pending");

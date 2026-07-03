@@ -69,6 +69,33 @@ describe("SerpDiscoverySource — platform-aware dedup", () => {
     expect(blog!.channelUrl).toBeNull();
     expect(cands.filter((c) => c.siteUrl?.includes("blogx.com")).length).toBe(1); // one per host
   });
+
+  it("keeps distinct youtube /watch results, keyed on the video id with ?v= preserved (#27)", async () => {
+    const watchHits: SerpHit[] = [
+      { title: "Creator C", url: "https://www.youtube.com/watch?v=abc123", snippet: "" },
+      { title: "Creator D", url: "https://www.youtube.com/watch?v=def456&t=42s", snippet: "" },
+      { title: "Creator E", url: "https://youtu.be/ghi789", snippet: "" },
+    ];
+    const src = new SerpDiscoverySource(new FakeSerp(watchHits), shortFetcher, { maxQueries: 4 });
+    const cands = await src.discover(baseQuery);
+    // Previously every /watch URL keyed as "youtube.com/watch" (all but one dropped)
+    // and the survivor's channelUrl lost its ?v= — a dead link.
+    const watch = cands.filter((c) => c.channelUrl?.includes("youtube.com/watch"));
+    expect(watch.map((c) => c.channelUrl)).toEqual(
+      expect.arrayContaining(["https://www.youtube.com/watch?v=abc123", "https://www.youtube.com/watch?v=def456"]),
+    );
+    expect(watch.length).toBe(2); // both videos survive dedup; the t=42s tracking param is stripped
+    expect(cands.some((c) => c.channelUrl === "https://youtu.be/ghi789")).toBe(true); // short link = social hit
+  });
+
+  it("dedupes a youtu.be short link against the same video's /watch URL", async () => {
+    const sameVideo: SerpHit[] = [
+      { title: "Creator C", url: "https://www.youtube.com/watch?v=abc123", snippet: "" },
+      { title: "Creator C again", url: "https://youtu.be/abc123", snippet: "" },
+    ];
+    const cands = await new SerpDiscoverySource(new FakeSerp(sameVideo), shortFetcher, { maxQueries: 4 }).discover(baseQuery);
+    expect(cands.filter((c) => c.channelUrl?.includes("abc123")).length).toBe(1); // one video = one candidate
+  });
 });
 
 // Returns one DISTINCT hit per query (host derived from the query text), so we can
@@ -195,6 +222,66 @@ describe("CompetitorProgramResolver", () => {
     const r = new CompetitorProgramResolver({ overrides: { "acme.com": [{ network: "Impact", kind: "vanity", merchantId: null, vanityHost: "acme.pxf.io" }] } });
     expect(await r.resolve("acme.com")).toContainEqual(expect.objectContaining({ vanityHost: "acme.pxf.io" }));
   });
+
+  it("does NOT trust a bare network link on the homepage — it may point at ANOTHER merchant (#28)", async () => {
+    const siteFetcher: HttpFetcher = {
+      kind: "mock",
+      async get(url: string): Promise<FetchResult> {
+        // The competitor merely PUBLISHES someone else's shared-network affiliate link.
+        if (url === "https://acme.com")
+          return { status: 200, url, html: `<p>Our favorite gear:</p><a href="https://shareasale.com/r.cfm?m=99999&urllink=https%3A%2F%2Fother.com">this blender</a>` };
+        return { status: 404, url, html: "" };
+      },
+    };
+    expect(await new CompetitorProgramResolver({ fetcher: siteFetcher }).resolve("acme.com")).toEqual([]);
+  });
+
+  it("accepts a homepage network link when the surrounding markup says affiliate/partner (#28)", async () => {
+    const siteFetcher: HttpFetcher = {
+      kind: "mock",
+      async get(url: string): Promise<FetchResult> {
+        if (url === "https://acme.com")
+          return { status: 200, url, html: `<a href="https://shareasale.com/shareasale.cfm?merchantID=1234">Join our affiliate program</a>` };
+        return { status: 404, url, html: "" };
+      },
+    };
+    const programs = await new CompetitorProgramResolver({ fetcher: siteFetcher }).resolve("acme.com");
+    expect(programs).toContainEqual(expect.objectContaining({ network: "ShareASale", merchantId: "1234" }));
+  });
+
+  it("scans the dedicated program paths BEFORE the homepage (#28)", async () => {
+    const visited: string[] = [];
+    const siteFetcher: HttpFetcher = {
+      kind: "mock",
+      async get(url: string): Promise<FetchResult> {
+        visited.push(url);
+        // Homepage carries a MISLEADING network link (another merchant, affiliate-y anchor);
+        // the /affiliates page carries the real program. Paths-first must win.
+        if (url === "https://acme.com")
+          return { status: 200, url, html: `<a href="https://shareasale.com/r.cfm?m=99999">our partner's affiliate deal</a>` };
+        if (url === "https://acme.com/affiliates")
+          return { status: 200, url, html: `<a href="https://shareasale.com/shareasale.cfm?merchantID=56789">Join</a>` };
+        return { status: 404, url, html: "" };
+      },
+    };
+    const programs = await new CompetitorProgramResolver({ fetcher: siteFetcher }).resolve("acme.com");
+    expect(programs).toEqual([expect.objectContaining({ network: "ShareASale", merchantId: "56789" })]);
+    expect(visited).not.toContain("https://acme.com"); // homepage never needed
+  });
+
+  it("TTLs the cache — empty results retry after an hour; hits live for a day (#28)", async () => {
+    let t = 0;
+    let calls = 0;
+    const failing: HttpFetcher = { kind: "mock", async get(url: string): Promise<FetchResult> { calls++; return { status: 404, url, html: "" }; } };
+    const r = new CompetitorProgramResolver({ fetcher: failing, now: () => t });
+    await r.resolve("acme.com");
+    const afterFirst = calls;
+    await r.resolve("acme.com"); // within the hour → served from cache
+    expect(calls).toBe(afterFirst);
+    t = 61 * 60 * 1000; // >1h → the cached EMPTY expired, crawl again
+    await r.resolve("acme.com");
+    expect(calls).toBeGreaterThan(afterFirst);
+  });
 });
 
 describe("BacklinkDiscoverySource — resolved network targeting", () => {
@@ -212,6 +299,19 @@ describe("BacklinkDiscoverySource — resolved network targeting", () => {
     const provider = new RecordingBacklinks([{ urlFrom: "https://aff.com/x", urlTo: "https://shareasale.com/r.cfm?m=56789", anchor: "" }]);
     await new BacklinkDiscoverySource(provider, resolver).discover({ ...baseQuery, competitors: ["acme.com"], limit: 5 });
     expect(provider.targets).toContain("shareasale.com?m=56789"); // queried the network, filtered by id
+  });
+
+  it("post-filters shared-network rows to the EXACT merchant id — the LIKE filter is a substring (#26)", async () => {
+    const resolver = new CompetitorProgramResolver({ overrides: { "acme.com": [{ network: "ShareASale", kind: "shared", merchantId: "1234", vanityHost: null }] } });
+    const provider = new RecordingBacklinks([
+      // %m=1234% ALSO matches m=12345 server-side — this row belongs to ANOTHER
+      // merchant and must never be emitted as acme's confirmed affiliate.
+      { urlFrom: "https://wrong-aff.com/x", urlTo: "https://shareasale.com/r.cfm?m=12345", anchor: "" },
+      { urlFrom: "https://real-aff.com/x", urlTo: "https://shareasale.com/r.cfm?m=1234&u=joe", anchor: "" },
+    ]);
+    const cands = await new BacklinkDiscoverySource(provider, resolver).discover({ ...baseQuery, competitors: ["acme.com"], limit: 5 });
+    expect(cands.map((c) => c.identity)).toEqual(["real-aff.com"]);
+    expect(cands[0]!.confirmedCompetitor).toBe("acme.com");
   });
 
   it("apex fallback (no resolved program) filters by affiliate markers", async () => {

@@ -30,6 +30,14 @@ export interface ResolvedProgram {
 export interface BacklinkTarget {
   target: string;
   urlToContains?: string;
+  /**
+   * For shared-network merchant-id queries: the exact param + value the destination
+   * must carry. The provider-side `urlToContains` filter is a substring LIKE
+   * (`%m=1234%` also matches `m=12345`), so callers MUST re-verify rows against
+   * these before trusting them as the merchant's affiliates.
+   */
+  param?: string;
+  value?: string;
 }
 
 interface NetworkSpec {
@@ -149,7 +157,9 @@ export function backlinkTargetsFor(program: ResolvedProgram, competitorDomain?: 
   const spec = NETWORKS.find((s) => s.name === program.network);
   if (program.kind === "shared" && program.merchantId && spec?.hosts) {
     const param = spec.merchantParam ?? "m";
-    return spec.hosts.map((h) => ({ target: h, urlToContains: `${param}=${program.merchantId}` }));
+    // param/value carry the EXACT merchant id so the caller can post-filter the
+    // provider's substring LIKE (which would also match longer ids).
+    return spec.hosts.map((h) => ({ target: h, urlToContains: `${param}=${program.merchantId}`, param, value: program.merchantId! }));
   }
   if (program.kind === "self_hosted") {
     const dom = competitorDomain ?? program.merchantDomain ?? null;

@@ -86,8 +86,12 @@ export async function planDiscovery(
       skipped.push({ sourceType: type, reason: "no competitors set in the ICP" });
       continue;
     }
-    if (type === "customer_mining" && orderCount === 0) {
-      skipped.push({ sourceType: type, reason: "no orders on file yet" });
+    if (type === "customer_mining") {
+      // Customer rows store only a HASHED email (privacy), so the source emits
+      // prospects with no contact path — billed enrichment on unreachable people.
+      // The source stays registered (dev/demo can still call it directly); the PLAN
+      // skips it until first-party advocate capture ships.
+      skipped.push({ sourceType: type, reason: "customers carry hashed emails only — no contact path (first-party advocate capture is a deferred feature)" });
       continue;
     }
     steps.push({ sourceType: type, label: meta.label, priority: meta.priority, rationale: rationaleFor(type, hasCompetitors, orderCount) });

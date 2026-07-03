@@ -31,7 +31,10 @@ export interface AffiliateNetworkPattern {
 }
 
 export const AFFILIATE_PATTERNS: AffiliateNetworkPattern[] = [
-  { network: "Amazon Associates", confidence: "high", hosts: ["amzn.to"], params: ["tag"] },
+  // amzn.to is Amazon's affiliate shortener by definition — real SiteStripe short
+  // links carry NO query params, so the host alone is a HIGH-confidence match.
+  // Full amazon.* domains still require ?tag= (a plain product link isn't a signal).
+  { network: "Amazon Associates", confidence: "high", hosts: ["amzn.to"] },
   { network: "Amazon Associates", confidence: "high", hosts: ["amazon.com", "amazon.co.uk", "amazon.de"], params: ["tag"] },
   { network: "ShareASale", confidence: "high", hosts: ["shareasale.com"], params: ["u", "m", "afftrack"] },
   { network: "Impact", confidence: "high", hosts: ["impact.com", "ojrq.net", "7eer.net", "evyy.net"], pathContains: ["/c/"] },

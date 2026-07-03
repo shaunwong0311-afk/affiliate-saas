@@ -66,6 +66,55 @@ describe("expandFrontier — recursive merchant-expansion", () => {
     expect(report.promoted).toEqual([]); // but never goes deeper
   });
 
+  it("assigns promotion depth from the node whose affiliates produced it — mixed-depth batch (#29)", async () => {
+    // A depth-2 expansion node is pending alongside the depth-0 seed in ONE cycle.
+    await db.frontierMerchants.insert({
+      id: "f-deep", merchantId: "m1", domain: "deepbrand.com", label: "deepbrand.com", depth: 2, coPromotions: 3,
+      status: "pending", source: "expansion", discoveredFrom: "brandb.com", createdAt: new Date().toISOString(), processedAt: null,
+    });
+    // rival's affiliates promote brandb; deepbrand's affiliates promote brandz.
+    const perNodeFetcher: HttpFetcher = {
+      kind: "mock",
+      async get(url: string): Promise<FetchResult> {
+        const html = url.includes("deepbrand")
+          ? `<a href="https://brandz.com/buy?ref=x">z</a>`
+          : `<a href="https://brandb.com/buy?ref=x">b</a>`;
+        return { status: 200, url, html };
+      },
+    };
+    const report = await expandFrontier(deps({ fetcher: perNodeFetcher }), "m1", { maxSeedsPerCycle: 2, minCoPromotions: 2, maxDepth: 3 });
+    expect(report.mined).toEqual(expect.arrayContaining(["rival.com", "deepbrand.com"]));
+    // brandz was surfaced by the DEPTH-2 node's affiliates → depth 3, edge from deepbrand
+    // (previously min(batch depths)+1 = 1 and discoveredFrom = mined[0], corrupting both).
+    expect(report.promoted.find((p) => p.domain === "brandz.com")?.depth).toBe(3);
+    const zRow = (await db.frontierMerchants.find((f) => f.domain === "brandz.com"))[0];
+    expect(zRow?.discoveredFrom).toBe("deepbrand.com");
+    // brandb came from the depth-0 seed → depth 1, edge from rival.
+    expect(report.promoted.find((p) => p.domain === "brandb.com")?.depth).toBe(1);
+    const bRow = (await db.frontierMerchants.find((f) => f.domain === "brandb.com"))[0];
+    expect(bRow?.discoveredFrom).toBe("rival.com");
+  });
+
+  it("drops a deep node's promotion when its REAL depth exceeds maxDepth (#29)", async () => {
+    await db.frontierMerchants.insert({
+      id: "f-deep", merchantId: "m1", domain: "deepbrand.com", label: "deepbrand.com", depth: 2, coPromotions: 3,
+      status: "pending", source: "expansion", discoveredFrom: "brandb.com", createdAt: new Date().toISOString(), processedAt: null,
+    });
+    const perNodeFetcher: HttpFetcher = {
+      kind: "mock",
+      async get(url: string): Promise<FetchResult> {
+        const html = url.includes("deepbrand")
+          ? `<a href="https://brandz.com/buy?ref=x">z</a>`
+          : `<a href="https://brandb.com/buy?ref=x">b</a>`;
+        return { status: 200, url, html };
+      },
+    };
+    // maxDepth 2: the depth-2 node's promotion would be hop 3 → dropped; the seed's survives.
+    const report = await expandFrontier(deps({ fetcher: perNodeFetcher }), "m1", { maxSeedsPerCycle: 2, minCoPromotions: 2, maxDepth: 2 });
+    expect(report.promoted.map((p) => p.domain)).toContain("brandb.com");
+    expect(report.promoted.map((p) => p.domain)).not.toContain("brandz.com");
+  });
+
   it("does not re-seed or re-mine on a second run (visited set persists)", async () => {
     await expandFrontier(deps(), "m1", { minCoPromotions: 2, maxDepth: 2 });
     const before = await db.frontierMerchants.count((f) => f.merchantId === "m1");

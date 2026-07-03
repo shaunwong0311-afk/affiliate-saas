@@ -161,12 +161,24 @@ export function createContext(overrides: Partial<AppContext> = {}): AppContext {
   const sharedFetcher: HttpFetcher = realDiscovery
     ? new CachingFetcher(new RateLimitedFetcher(networkFetcher, { maxConcurrent: 6, perHostIntervalMs: 1000 }))
     : pageFetcher;
-  const serpSource = new SerpDiscoverySource(serpProvider, sharedFetcher);
+  // The SERP provider is REAL only when a SERP-capable key is set. PROXY_URL alone
+  // makes `realDiscovery` true (the shared fetcher goes real), but the deterministic
+  // SERP provider fabricates domains — pairing it with a real fetcher would issue
+  // real HTTP to invented hosts. So the SERP source's fetcher is chosen by whether
+  // the PROVIDER is real, never by the aggregate flag; and when the provider is
+  // deterministic AND synthetic discovery is disallowed (prod), the source is omitted
+  // entirely — honest empty, same rule as the backlink source.
+  const serpIsReal = hasSerp || hasDfs;
+  const serpSource =
+    serpIsReal || config.allowSyntheticDiscovery
+      ? new SerpDiscoverySource(serpProvider, serpIsReal ? sharedFetcher : new DeterministicFetcher())
+      : null;
   const fetcher = overrides.fetcher ?? (realDiscovery ? sharedFetcher : undefined);
 
   // Synthetic generators fabricate demo prospects — only included when allowed
-  // (never in production). The SERP source, first-party customer mining, and the
-  // (real-or-empty) backlink source are always present.
+  // (never in production). First-party customer mining and the (real-or-empty)
+  // backlink source are always present; the SERP source only when its provider is
+  // real or synthetic output is allowed (see above).
   const syntheticSources = config.allowSyntheticDiscovery
     ? [new CompetitorAffiliateSource(), new CreatorDiscoverySource()]
     : [];
@@ -192,7 +204,7 @@ export function createContext(overrides: Partial<AppContext> = {}): AppContext {
   // when real discovery is on (so dev/test make no outbound calls); reuses the fetcher.
   const podcastDiscovery = realDiscovery ? new PodcastDiscoverySource({ http: jsonHttp, fetcher: sharedFetcher }) : null;
   const discoverySources: DiscoverySource[] = overrides.discoverySources ?? [
-    serpSource,
+    ...(serpSource ? [serpSource] : []),
     ...syntheticSources,
     new DbCustomerMiningSource(db),
     new BacklinkDiscoverySource(backlinkProvider, programResolver),

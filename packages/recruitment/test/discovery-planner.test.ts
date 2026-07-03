@@ -26,13 +26,28 @@ async function merchant(competitors: string[]) {
 const deps = (sources: DiscoverySource[]): RecruitmentDeps => ({ db, discoverySources: sources }) as unknown as RecruitmentDeps;
 
 describe("planDiscovery — the orchestration brain", () => {
-  it("runs competitor backlink mining first (warmest) and skips customer mining with no orders", async () => {
+  it("runs competitor backlink mining first (warmest) and skips customer mining (hashed emails — no contact path)", async () => {
     await merchant(["rival.com"]);
     const plan = await planDiscovery(deps([stub("serp_mining"), stub("backlink_mining"), stub("customer_mining")]), "m1");
     expect(plan.steps[0]!.sourceType).toBe("backlink_mining"); // warmest first, not array order
     expect(plan.steps.map((s) => s.sourceType)).toContain("serp_mining");
-    expect(plan.skipped.find((s) => s.sourceType === "customer_mining")?.reason).toMatch(/no orders/i);
+    // #30 behavior flip: customer mining is ALWAYS skipped by the plan (even with orders
+    // on file) — Customer stores only emailHash, so its prospects are uncontactable.
+    expect(plan.skipped.find((s) => s.sourceType === "customer_mining")?.reason).toMatch(/hashed emails only/i);
     expect(plan.steps[0]!.rationale).toBeTruthy();
+  });
+
+  it("skips customer mining even when orders exist (the source stays registered for dev/demo)", async () => {
+    await merchant(["rival.com"]);
+    await db.orders.insert({
+      id: "o1", merchantId: "m1", customerId: "c1", amountCents: 5000, currency: "USD",
+      txnId: "t1", ts: new Date().toISOString(), lineItems: [], couponCodes: [],
+      isNewCustomer: true, isRebill: false, subtotalCents: 5000, discountCents: 0,
+      taxCents: 0, shippingCents: 0, country: null,
+    });
+    const plan = await planDiscovery(deps([stub("backlink_mining"), stub("customer_mining")]), "m1");
+    expect(plan.steps.map((s) => s.sourceType)).not.toContain("customer_mining");
+    expect(plan.skipped.find((s) => s.sourceType === "customer_mining")?.reason).toMatch(/no contact path/i);
   });
 
   it("skips competitor mining when no competitors are set, with a guiding note", async () => {

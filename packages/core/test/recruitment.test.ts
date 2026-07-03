@@ -132,6 +132,15 @@ describe("affiliate-link detection", () => {
     expect(s[0]!.network).toBe("Amazon Associates");
   });
 
+  it("detects a BARE amzn.to short link — real SiteStripe links carry no params (#25)", () => {
+    const s = detectAffiliateUrl("https://amzn.to/3XYZ");
+    expect(s[0]!.network).toBe("Amazon Associates");
+    expect(s[0]!.confidence).toBe("high"); // amzn.to IS Amazon's affiliate shortener
+    // Full amazon.* domains still require ?tag= (a plain product link is not a signal).
+    expect(detectAffiliateUrl("https://amazon.com/dp/B0ABC123")).toEqual([]);
+    expect(detectAffiliateUrl("https://www.amazon.com/dp/B0ABC123?tag=mysite-20").length).toBeGreaterThan(0);
+  });
+
   it("detects generic ?ref= params but marks them LOW confidence", () => {
     const s = detectAffiliateUrl("https://competitor.com/buy?ref=joe123");
     expect(s.some((x) => x.network.includes("Generic"))).toBe(true);

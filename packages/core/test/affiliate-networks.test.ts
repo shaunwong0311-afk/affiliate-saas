@@ -58,9 +58,11 @@ describe("identifyProgram — extracts network + merchant from an affiliate link
 });
 
 describe("backlinkTargetsFor — turns a program into backlink queries", () => {
-  it("shared network → query the click host, filtered by merchant id", () => {
+  it("shared network → query the click host, filtered by merchant id (with the exact param/value for post-filtering)", () => {
     const p = identifyProgram("https://shareasale.com/r.cfm?m=56789")!;
-    expect(backlinkTargetsFor(p)).toContainEqual({ target: "shareasale.com", urlToContains: "m=56789" });
+    // param/value are explicit so callers can verify rows EXACTLY — the provider-side
+    // LIKE is a substring (`%m=56789%` would also match m=567890).
+    expect(backlinkTargetsFor(p)).toContainEqual({ target: "shareasale.com", urlToContains: "m=56789", param: "m", value: "56789" });
   });
 
   it("vanity network → query the vanity host directly (no filter)", () => {

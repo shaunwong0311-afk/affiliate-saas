@@ -5,6 +5,7 @@ import {
   identifyProgram,
   backlinkTargetsFor,
   type AffiliateSignal,
+  type BacklinkTarget,
   type ResolvedProgram,
 } from "@affiliate/core";
 import type { Database } from "@affiliate/db";
@@ -107,14 +108,25 @@ function safeHost(url: string): string | null {
 
 // Platforms whose identity lives in the PATH (or subdomain), so the host alone does
 // not identify a creator — dedup and seed URLs must keep the handle.
-const SOCIAL_HOSTS = ["youtube.com", "twitter.com", "x.com", "instagram.com", "tiktok.com"];
+const SOCIAL_HOSTS = ["youtube.com", "youtu.be", "twitter.com", "x.com", "instagram.com", "tiktok.com"];
 const PATH_PLATFORM_HOSTS = [...SOCIAL_HOSTS, "medium.com", "reddit.com"];
+
+// A youtube.com/watch URL — the identity is the `v` param, not the path.
+function youtubeWatchVideoId(u: URL): string | null {
+  const host = u.hostname.replace(/^www\./, "").toLowerCase();
+  if (host !== "youtube.com" || u.pathname.replace(/\/$/, "") !== "/watch") return null;
+  return u.searchParams.get("v");
+}
 
 function cleanUrl(url: string): string {
   try {
     const u = new URL(url);
+    // A watch URL is nothing without its video id — keep ?v= (everything else —
+    // tracking params, playlist/timestamp params — is still stripped).
+    const videoId = youtubeWatchVideoId(u);
     u.search = "";
     u.hash = "";
+    if (videoId) u.search = `?v=${videoId}`;
     return u.toString().replace(/\/$/, "");
   } catch {
     return url;
@@ -124,14 +136,20 @@ function cleanUrl(url: string): string {
 /**
  * A stable identity key for dedup. For path-based platforms (youtube.com/@a vs
  * youtube.com/@b) the first path segment is part of the key, so distinct creators on
- * the same host are NOT collapsed; ordinary sites key on host.
+ * the same host are NOT collapsed; ordinary sites key on host. YouTube watch URLs
+ * (youtube.com/watch?v=…, youtu.be/…) key on the VIDEO id — the first path segment
+ * is "watch" for every result, which would collapse a whole SERP to one candidate.
  */
 function candidateKey(url: string): string | null {
   const host = safeHost(url);
   if (!host) return null;
   if (!PATH_PLATFORM_HOSTS.includes(host)) return host;
   try {
-    const seg = new URL(url).pathname.split("/").filter(Boolean)[0];
+    const u = new URL(url);
+    const videoId = youtubeWatchVideoId(u);
+    if (videoId) return `${host}/watch/${videoId}`; // video ids are case-sensitive
+    const seg = u.pathname.split("/").filter(Boolean)[0];
+    if (host === "youtu.be") return seg ? `youtube.com/watch/${seg}` : host; // the path segment IS the video id
     return seg ? `${host}/${seg.toLowerCase()}` : host;
   } catch {
     return host;
@@ -269,6 +287,21 @@ export interface BacklinkProvider {
 /** Common affiliate URL markers for the apex-domain server filter. */
 export const AFFILIATE_MARKERS = ["ref=", "aff=", "affiliate", "via=", "partner=", "/go/", "/recommend", "/aff/"];
 
+/**
+ * Exact merchant-param check for network-targeted backlink rows. The provider-side
+ * `url_to` filter is a substring LIKE (`%m=1234%` also matches `m=12345`), so a row
+ * is only trusted once the destination URL carries the EXACT id.
+ */
+function hasExactParam(rawUrl: string, param: string, value: string): boolean {
+  try {
+    return new URL(rawUrl).searchParams.get(param) === value;
+  } catch {
+    // Unparseable URL → boundary-aware fallback: param=value ending at &, #, or end.
+    const esc = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return new RegExp(`[?&]${esc(param)}=${esc(value)}(?:[&#]|$)`).test(rawUrl);
+  }
+}
+
 // Build a DataForSEO OR-of-LIKE filter (capped at 8, their max combined filters).
 function orLikeFilter(field: string, values: string[]): unknown[] {
   const out: unknown[] = [];
@@ -349,49 +382,79 @@ export class DeterministicBacklinkProvider implements BacklinkProvider {
   }
 }
 
+// Resolver cache TTLs: a wrong entry poisons every later mining run, so hits expire
+// daily; empties expire within the hour (a temporarily-unreachable site gets retried).
+const RESOLVER_HIT_TTL_MS = 24 * 60 * 60 * 1000;
+const RESOLVER_MISS_TTL_MS = 60 * 60 * 1000;
+
+// Homepage-only guard: a network-shaped link counts only when its href or the
+// surrounding markup says affiliate/partner — the homepage routinely carries
+// shared-network links the competitor merely PUBLISHES (pointing at ANOTHER merchant).
+const AFFILIATE_CONTEXT = /affiliat|partner|refer/i;
+
 /**
  * Resolves a competitor domain to its affiliate program(s) — the network + merchant
  * id (or vanity host) needed to query the RIGHT backlinks. Tries a manual override
- * first, then reads the competitor's own site (their "Affiliates"/"Partners" page
- * links into the network with the id baked in). Cached per competitor.
+ * first, then reads the competitor's own site: the dedicated "Affiliates"/"Partners"
+ * paths FIRST (a program link there is unambiguously theirs), the homepage only as a
+ * context-guarded fallback. Cached per competitor with a TTL.
  */
 export class CompetitorProgramResolver {
-  private readonly cache = new Map<string, ResolvedProgram[]>();
-  constructor(private readonly opts: { fetcher?: HttpFetcher; overrides?: Record<string, ResolvedProgram[]> } = {}) {}
+  private readonly cache = new Map<string, { programs: ResolvedProgram[]; expiresAt: number }>();
+  constructor(private readonly opts: { fetcher?: HttpFetcher; overrides?: Record<string, ResolvedProgram[]>; now?: () => number } = {}) {}
+
+  private now(): number {
+    return this.opts.now ? this.opts.now() : Date.now();
+  }
 
   async resolve(competitor: string): Promise<ResolvedProgram[]> {
     const domain = safeHost(competitor) ?? competitor.toLowerCase();
     const cached = this.cache.get(domain);
-    if (cached) return cached;
+    if (cached && cached.expiresAt > this.now()) return cached.programs;
     let programs = this.opts.overrides?.[domain] ?? [];
     if (programs.length === 0 && this.opts.fetcher) programs = await this.fromSite(domain).catch(() => []);
     const deduped = dedupePrograms(programs);
-    this.cache.set(domain, deduped);
+    this.cache.set(domain, { programs: deduped, expiresAt: this.now() + (deduped.length ? RESOLVER_HIT_TTL_MS : RESOLVER_MISS_TTL_MS) });
     return deduped;
   }
 
   private async fromSite(domain: string): Promise<ResolvedProgram[]> {
     const found: ResolvedProgram[] = [];
-    const scan = async (url: string): Promise<string | null> => {
+    const fetchHtml = async (url: string): Promise<string | null> => {
       try {
         const r = await this.opts.fetcher!.get(url);
-        if (r.status < 200 || r.status >= 300 || !r.html) return null;
-        for (const href of extractHrefs(r.html, url)) {
-          const p = identifyProgram(href);
-          if (p) found.push(p);
-        }
-        return r.html;
+        return r.status >= 200 && r.status < 300 && r.html ? r.html : null;
       } catch {
         return null;
       }
     };
-    const home = await scan(`https://${domain}`);
+    // On a DEDICATED program page every network link is the competitor's own program.
+    const scan = async (url: string): Promise<void> => {
+      const html = await fetchHtml(url);
+      if (!html) return;
+      for (const href of extractHrefs(html, url)) {
+        const p = identifyProgram(href);
+        if (p) found.push(p);
+      }
+    };
+
+    // 1) Dedicated program paths FIRST — the trustworthy source.
     const PROGRAM_PATHS = ["/affiliates", "/affiliate", "/affiliate-program", "/partners", "/partner-program", "/referral", "/ambassadors"];
     for (const path of PROGRAM_PATHS) {
       if (found.length) break;
       await scan(`https://${domain}${path}`);
     }
-    // Follow an on-page "affiliate/partner" link if the common paths missed.
+
+    // 2) Homepage as a fallback — but only links whose href / surrounding ~120 chars
+    //    look affiliate-ish, so a link the competitor publishes to SOMEONE ELSE'S
+    //    program never resolves as theirs.
+    let home: string | null = null;
+    if (found.length === 0) {
+      home = await fetchHtml(`https://${domain}`);
+      if (home) found.push(...programsFromHomepage(home, `https://${domain}`));
+    }
+
+    // 3) Follow an on-page "affiliate/partner" link if the common paths missed.
     if (found.length === 0 && home) {
       const links = extractHrefs(home, `https://${domain}`).filter((l) => /affiliate|partner|refer|ambassador/i.test(l) && safeHost(l) === domain);
       for (const l of links.slice(0, 3)) {
@@ -401,6 +464,25 @@ export class CompetitorProgramResolver {
     }
     return found;
   }
+}
+
+// Extract programs from the HOMEPAGE only when the href or ~120 chars of surrounding
+// HTML carry affiliate context (the window includes the href itself).
+function programsFromHomepage(html: string, baseUrl: string): ResolvedProgram[] {
+  const out: ResolvedProgram[] = [];
+  for (const m of html.matchAll(/href\s*=\s*["']([^"']+)["']/gi)) {
+    let resolved: string;
+    try {
+      resolved = new URL(m[1]!, baseUrl).toString();
+    } catch {
+      continue;
+    }
+    const p = identifyProgram(resolved);
+    if (!p) continue;
+    const context = html.slice(Math.max(0, m.index! - 120), m.index! + m[0].length + 120);
+    if (AFFILIATE_CONTEXT.test(context)) out.push(p);
+  }
+  return out;
 }
 
 function dedupePrograms(programs: ResolvedProgram[]): ResolvedProgram[] {
@@ -448,7 +530,7 @@ export class BacklinkDiscoverySource implements DiscoverySource {
       // Resolve the program → precise backlink targets. Fall back to the apex domain.
       const programs = this.resolver ? await this.resolver.resolve(competitor).catch(() => []) : [];
       const targets = programs.flatMap((p) => backlinkTargetsFor(p, competitor));
-      const queries = targets.length ? targets : [{ target: competitor, urlToContains: undefined as string | undefined }];
+      const queries: BacklinkTarget[] = targets.length ? targets : [{ target: competitor }];
 
       for (const t of queries) {
         if (out.length >= query.limit) break;
@@ -469,7 +551,12 @@ export class BacklinkDiscoverySource implements DiscoverySource {
         }
         for (const row of rows) {
           if (out.length >= query.limit) break;
-          if (!networkTargeted) {
+          if (networkTargeted) {
+            // The server-side merchant-id filter is a substring LIKE, so a shared-network
+            // row must carry the EXACT id before it earns `confirmedCompetitor` — a row
+            // failing this provably belongs to ANOTHER merchant on the network → drop it.
+            if (t.param && t.value && !hasExactParam(row.urlTo, t.param, t.value)) continue;
+          } else {
             // Apex fallback: require an affiliate signature pointing at the competitor.
             if (detectAffiliateUrl(row.urlTo).length === 0) continue;
             const th = safeHost(row.urlTo);
