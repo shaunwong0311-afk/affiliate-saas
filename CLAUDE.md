@@ -107,9 +107,26 @@ links. Keep this discipline in all discovery/enrichment work.
 
 ## Current state (as of this writing)
 
-All built and green (**377 tests**, root + web typecheck clean, vite build clean, demo runs).
+All built and green (**456 tests**, root + web typecheck clean, vite build clean, demo runs).
 The full **discovery + enrich + score + recursive-frontier** AND the **outreach/recruit→close**
 half now exist end-to-end behind ports; runs on labeled demo data until keys are set.
+
+A **multi-agent adversarial audit was run and fully remediated** — see `docs/AUDIT-2026-07.md`
+(all 50 verified findings fixed across 12 commits). Load-bearing outcomes now hold in a real
+keyed deploy: a mailer `failed` result is never recorded as sent (no phantom sends / billing);
+mailbox credentials persist AES-256-GCM-encrypted in the DB (survive restart, no silent mock
+fallback); the standalone worker builds the SAME full `AppContext` as the API (env-gated real
+sources/senders/poller — `packages/api/src/worker.ts`); the transactional ESP is env-wired
+(Resend/Postmark); reply ingestion can't false-suppress (quoted-reply extraction never falls back
+to raw, tenant-scoped, Message-Id dedup, STOP honored, OOO snooze); daily-cap/warmup/auto-pause are
+enforced on the CAMPAIGN's mailbox; the unsubscribe link is HMAC-signed + confirm-on-GET; the
+circuit breaker uses a rolling window and separates unsubscribes from complaints; discovery is
+honest (no synthetic SERP in prod, bare `amzn.to` detected, exact-merchant-id backlink filter, no
+identity over-merge); OAuth rails reach SMTP parity (raw-MIME headers + bounce mapping). New
+capabilities: **bulk import** (prospects + affiliate roster — also guards a merchant's own
+affiliates from cold email), **IG/TikTok discovery** (`SocialCreatorDiscoverySource` + social SERP
+fallback), **content-freshness** (`activityRecency`), **merchant `bookingUrl`** (honest A-tier
+calendar, no fabricated stub URL), and an **audience-quality flag** (bought-audience reach discount).
 
 The **`docs/OUTREACH-SPEC.md` §16 queue is COMPLETE** — all seven items shipped: IMAP reply
 poller (SMTP-rail inbound, PEEK-only, wired into the scheduler), activation welcome email
