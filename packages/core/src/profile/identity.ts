@@ -116,12 +116,25 @@ export function classifyAccountUrl(rawUrl: string): { platform: Platform; handle
 
   if (hostMatches(host, BIO_HOSTS)) return { platform: "linktree", handle: seg[0] ?? null, url: norm };
   if (host === "youtube.com" || host === "youtu.be") {
-    const handle = seg[0]?.startsWith("@") ? seg[0] : ["channel", "c", "user"].includes(seg[0] ?? "") ? seg[1] ?? null : null;
-    return { platform: "youtube", handle: handle ?? null, url: norm };
+    // Video / search / utility paths carry NO channel identity — a link to one is not an
+    // owned account (two unrelated sites can embed the same video, and query-stripping
+    // would collapse every `watch?v=…` to one shared, handle-less key). Skip them so they
+    // never become a merge identifier. Only real channel handles/ids resolve to an account.
+    const first = (seg[0] ?? "").toLowerCase();
+    if (host === "youtube.com" && ["watch", "shorts", "playlist", "embed", "results", "feed", "clip"].includes(first)) return null;
+    const handle = seg[0]?.startsWith("@") ? seg[0] : ["channel", "c", "user"].includes(first) ? seg[1] ?? null : null;
+    if (!handle) return null; // handle-less (bare host, youtu.be/<videoId>) — no channel identity
+    return { platform: "youtube", handle, url: norm };
   }
   if (host === "twitter.com" || host === "x.com") {
-    const h = seg[0] && !["i", "home", "search", "intent"].includes(seg[0]) ? `@${seg[0].replace(/^@/, "")}` : null;
-    return { platform: "twitter", handle: h, url: norm };
+    // Share widgets (/intent/tweet, /share), utility tabs, and a specific tweet
+    // (/<user>/status/<id> — usually an EMBEDDED/quoted tweet) are not the page owner's
+    // handle, so we never attribute them as an owned account.
+    const first = (seg[0] ?? "").toLowerCase();
+    const NON_PROFILE = ["i", "home", "search", "intent", "share", "hashtag", "explore", "notifications", "messages", "compose", "login", "signup", "settings"];
+    if (!first || NON_PROFILE.includes(first)) return null;
+    if ((seg[1] ?? "").toLowerCase() === "status") return null; // a tweet, not their profile
+    return { platform: "twitter", handle: `@${seg[0]!.replace(/^@/, "")}`, url: norm };
   }
   if (host === "instagram.com") return { platform: "instagram", handle: seg[0] ? `@${seg[0].replace(/^@/, "")}` : null, url: norm };
   if (host === "tiktok.com") return { platform: "tiktok", handle: seg[0]?.startsWith("@") ? seg[0] : null, url: norm };

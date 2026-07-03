@@ -55,6 +55,16 @@ describe("extractEmailsFromHtml — obfuscation handling", () => {
     expect(emailsIn("reach jane AT creator DOT co")).toContain("jane@creator.co");
   });
 
+  it("reads the single-obfuscation `name [at] domain.com` form (obfuscated at, literal dot)", () => {
+    expect(emailsIn("email me: john [at] gmail.com")).toContain("john@gmail.com");
+    // literal dots + a two-level TLD reconstruct correctly (domain avoids the "example" junk filter).
+    expect(emailsIn("jane (at) brandstudio.co.uk for press")).toContain("jane@brandstudio.co.uk");
+  });
+
+  it("does NOT match prose 'sit at the dot' (bare at/dot stay uppercase-only)", () => {
+    expect(emailsIn("please sit at the dot on the floor")).toEqual([]);
+  });
+
   it("reads spaced-punctuation obfuscation", () => {
     expect(emailsIn("hello @ brandsite . com for inquiries")).toContain("hello@brandsite.com");
   });

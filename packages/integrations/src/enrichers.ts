@@ -18,6 +18,41 @@ function numOrNull(v: unknown): number | null {
   return Number.isFinite(n) ? n : null;
 }
 
+// Scrape actors report geo/language inconsistently ("United States", "English", or an
+// ISO code). audienceOverlapScore expects ISO 3166-1 alpha-2 / ISO 639-1, so an
+// un-normalized name scores as a MISMATCH (a fake penalty) instead of honest "unknown".
+// Normalize the frequent names; anything we can't confidently map stays null (never faked).
+const COUNTRY_NAME_TO_ISO: Record<string, string> = {
+  "united states": "US", "united states of america": "US", usa: "US", america: "US",
+  canada: "CA", "united kingdom": "GB", uk: "GB", "great britain": "GB", britain: "GB", england: "GB",
+  australia: "AU", "new zealand": "NZ", germany: "DE", france: "FR", spain: "ES", italy: "IT",
+  netherlands: "NL", ireland: "IE", belgium: "BE", austria: "AT", portugal: "PT", finland: "FI",
+  greece: "GR", sweden: "SE", norway: "NO", denmark: "DK", switzerland: "CH", poland: "PL",
+  japan: "JP", brazil: "BR", mexico: "MX", india: "IN", singapore: "SG", china: "CN",
+  "south korea": "KR", korea: "KR", indonesia: "ID", philippines: "PH", "south africa": "ZA",
+};
+const LANG_NAME_TO_ISO: Record<string, string> = {
+  english: "en", spanish: "es", french: "fr", german: "de", italian: "it", portuguese: "pt",
+  dutch: "nl", japanese: "ja", chinese: "zh", mandarin: "zh", korean: "ko", russian: "ru",
+  arabic: "ar", hindi: "hi", turkish: "tr", polish: "pl", swedish: "sv", indonesian: "id",
+};
+
+/** Normalize a country value to ISO 3166-1 alpha-2, or null when it can't be mapped. */
+function normalizeGeo(v: unknown): string | null {
+  if (typeof v !== "string") return null;
+  const s = v.trim();
+  if (/^[A-Za-z]{2}$/.test(s)) return s.toUpperCase(); // already an alpha-2 code
+  return COUNTRY_NAME_TO_ISO[s.toLowerCase()] ?? null; // unknown → null, not a fake mismatch
+}
+
+/** Normalize a language value to ISO 639-1 (2-letter), or null when it can't be mapped. */
+function normalizeLang(v: unknown): string | null {
+  if (typeof v !== "string") return null;
+  const s = v.trim();
+  if (/^[a-zA-Z]{2}(-|$)/.test(s)) return s.slice(0, 2).toLowerCase(); // "en" / "en-US"
+  return LANG_NAME_TO_ISO[s.toLowerCase()] ?? null;
+}
+
 /**
  * YouTube — FREE via the Data API. channels.list gives subscriberCount + country;
  * recent uploads' videos.list gives likes/comments/views → a real engagement rate.
@@ -94,7 +129,9 @@ export class ScrapeMetricsEnricher implements AccountEnricher {
     const reach = numOrNull(d.followers ?? d.followerCount ?? d.subscribers);
     const engagementRate = numOrNull(d.engagementRate ?? d.engagement_rate);
     if (reach == null && engagementRate == null) return null;
-    return { reach, engagementRate, primaryGeo: d.country ?? null, language: d.language ?? null, source: "scrape" };
+    // Normalize geo/language to ISO so audienceOverlapScore compares like-for-like — an
+    // un-mappable value stays null (honest unknown) rather than scoring as a fake mismatch.
+    return { reach, engagementRate, primaryGeo: normalizeGeo(d.country), language: normalizeLang(d.language), source: "scrape" };
   }
 }
 
@@ -122,10 +159,19 @@ export class OnPageSubscriberEnricher implements AccountEnricher {
   }
 }
 
+/** True when a metrics result carries ANY real signal (audience OR a contact path). */
+function metricsHaveData(m: AccountMetrics): boolean {
+  return m.reach != null || m.engagementRate != null || (m.emails?.length ?? 0) > 0 || (m.links?.length ?? 0) > 0;
+}
+
 /**
- * Caches enricher results (including misses) by platform+handle for a TTL, so the
- * same creator — seen across merchants or re-runs — is only paid for once per
+ * Caches enricher results (including genuine misses) by platform+handle for a TTL, so
+ * the same creator — seen across merchants or re-runs — is only paid for once per
  * window. The single biggest credit saver once merchant niches overlap.
+ *
+ * A genuine null ("this account exposes no data") caches normally. A TRANSPORT ERROR
+ * (the inner enricher THREW — API down, rate-limited, network blip) is NOT cached, so a
+ * transient outage never becomes a 24h dead miss that silently drops a contactable creator.
  */
 export class CachingEnricher implements AccountEnricher {
   readonly kind: string;
@@ -144,13 +190,24 @@ export class CachingEnricher implements AccountEnricher {
     const now = Date.now();
     const hit = this.cache.get(key);
     if (hit && hit.expiresAt > now) return hit.metrics;
-    const metrics = await this.inner.enrich(account);
+    let metrics: AccountMetrics | null;
+    try {
+      metrics = await this.inner.enrich(account);
+    } catch {
+      return null; // transport error → don't poison the cache; the next call retries
+    }
     this.cache.set(key, { metrics, expiresAt: now + this.ttlMs });
     return metrics;
   }
 }
 
-/** Routes an account to the first enricher that supports its platform. */
+/**
+ * Routes an account to the first enricher that supports its platform and returns real
+ * data. A metrics result is kept when it carries ANY real signal — including a contact
+ * path (emails/links from a YouTube channel description) even with null reach/engagement,
+ * the key path for website-less creators. Distinguishes a genuine no-data result (returns
+ * null, cacheable) from a transport error (RE-THROWS, so CachingEnricher won't cache it).
+ */
 export class EnricherRegistry implements AccountEnricher {
   readonly kind = "registry";
   constructor(private readonly enrichers: AccountEnricher[]) {}
@@ -158,11 +215,17 @@ export class EnricherRegistry implements AccountEnricher {
     return this.enrichers.some((e) => e.supports(platform));
   }
   async enrich(account: { platform: string; handle: string | null; url: string }): Promise<AccountMetrics | null> {
+    let transportError: unknown = null;
     for (const e of this.enrichers) {
       if (!e.supports(account.platform)) continue;
-      const m = await e.enrich(account).catch(() => null);
-      if (m && (m.reach != null || m.engagementRate != null)) return m;
+      try {
+        const m = await e.enrich(account);
+        if (m && metricsHaveData(m)) return m;
+      } catch (err) {
+        transportError = err; // remember; try the next supporting enricher
+      }
     }
-    return null;
+    if (transportError) throw transportError; // no data AND something errored → not a cacheable miss
+    return null; // every supporting enricher answered "no data"
   }
 }

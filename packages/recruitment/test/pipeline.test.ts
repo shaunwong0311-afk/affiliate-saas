@@ -8,8 +8,8 @@ import {
   DEFAULT_DISCOVERY_SOURCES,
 } from "@affiliate/integrations";
 import { systemClock, newId } from "@affiliate/core";
-import { runSourcing, handleReply, isSuppressed, ingestCandidate, type RecruitmentDeps } from "../src/index.js";
-import type { RawCandidate } from "@affiliate/integrations";
+import { runSourcing, handleReply, isSuppressed, ingestCandidate, enrich, type RecruitmentDeps } from "../src/index.js";
+import type { RawCandidate, EmailFinder, EmailVerifier } from "@affiliate/integrations";
 
 let db: Database;
 let deps: RecruitmentDeps;
@@ -111,6 +111,41 @@ describe("recruitment pipeline", () => {
     const platforms = (merged.evidence?.profile?.accounts ?? []).map((x: { platform: string }) => x.platform);
     expect(platforms).toContain("youtube");
     expect(platforms).toContain("website");
+  });
+
+  it("enrich: verification precedence prefers Hunter's mailbox verify over a domain-only MX pass", async () => {
+    const discovered = {
+      merchantId: "m1", source: "backlink_mining", channelUrl: null, email: null,
+      state: "discovered" as const, score: null, tier: null, country: null, language: null,
+      suppressionStatus: "none" as const, scoreBreakdown: null, synthetic: false, confidence: null,
+      evidence: null, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+    };
+
+    // (a) A Hunter find-candidate already stamped verified:true is trusted — no domain re-verify.
+    const mxCalls: string[] = [];
+    const trustingFinder: EmailFinder = {
+      name: "hunter",
+      async find() { return [{ email: "real@brand.com", confidence: 0.9, verified: true, source: "hunter" }]; },
+      async verify() { return { deliverable: true, reason: "valid" }; },
+    };
+    const mxAlwaysGood: EmailVerifier = { kind: "mx", async verify(e: string) { mxCalls.push(e); return { deliverable: true, reason: "mx present" }; } };
+    const p1 = await db.prospects.insert({ ...discovered, id: newId("prosp"), identity: "Brand Blog", siteUrl: "https://brand.com" });
+    const out1 = await enrich({ ...deps, emailFinder: trustingFinder, emailVerifier: mxAlwaysGood }, p1.id);
+    expect(out1.email).toBe("real@brand.com"); // trusted the finder's verified flag
+    expect(mxCalls).not.toContain("real@brand.com"); // never re-verified at the domain level
+
+    // (b) An unverified GUESS that MX passes (any gmail.com) must defer to the finder's
+    //     mailbox verify — which rejects it — instead of being accepted on the MX pass alone.
+    const hunterVerifyCalls: string[] = [];
+    const guessingFinder: EmailFinder = {
+      name: "hunter",
+      async find() { return [{ email: "guess@gmail.com", confidence: 0.8, verified: false, source: "hunter" }]; },
+      async verify(e: string) { hunterVerifyCalls.push(e); return { deliverable: false, reason: "mailbox not found" }; },
+    };
+    const p2 = await db.prospects.insert({ ...discovered, id: newId("prosp"), identity: "Guess Blog", siteUrl: "https://guess-brand.com" });
+    const out2 = await enrich({ ...deps, emailFinder: guessingFinder, emailVerifier: mxAlwaysGood }, p2.id);
+    expect(hunterVerifyCalls).toContain("guess@gmail.com"); // MX pass deferred to the finder's mailbox verify
+    expect(out2.email).toBeNull(); // finder rejected the guess → not accepted on MX alone
   });
 
   it("suppresses on unsubscribe and routes interested replies to HITL", async () => {

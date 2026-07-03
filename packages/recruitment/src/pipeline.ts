@@ -10,7 +10,6 @@ import {
   addPageToProfile,
   mergeProfiles,
   identitySignalsFromProfile,
-  identitiesOverlap,
   hasIdentitySignal,
   audienceOverlapScore,
   targetMarketForCurrency,
@@ -20,6 +19,7 @@ import {
   type AffiliateSignal,
   type Tier,
   type Profile,
+  type IdentitySignals,
 } from "@affiliate/core";
 import type { Prospect, ProspectSignal, OutreachCampaign, OutreachMessage, Reply, Merchant } from "@affiliate/db";
 import {
@@ -78,6 +78,9 @@ export async function discover(
   }
 
   const created: Prospect[] = [];
+  // One identity-key index for the whole run: candidates dedup/merge against it in O(1)
+  // instead of each ingest rescanning every prospect (was O(C×N)).
+  const identityIndex = await buildIdentityIndex(deps, merchantId);
   for (const source of sources) {
     if (excluded.has(source.sourceType)) continue; // source-yield pruning
     let candidates;
@@ -87,7 +90,7 @@ export async function discover(
       continue; // isolate source failures (Section 8.1)
     }
     for (const cand of candidates) {
-      const prospect = await ingestCandidate(deps, merchant, cand);
+      const prospect = await ingestCandidate(deps, merchant, cand, { identityIndex });
       if (prospect) created.push(prospect);
     }
   }
@@ -99,7 +102,12 @@ export async function discover(
  * insert prospect + source + signals). Returns null on a duplicate. Shared by the
  * discovery loop and the recursive frontier engine so both ingest identically.
  */
-export async function ingestCandidate(deps: RecruitmentDeps, merchant: Merchant, cand: RawCandidate): Promise<Prospect | null> {
+export async function ingestCandidate(
+  deps: RecruitmentDeps,
+  merchant: Merchant,
+  cand: RawCandidate,
+  opts?: { identityIndex?: IdentityIndex },
+): Promise<Prospect | null> {
   const merchantId = merchant.id;
   // Fast path: exact re-discovery of the same surface (cheap, runs before the resolver).
   // For URL-less candidates (e.g. customer mining) fall back to identity-name equality.
@@ -143,15 +151,18 @@ export async function ingestCandidate(deps: RecruitmentDeps, merchant: Merchant,
   // than creating a duplicate. Matches on a shared social handle, contact email, or
   // website domain (never on name alone).
   const candSignals = identitySignalsFromProfile(profile, contactEmails.map((e) => e.email));
+  // Look the candidate up against a merchant identity-key INDEX rather than rescanning (and
+  // recomputing signals for) every prospect per candidate (was O(C×N)). The loop callers
+  // (discover/frontier) build ONE index per run and pass it; absent one we build it once for
+  // this call. The index mirrors identitiesOverlap exactly, so merge decisions are unchanged.
+  const index = opts?.identityIndex ?? (await buildIdentityIndex(deps, merchantId));
   if (hasIdentitySignal(candSignals)) {
-    const others = await deps.db.prospects.find((p) => p.merchantId === merchantId);
-    for (const other of others) {
-      const otherEmails = [other.email, ...(((other.evidence?.contactEmails as { email: string }[] | undefined) ?? []).map((e) => e.email))];
-      const otherSignals = identitySignalsFromProfile((other.evidence?.profile as Profile | null) ?? null, otherEmails);
-      if (identitiesOverlap(candSignals, otherSignals)) {
-        await mergeCandidateInto(deps, other, cand, { signals, profile, contactEmails, contactUrls, hasContactForm, competitorPromoted, isAffiliate, promotesComp, now });
-        return null; // enriched an existing prospect — not a net-new one
-      }
+    const matchId = index.lookup(candSignals);
+    if (matchId) {
+      const other = await deps.db.prospects.require(matchId);
+      await mergeCandidateInto(deps, other, cand, { signals, profile, contactEmails, contactUrls, hasContactForm, competitorPromoted, isAffiliate, promotesComp, now });
+      index.add(other.id, candSignals); // keep a shared index in sync for later candidates in the run
+      return null; // enriched an existing prospect — not a net-new one
     }
   }
 
@@ -208,7 +219,63 @@ export async function ingestCandidate(deps: RecruitmentDeps, merchant: Merchant,
     engagement: null,
     audienceOverlap: null,
   });
+  index.add(prospect.id, candSignals); // register so later candidates in this run merge/dedup against it
   return prospect;
+}
+
+/**
+ * A merchant's identity-key index: Map<hard identifier, prospectId>, built once per run so
+ * ingestCandidate resolves the "is this an existing creator?" merge in O(1) instead of
+ * rescanning every prospect. Keys mirror {@link identitiesOverlap}: a candidate's STRONG
+ * identifiers (owned accounts, emails, domains) match an existing strong OR weak key; a
+ * candidate's WEAK (page_link) account keys match only an existing STRONG key. First writer
+ * wins per key so a match resolves to the earliest-ingested prospect (mirrors scan order).
+ */
+export interface IdentityIndex {
+  lookup(signals: IdentitySignals): string | null;
+  add(prospectId: string, signals: IdentitySignals): void;
+}
+
+class ProspectIdentityIndex implements IdentityIndex {
+  private readonly strong = new Map<string, string>(); // strong account keys + emails + domains
+  private readonly weak = new Map<string, string>(); // page_link account keys
+
+  add(prospectId: string, s: IdentitySignals): void {
+    for (const k of this.strongKeys(s)) if (!this.strong.has(k)) this.strong.set(k, prospectId);
+    for (const k of s.weakAccountKeys) {
+      const wk = `a:${k}`;
+      if (!this.weak.has(wk)) this.weak.set(wk, prospectId);
+    }
+  }
+
+  lookup(s: IdentitySignals): string | null {
+    for (const k of this.strongKeys(s)) {
+      const id = this.strong.get(k) ?? this.weak.get(k); // strong↔strong or strong↔weak
+      if (id) return id;
+    }
+    for (const k of s.weakAccountKeys) {
+      const id = this.strong.get(`a:${k}`); // weak↔strong only (never weak↔weak)
+      if (id) return id;
+    }
+    return null;
+  }
+
+  private *strongKeys(s: IdentitySignals): Iterable<string> {
+    for (const k of s.accountKeys) yield `a:${k}`;
+    for (const e of s.emails) yield `e:${e}`;
+    for (const d of s.domains) yield `d:${d}`;
+  }
+}
+
+/** Build the identity-key index for a merchant from its existing prospects (once per run). */
+export async function buildIdentityIndex(deps: RecruitmentDeps, merchantId: string): Promise<IdentityIndex> {
+  const index = new ProspectIdentityIndex();
+  const others = await deps.db.prospects.find((p) => p.merchantId === merchantId);
+  for (const other of others) {
+    const otherEmails = [other.email, ...(((other.evidence?.contactEmails as { email: string }[] | undefined) ?? []).map((e) => e.email))];
+    index.add(other.id, identitySignalsFromProfile((other.evidence?.profile as Profile | null) ?? null, otherEmails));
+  }
+  return index;
 }
 
 // ---- 2. Enrich --------------------------------------------------------------
@@ -221,10 +288,22 @@ export async function enrich(
   if (!canTransition(prospect.state, "enriched")) return prospect;
 
   const domain = hostOf(prospect.siteUrl ?? prospect.channelUrl);
-  // Deliverability check: a wired EmailVerifier (real MX/SMTP) wins; otherwise the
-  // EmailFinder's own verify(). We never mark an unverified address deliverable.
-  const verify = (email: string) =>
-    deps.emailVerifier ? deps.emailVerifier.verify(email) : deps.emailFinder.verify(email);
+  // Deliverability check. The EmailFinder's own verify() (e.g. Hunter) is MAILBOX-level —
+  // strictly better than a domain-level MX check, which happily passes any well-formed
+  // gmail.com guess. So when the finder does real verification we trust it, using the MX
+  // verifier only as a cheap PRE-filter: a domain with no mail server can never receive
+  // mail, so we short-circuit undeliverable BEFORE spending a paid mailbox lookup. The
+  // stub finder's verify() is deterministic (not real), so we don't prefer it over MX.
+  const finderVerifies = deps.emailFinder.name !== "stub-finder";
+  const verify = async (email: string): Promise<{ deliverable: boolean; reason: string }> => {
+    if (deps.emailVerifier) {
+      const mx = await deps.emailVerifier.verify(email);
+      if (!mx.deliverable) return mx; // no mail server → undeliverable; skip the paid call
+      if (finderVerifies) return deps.emailFinder.verify(email); // confirm the mailbox itself
+      return mx; // MX passed and no real mailbox verifier available
+    }
+    return deps.emailFinder.verify(email); // no MX verifier → the finder's own verify (real or stub)
+  };
 
   let chosenEmail: string | null = null;
   let contactSource: string | null = null;
@@ -294,6 +373,14 @@ export async function enrich(
       .find({ fullName: prospect.identity, domain: domain ?? undefined, siteUrl: prospect.siteUrl ?? undefined })
       .catch(() => []);
     for (const c of candidates.sort((a, b) => b.confidence - a.confidence)) {
+      // Trust a candidate the finder already verified at find time (Hunter stamps
+      // `verified` from its verification.status) — don't pay to re-verify what it confirmed.
+      // The stub always reports verified:false, so this never fires offline.
+      if (c.verified) {
+        chosenEmail = c.email;
+        contactSource = c.source === "stub-finder" ? "pattern-guess" : c.source;
+        break;
+      }
       const v = await verify(c.email).catch(() => ({ deliverable: false, reason: "verify error" }));
       if (v.deliverable) {
         chosenEmail = c.email;

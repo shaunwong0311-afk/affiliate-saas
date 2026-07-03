@@ -29,6 +29,36 @@ describe("identitySignalsFromProfile + identitiesOverlap", () => {
     expect(identitiesOverlap(a, b)).toBe(false);
   });
 
+  it("does NOT merge two unrelated blogs that both LINK the same brand's Instagram (weak↔weak)", () => {
+    // Each blog merely one-directionally links instagram.com/nike (a page_link, 0.5) — that
+    // is not evidence either blog IS that account. Merging them would be the over-merge bug.
+    const a = identitySignalsFromProfile(buildProfile("https://blog1.com", [{ url: "https://blog1.com", links: ["https://instagram.com/nike"] }]), []);
+    const b = identitySignalsFromProfile(buildProfile("https://blog2.com", [{ url: "https://blog2.com", links: ["https://instagram.com/nike"] }]), []);
+    expect(a.weakAccountKeys.has("instagram:@nike")).toBe(true); // present, but only as a WEAK key
+    expect(identitiesOverlap(a, b)).toBe(false);
+  });
+
+  it("does NOT merge two unrelated blogs that embed the same YouTube VIDEO (no channel identity)", () => {
+    // A /watch URL carries no channel handle, so it never becomes an account/merge key at all.
+    const a = identitySignalsFromProfile(buildProfile("https://b1.com", [{ url: "https://b1.com", links: ["https://youtube.com/watch?v=POPULAR"] }]), []);
+    const b = identitySignalsFromProfile(buildProfile("https://b2.com", [{ url: "https://b2.com", links: ["https://youtube.com/watch?v=POPULAR"] }]), []);
+    expect([...a.weakAccountKeys, ...a.accountKeys].some((k) => k.startsWith("youtube:"))).toBe(false);
+    expect(identitiesOverlap(a, b)).toBe(false);
+  });
+
+  it("STILL merges on a shared handle when it is HIGH confidence on both sides (bio_aggregator ↔ seed)", () => {
+    // A: the youtube channel discovered on its own (seed, 1.0). B: a creator whose Linktree
+    // (bio aggregator, 0.9) lists that same channel → both hold it as a STRONG key.
+    const a = identitySignalsFromProfile(buildProfile("https://youtube.com/@trailgeek", []), []);
+    const b = identitySignalsFromProfile(
+      buildProfile("https://trailgeek.blog", [{ url: "https://linktr.ee/trailgeek", links: ["https://youtube.com/@trailgeek"], bioAggregator: true }]),
+      [],
+    );
+    expect(a.accountKeys.has("youtube:@trailgeek")).toBe(true);
+    expect(b.accountKeys.has("youtube:@trailgeek")).toBe(true);
+    expect(identitiesOverlap(a, b)).toBe(true);
+  });
+
   it("reports when a profile carries no hard identifier", () => {
     expect(hasIdentitySignal(identitySignalsFromProfile(null, []))).toBe(false);
     expect(hasIdentitySignal(identitySignalsFromProfile(buildProfile("https://x.com", []), []))).toBe(true);

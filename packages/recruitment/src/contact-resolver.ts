@@ -70,6 +70,9 @@ const NON_WEBSITE_HOSTS = new Set([
   "facebook.com", "fb.com", "amazon.com", "google.com", "apple.com", "play.google.com",
   "paypal.com", "gofundme.com", "patreon.com", "discord.gg", "discord.com", "t.me", "wa.me",
   "pinterest.com", "reddit.com", "gravatar.com", "wp.com", "shopify.com", "gumroad.com", "cdn.com",
+  // Social/video platforms — a handle URL is handled as a graph account; a handle-LESS URL
+  // (a youtube /watch, a tweet /status) is not the creator's own site, so never fetch it as one.
+  "youtube.com", "youtu.be", "twitter.com", "x.com", "instagram.com", "tiktok.com",
 ]);
 
 function hostOf(url: string): string | null {
@@ -126,7 +129,15 @@ export async function resolveContact(deps: ResolveDeps, input: ResolveInput): Pr
   // 2) Build the traversal frontier from the known contact URLs + every graph account.
   const visited = new Set<string>();
   const seedHost = input.seedUrl ? hostOf(input.seedUrl) : null;
-  if (seedHost) visited.add(seedHost); // the homepage was already fetched upstream
+  if (seedHost) {
+    // The homepage was already fetched upstream (its emails/links are passed in). Mark EVERY
+    // key shape the seed website account can dequeue as — bare host, normalized https URL, and
+    // the exact seed URL — so it's never re-fetched. The loop's visited key is `norm(url)`, so
+    // the bare host alone (the old behavior) never matched and wasted a slot of the tiny budget.
+    visited.add(seedHost);
+    visited.add(norm(`https://${seedHost}`));
+    if (input.seedUrl) visited.add(norm(input.seedUrl));
+  }
 
   const queue: Candidate[] = [];
   const enqueue = (c: Candidate) => {

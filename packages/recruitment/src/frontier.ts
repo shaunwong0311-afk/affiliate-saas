@@ -2,7 +2,7 @@ import { newId, competitorHostsFromLinks } from "@affiliate/core";
 import type { FrontierMerchant, Merchant, Prospect } from "@affiliate/db";
 import { extractHrefs, type DiscoveryQuery, type RawCandidate } from "@affiliate/integrations";
 import type { RecruitmentDeps } from "./deps.js";
-import { ingestCandidate } from "./pipeline.js";
+import { ingestCandidate, buildIdentityIndex } from "./pipeline.js";
 
 /**
  * Recursive discovery — the merchant-expansion frontier engine (Section 8.1). The
@@ -55,6 +55,8 @@ export async function expandFrontier(deps: RecruitmentDeps, merchantId: string, 
   };
   const backlink = deps.discoverySources.find((s) => s.sourceType === "backlink_mining");
   const now = () => deps.clock.now().toISOString();
+  // One identity-key index for the whole expansion so per-candidate ingest is O(1), not O(N).
+  const identityIndex = await buildIdentityIndex(deps, merchantId);
 
   // 1) Seed the frontier with the merchant's competitors (depth 0).
   const existing = await deps.db.frontierMerchants.find((f) => f.merchantId === merchantId);
@@ -89,7 +91,7 @@ export async function expandFrontier(deps: RecruitmentDeps, merchantId: string, 
         cands = [];
       }
       for (const cand of cands) {
-        const p = await ingestCandidate(deps, merchant, cand);
+        const p = await ingestCandidate(deps, merchant, cand, { identityIndex });
         if (p) {
           affiliates.push(p);
           discovered++;

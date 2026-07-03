@@ -83,6 +83,19 @@ describe("resolveContact — graph traversal", () => {
     expect(res.email).toBeNull();
   });
 
+  it("does NOT re-fetch the seed homepage (already fetched upstream) — saves a budget slot", async () => {
+    // The seed website account is enqueued from the profile; the homepage was already fetched
+    // upstream (its emails arrive via knownEmails). The traversal must not spend a fetch on it.
+    // Here the page WOULD yield an email if fetched — proving via absence that it isn't.
+    const fetcher = fetcherFrom({ "https://example.com": `<a href="mailto:home@example.com">contact</a>` });
+    const res = await resolveContact(
+      { fetcher, verify: verify(["home@example.com"]) },
+      { profile: buildProfile("https://example.com", []), seedUrl: "https://example.com", canFetch: true, knownEmails: [], knownContactUrls: [] },
+    );
+    expect(fetcher.hits()).not.toContain("https://example.com"); // seed homepage NOT re-fetched
+    expect(res.email).toBeNull(); // nothing else to try → honest miss (not the re-fetched homepage email)
+  });
+
   it("does no network traversal for synthetic/dev prospects (canFetch=false)", async () => {
     const fetcher = fetcherFrom({ "https://linktr.ee/x": `<a href="mailto:x@x.com">e</a>` });
     const res = await resolveContact(

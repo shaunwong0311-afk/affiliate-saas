@@ -76,18 +76,21 @@ export class NoopEmailVerifier implements EmailVerifier {
 const EMAIL_RE = /[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/gi;
 
 /**
- * Obfuscated-email pattern: `local <at> domain <dot> tld`, where <at>/<dot> are
- * bracketed words (`[at]`, `(dot)`), bare UPPERCASE words (`AT`, `DOT` — the
- * deliberate-obfuscation signal), or spaced punctuation (` @ `, ` . `). Case-
- * SENSITIVE on purpose so prose like "look at the dot-com era" doesn't match —
- * the bare-word forms must be uppercase. The domain group is greedy so multi-part
- * domains (`sub.example DOT com`) reconstruct correctly.
+ * Obfuscated-email pattern: `local <at> domain <dot> tld`, where <at> is a bracketed
+ * word (`[at]`, `(at)`), a bare UPPERCASE word (`AT` — the deliberate-obfuscation
+ * signal), or spaced punctuation (` @ `); and <dot> is any of those forms OR a plain
+ * literal `.` adjacent to the TLD. The literal-dot alternative catches the most common
+ * SINGLE-obfuscation form — `john [at] gmail.com` — where only the at-part is disguised.
+ * The bare-word AT/DOT forms stay UPPERCASE-only so prose like "look at the dot-com era"
+ * (lowercase) never matches; the literal dot is safe because it can only fire AFTER a
+ * valid at-separator has matched (which lowercase prose "at" won't satisfy). The domain
+ * group is greedy so multi-part domains (`sub.example DOT com`) reconstruct correctly.
  */
 const OBFUSCATED_RE = new RegExp(
   String.raw`([a-zA-Z0-9._%+-]+)` +
     String.raw`(?:\s*[\[\(\{]\s*[aA][tT]\s*[\]\)\}]\s*|\s+AT\s+|\s+@\s+)` +
     String.raw`([a-zA-Z0-9.-]+)` +
-    String.raw`(?:\s*[\[\(\{]\s*[dD][oO][tT]\s*[\]\)\}]\s*|\s+DOT\s+|\s+\.\s+)` +
+    String.raw`(?:\s*[\[\(\{]\s*[dD][oO][tT]\s*[\]\)\}]\s*|\s+DOT\s+|\s+\.\s+|\.)` +
     String.raw`([a-zA-Z]{2,})`,
   "g",
 );

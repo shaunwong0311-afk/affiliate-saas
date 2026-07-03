@@ -43,4 +43,20 @@ describe("LlmRelevanceScorer", () => {
     await s.score({ prospect: "p", merchant: "m" });
     expect(llm.calls()).toBe(1);
   });
+
+  it("does NOT cache a transport failure — the next call re-attempts (and can succeed)", async () => {
+    let calls = 0;
+    const llm: LlmClient = {
+      model: "flaky",
+      async complete() {
+        calls++;
+        if (calls === 1) throw new Error("upstream 503");
+        return "0.7";
+      },
+    };
+    const s = new LlmRelevanceScorer(llm);
+    expect(await s.score({ prospect: "p", merchant: "m" })).toBe(0); // outage → no credit, uncached
+    expect(await s.score({ prospect: "p", merchant: "m" })).toBeCloseTo(0.7); // retried → real score
+    expect(calls).toBe(2);
+  });
 });

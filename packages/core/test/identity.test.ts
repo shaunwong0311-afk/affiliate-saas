@@ -19,6 +19,26 @@ describe("classifyAccountUrl", () => {
     expect(classifyAccountUrl("not a url")).toBeNull();
   });
 
+  it("returns null for YouTube video/utility URLs that carry no channel identity", () => {
+    // These would otherwise collapse (query-stripped) into one shared handle-less merge key.
+    expect(classifyAccountUrl("https://youtube.com/watch?v=abc123")).toBeNull();
+    expect(classifyAccountUrl("https://www.youtube.com/watch?v=xyz")).toBeNull();
+    expect(classifyAccountUrl("https://youtube.com/shorts/abc")).toBeNull();
+    expect(classifyAccountUrl("https://youtube.com/playlist?list=PL1")).toBeNull();
+    expect(classifyAccountUrl("https://youtube.com/results?search_query=trail")).toBeNull();
+    expect(classifyAccountUrl("https://youtu.be/dQw4w9WgXcQ")).toBeNull(); // a video share, not a channel
+    // A real channel handle/id still resolves.
+    expect(classifyAccountUrl("https://youtube.com/@trailgeek")).toMatchObject({ platform: "youtube", handle: "@trailgeek" });
+  });
+
+  it("does not attribute a tweet or share widget as an owned Twitter account", () => {
+    expect(classifyAccountUrl("https://x.com/someone/status/123456")).toBeNull(); // an embedded/quoted tweet
+    expect(classifyAccountUrl("https://twitter.com/intent/tweet?text=hi")).toBeNull(); // share widget
+    expect(classifyAccountUrl("https://x.com/share")).toBeNull();
+    // A plain profile URL is still an account.
+    expect(classifyAccountUrl("https://x.com/trailgeek")).toMatchObject({ platform: "twitter", handle: "@trailgeek" });
+  });
+
   it("seedAccount falls back to a website account for a bare domain", () => {
     expect(seedAccount("https://trailrunner.com/about")).toMatchObject({ platform: "website", url: "https://trailrunner.com" });
     expect(seedAccount("https://youtube.com/@x")).toMatchObject({ platform: "youtube" });

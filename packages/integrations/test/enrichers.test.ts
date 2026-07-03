@@ -64,6 +64,17 @@ describe("ScrapeMetricsEnricher", () => {
     const m = await new ScrapeMetricsEnricher({ endpoint: "https://actor", apiKey: "k", http }).enrich({ platform: "tiktok", handle: "@c", url: "https://tiktok.com/@c" });
     expect(m).toMatchObject({ reach: 50000, engagementRate: 0.03, primaryGeo: "GB", source: "scrape" });
   });
+
+  it("normalizes country/language NAMES to ISO codes; nulls the unmappable (never a fake mismatch)", async () => {
+    const usEn = { async get() { return { status: 200, json: { data: { followers: 1000, country: "United States", language: "English" } } }; } };
+    const m = await new ScrapeMetricsEnricher({ endpoint: "https://actor", http: usEn }).enrich({ platform: "instagram", handle: "@c", url: "x" });
+    expect(m).toMatchObject({ primaryGeo: "US", language: "en" }); // ISO 3166-1 / 639-1
+
+    const unknown = { async get() { return { status: 200, json: { data: { followers: 1000, country: "Freedonia", language: "Klingon" } } }; } };
+    const m2 = await new ScrapeMetricsEnricher({ endpoint: "https://actor", http: unknown }).enrich({ platform: "instagram", handle: "@c", url: "x" });
+    expect(m2?.primaryGeo).toBeNull(); // unmappable → null, not a mismatched code
+    expect(m2?.language).toBeNull();
+  });
 });
 
 describe("OnPageSubscriberEnricher", () => {
@@ -81,6 +92,27 @@ describe("EnricherRegistry", () => {
     expect(reg.supports("tiktok")).toBe(false);
     expect((await reg.enrich({ platform: "youtube", handle: "@c", url: "x" }))?.reach).toBe(125000);
     expect(await reg.enrich({ platform: "tiktok", handle: "@c", url: "x" })).toBeNull();
+  });
+
+  it("keeps a contact-only result (emails/links) even when reach + engagement are null", async () => {
+    // The website-less-YouTube-creator contact path: description email but no audience metrics.
+    const contactOnly: AccountEnricher = {
+      kind: "yt-desc",
+      supports: (p) => p === "youtube",
+      async enrich() {
+        return { reach: null, engagementRate: null, primaryGeo: null, language: null, source: "api", emails: ["biz@creator.com"] };
+      },
+    };
+    const m = await new EnricherRegistry([contactOnly]).enrich({ platform: "youtube", handle: "@c", url: "x" });
+    expect(m?.emails).toContain("biz@creator.com"); // returned, not discarded
+  });
+
+  it("returns null on genuine no-data but RE-THROWS a transport error (so caching can tell them apart)", async () => {
+    const empty: AccountEnricher = { kind: "empty", supports: () => true, async enrich() { return null; } };
+    expect(await new EnricherRegistry([empty]).enrich({ platform: "youtube", handle: "@a", url: "x" })).toBeNull();
+
+    const boom: AccountEnricher = { kind: "boom", supports: () => true, async enrich() { throw new Error("api down"); } };
+    await expect(new EnricherRegistry([boom]).enrich({ platform: "youtube", handle: "@a", url: "x" })).rejects.toThrow();
   });
 });
 
@@ -110,5 +142,22 @@ describe("CachingEnricher", () => {
     await c.enrich({ platform: "tiktok", handle: "@a", url: "x" });
     await c.enrich({ platform: "tiktok", handle: "@a", url: "x" });
     expect(calls).toBe(1);
+  });
+
+  it("does NOT cache a transport error — the next call retries (no 24h dead miss)", async () => {
+    let calls = 0;
+    const inner: AccountEnricher = {
+      kind: "flaky",
+      supports: () => true,
+      async enrich() {
+        calls++;
+        if (calls === 1) throw new Error("rate limited");
+        return { reach: 9000, engagementRate: 0.04, primaryGeo: null, language: null, source: "api" };
+      },
+    };
+    const c = new CachingEnricher(inner);
+    expect(await c.enrich({ platform: "youtube", handle: "@a", url: "x" })).toBeNull(); // errored → uncached
+    expect((await c.enrich({ platform: "youtube", handle: "@a", url: "x" }))?.reach).toBe(9000); // retried → success
+    expect(calls).toBe(2);
   });
 });
