@@ -84,3 +84,18 @@ export function verifyHmacSignature(rawBody: string, signature: string | null | 
   if (!signature) return false;
   return constantTimeEqualHex(hmacHex(rawBody, secret), signature);
 }
+
+/**
+ * Signed unsubscribe token: without it, anyone could globally suppress ANY address by
+ * enumerating `?e=` values (a competitor could wipe a prospect list). Bound to the
+ * merchant + address; truncation keeps the footer link short (128 bits is plenty).
+ */
+export function signUnsubscribeToken(merchantId: string, email: string, secret: string): string {
+  return hmacHex(`unsub:${merchantId}:${email.trim().toLowerCase()}`, secret).slice(0, 32);
+}
+
+/** Constant-time-ish check of an unsubscribe token (HMAC output — no timing oracle on inputs). */
+export function verifyUnsubscribeToken(merchantId: string, email: string, token: string | null | undefined, secret: string): boolean {
+  if (!token) return false;
+  return constantTimeEqualHex(signUnsubscribeToken(merchantId, email, secret).padEnd(64, "0"), token.padEnd(64, "0"));
+}

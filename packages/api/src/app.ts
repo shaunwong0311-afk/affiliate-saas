@@ -31,7 +31,7 @@ export async function buildApp(ctxOverride?: Partial<AppContext>): Promise<Fasti
   const limiter = createRateLimiter({ windowMs: 60_000, max: 30 });
   app.addHook("onRequest", async (request, reply) => {
     const url = request.url.split("?")[0] ?? "";
-    if (url.startsWith("/auth/") || url.includes("/reply-webhook/") || url.includes("/track/postback/")) {
+    if (url.startsWith("/auth/") || url.includes("/reply-webhook/") || url.includes("/track/postback/") || url.includes("/track/unsubscribe") || url.startsWith("/join/") || url.includes("/webhooks/inbound")) {
       const ip = (request.headers["x-forwarded-for"] as string)?.split(",")[0]?.trim() || request.ip || "unknown";
       if (!limiter.allow(`${ip}:${url}`)) {
         return reply.status(429).send({ error: { message: "too many requests", code: "rate_limited" } });

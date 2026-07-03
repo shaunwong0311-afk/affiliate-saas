@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { newId, signPostback, type PostbackPayload } from "@affiliate/core";
+import { newId, signPostback, verifyUnsubscribeToken, type PostbackPayload } from "@affiliate/core";
 import type { Suppression } from "@affiliate/db";
 import type { RouteModule } from "./helpers.js";
 import { parseBody, ok } from "./helpers.js";
@@ -10,16 +10,26 @@ import { reverseOrder } from "../services/reversal.js";
 
 export const ingestionRoutes: RouteModule = (app, ctx) => {
   // ---- Public one-click unsubscribe (the link in every outreach email) ------
-  // Honored globally across all merchants, per CAN-SPAM / bulk-sender rules. Both the
-  // human GET (the footer link) and the RFC 8058 POST (the mailbox's one-click button,
-  // body `List-Unsubscribe=One-Click`) resolve here.
-  const doUnsubscribe = async (email: string): Promise<boolean> => {
+  // Honored globally across all merchants, per CAN-SPAM / bulk-sender rules. HARDENED:
+  //  - the link is HMAC-signed (m + e + t) — unsigned requests are rejected, so nobody can
+  //    suppress arbitrary addresses by enumerating `?e=` (a competitor could otherwise wipe
+  //    a merchant's whole prospect list);
+  //  - GET renders a CONFIRM page (mail-scanner link prefetchers must never unsubscribe
+  //    someone who didn't click); the actual suppression happens on POST — which is also
+  //    exactly what the RFC 8058 one-click button sends;
+  //  - the merchant id is recorded on the suppression row so unsubscribes attribute.
+  const unsubSecret = () => process.env.UNSUBSCRIBE_SECRET ?? process.env.JWT_SECRET ?? "dev-insecure-secret-change-me";
+  const unsubParams = (request: { query: unknown }) => {
+    const q = request.query as { e?: string; m?: string; t?: string };
+    return { email: (q.e ?? "").toLowerCase().trim(), merchantId: q.m ?? "", token: q.t ?? "" };
+  };
+  const doUnsubscribe = async (email: string, merchantId: string): Promise<boolean> => {
     if (!email || !email.includes("@")) return false;
     const existing = await ctx.db.suppressions.findOne((s) => s.scope === "global" && s.email?.toLowerCase() === email);
     if (!existing) {
       const supp: Suppression = {
         id: newId("supp"),
-        merchantId: null,
+        merchantId: merchantId || null, // attribution only — the suppression still applies globally
         email,
         domain: null,
         reason: "unsubscribe",
@@ -34,14 +44,25 @@ export const ingestionRoutes: RouteModule = (app, ctx) => {
   };
 
   app.get("/track/unsubscribe", async (request, reply) => {
-    const ok = await doUnsubscribe(((request.query as { e?: string }).e ?? "").toLowerCase());
-    return reply.type("text/html").send(ok ? `<p>You've been unsubscribed. You won't receive further emails.</p>` : "<p>Invalid unsubscribe link.</p>");
+    const { email, merchantId, token } = unsubParams(request);
+    if (!verifyUnsubscribeToken(merchantId, email, token, unsubSecret())) {
+      return reply.code(400).type("text/html").send("<p>Invalid unsubscribe link.</p>");
+    }
+    // Confirm page — a human clicks the button; a prefetcher fetching this URL changes nothing.
+    return reply.type("text/html").send(
+      `<!doctype html><meta name="robots" content="noindex"><div style="font-family:sans-serif;max-width:420px;margin:80px auto;text-align:center">` +
+        `<p>Unsubscribe <strong>${email.replace(/</g, "&lt;")}</strong> from these emails?</p>` +
+        `<form method="POST" action="/track/unsubscribe?m=${encodeURIComponent(merchantId)}&e=${encodeURIComponent(email)}&t=${encodeURIComponent(token)}">` +
+        `<button type="submit" style="padding:10px 22px;font-size:15px;cursor:pointer">Unsubscribe</button></form></div>`,
+    );
   });
 
-  // RFC 8058 one-click POST — the mailbox calls this directly; respond 200 with no body.
+  // RFC 8058 one-click POST (the mailbox's button) + the confirm form above land here.
   app.post("/track/unsubscribe", async (request, reply) => {
-    await doUnsubscribe(((request.query as { e?: string }).e ?? "").toLowerCase());
-    return reply.code(200).send();
+    const { email, merchantId, token } = unsubParams(request);
+    if (!verifyUnsubscribeToken(merchantId, email, token, unsubSecret())) return reply.code(400).send();
+    await doUnsubscribe(email, merchantId);
+    return reply.type("text/html").send("<p>You've been unsubscribed. You won't receive further emails.</p>");
   });
 
   // ---- Public signed S2S postback (Section 6) -------------------------------

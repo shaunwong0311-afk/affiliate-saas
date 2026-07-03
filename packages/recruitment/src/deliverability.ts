@@ -84,30 +84,54 @@ export async function pickSendableMailbox(deps: RecruitmentDeps, merchantId: str
 }
 
 export interface DeliverabilityHealth {
+  /** Sends in the rolling window (not all-time — the breaker must be able to RECOVER). */
   sent: number;
   bounced: number;
   bounceRate: number;
+  /** Real spam complaints (reason "complaint" — FBL/ESP events), NOT unsubscribes. */
+  complaints: number;
   complaintRate: number;
+  /** Unsubscribes in the window — a compliant, invited action; reported, never a breaker input. */
+  unsubscribes: number;
+  unsubscribeRate: number;
   /** True when bounce/complaint rates exceed the bulk-sender thresholds → pause. */
   circuitOpen: boolean;
 }
+
+/** Rolling window for the merchant-level circuit breaker (matches mailboxHealth). */
+const HEALTH_WINDOW_DAYS = 30;
 
 /**
  * Circuit breaker on bounce/complaint rate (Google/Yahoo/Microsoft 2025 bulk-sender
  * posture: complaints < 0.3%, bounces < 2%). When open, the autonomous cycle stops
  * sending for the merchant until it recovers.
+ *
+ * Two deliberate corrections (AUDIT-2026-07 #17): rates are computed over a ROLLING
+ * window, not all-time — an all-time breaker latches open forever because halting sends
+ * freezes the denominator. And unsubscribes are NOT complaints: a 1-2% unsubscribe rate
+ * is normal, invited behavior (the one-click header exists precisely so recipients unsub
+ * instead of hitting Report Spam) — counting it against the 0.3% FBL threshold would trip
+ * the breaker for essentially every merchant. Complaints count only `reason: "complaint"`
+ * suppressions (fed by FBL/ESP complaint events when that ingestion is wired).
  */
 export async function deliverabilityHealth(deps: RecruitmentDeps, merchantId: string): Promise<DeliverabilityHealth> {
+  const now = deps.clock.now();
+  const since = new Date(now.getTime() - HEALTH_WINDOW_DAYS * 86_400_000).toISOString();
   const campaigns = await deps.db.campaigns.find((c) => c.merchantId === merchantId);
   const ids = new Set(campaigns.map((c) => c.id));
-  const messages = await deps.db.outreachMessages.find((m) => ids.has(m.campaignId) && (m.status === "sent" || m.status === "bounced"));
+  const messages = await deps.db.outreachMessages.find(
+    (m) => ids.has(m.campaignId) && (m.status === "sent" || m.status === "bounced") && (m.sentAt ?? "") >= since,
+  );
   const sent = messages.length;
   const bounced = messages.filter((m) => m.status === "bounced").length;
-  const complaints = (await deps.db.suppressions.find((s) => s.merchantId === merchantId && s.reason === "unsubscribe")).length;
+  const inWindow = (ts: string) => ts >= since;
+  const complaints = (await deps.db.suppressions.find((s) => s.merchantId === merchantId && s.reason === "complaint" && inWindow(s.ts))).length;
+  const unsubscribes = (await deps.db.suppressions.find((s) => s.merchantId === merchantId && s.reason === "unsubscribe" && inWindow(s.ts))).length;
   const bounceRate = sent ? bounced / sent : 0;
   const complaintRate = sent ? complaints / sent : 0;
+  const unsubscribeRate = sent ? unsubscribes / sent : 0;
   const circuitOpen = sent >= 20 && (bounceRate > 0.02 || complaintRate > 0.003);
-  return { sent, bounced, bounceRate, complaintRate, circuitOpen };
+  return { sent, bounced, bounceRate, complaints, complaintRate, unsubscribes, unsubscribeRate, circuitOpen };
 }
 
 /** Minimum sends before a bounce rate is statistically meaningful enough to auto-pause. */

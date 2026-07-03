@@ -47,6 +47,39 @@ describe("mailboxHealth", () => {
   });
 });
 
+describe("deliverabilityHealth circuit breaker", () => {
+  it("normal unsubscribes never trip the breaker; real complaints do", async () => {
+    const { deliverabilityHealth } = await import("../src/index.js");
+    const mbx = await db.mailboxes.insert(mailbox());
+    await seedSends(mbx.id, 100, 0); // healthy volume, zero bounces
+    // A normal 2% unsubscribe rate (invited behavior — the one-click header exists for this).
+    for (let i = 0; i < 2; i++) {
+      await db.suppressions.insert({ id: newId("supp"), merchantId: "m1", email: `u${i}@x.com`, domain: null, reason: "unsubscribe", scope: "global", ts: NOW.toISOString() });
+    }
+    const healthy = await deliverabilityHealth(makeDeps(), "m1");
+    expect(healthy.unsubscribes).toBe(2);
+    expect(healthy.circuitOpen).toBe(false); // unsubs are a metric, not a breaker input
+
+    // One real FBL complaint over 100 sends = 1% >> 0.3% → breaker opens.
+    await db.suppressions.insert({ id: newId("supp"), merchantId: "m1", email: "angry@x.com", domain: null, reason: "complaint", scope: "global", ts: NOW.toISOString() });
+    const complained = await deliverabilityHealth(makeDeps(), "m1");
+    expect(complained.complaints).toBe(1);
+    expect(complained.circuitOpen).toBe(true);
+  });
+
+  it("uses a rolling window so the breaker can RECOVER (old events age out)", async () => {
+    const { deliverabilityHealth } = await import("../src/index.js");
+    const mbx = await db.mailboxes.insert(mailbox());
+    await seedSends(mbx.id, 30, 0);
+    // A complaint from 40 days ago is outside the 30-day window.
+    const old = new Date(NOW.getTime() - 40 * 86_400_000).toISOString();
+    await db.suppressions.insert({ id: newId("supp"), merchantId: "m1", email: "old@x.com", domain: null, reason: "complaint", scope: "global", ts: old });
+    const h = await deliverabilityHealth(makeDeps(), "m1");
+    expect(h.complaints).toBe(0);
+    expect(h.circuitOpen).toBe(false);
+  });
+});
+
 describe("monitorDeliverability", () => {
   it("auto-pauses a mailbox that breaches the bounce ceiling and drops it from rotation", async () => {
     const bad = await db.mailboxes.insert(mailbox({ email: "bad@lumen.com" }));

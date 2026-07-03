@@ -15,6 +15,7 @@ import {
   audienceOverlapScore,
   targetMarketForCurrency,
   scanContent,
+  signUnsubscribeToken,
   type ScoringSignals,
   type AffiliateSignal,
   type Tier,
@@ -809,7 +810,10 @@ const GEO_GATED: ReadonlySet<string> = new Set([
 ]);
 
 function unsubscribeLink(merchantId: string, email: string): string {
-  // Points at the API's real public unsubscribe endpoint (GET /track/unsubscribe).
+  // Points at the API's real public unsubscribe endpoint. SIGNED: the endpoint rejects
+  // unsigned requests, so nobody can suppress arbitrary addresses by enumerating `?e=`.
   const base = process.env.PUBLIC_API_URL ?? "http://localhost:8787";
-  return `${base}/track/unsubscribe?m=${encodeURIComponent(merchantId)}&e=${encodeURIComponent(email)}`;
+  const secret = process.env.UNSUBSCRIBE_SECRET ?? process.env.JWT_SECRET ?? "dev-insecure-secret-change-me";
+  const token = signUnsubscribeToken(merchantId, email, secret);
+  return `${base}/track/unsubscribe?m=${encodeURIComponent(merchantId)}&e=${encodeURIComponent(email)}&t=${token}`;
 }
