@@ -334,13 +334,22 @@ meters vs the 2% ceiling, warmup/cap, auto-pause + resume, run-monitor), `Activa
 click→sale funnel bars, fast-start, median-days-to-sale, A/B subject variants, recruits table); CSS/SVG
 charts, no chart lib; wired into `App.tsx` nav + routes; web tsc + vite build clean).
 
-**QUEUE COMPLETE.** All of #2/#4+#9/#11/#6/#7/#5/#8 shipped (377 tests, root + web green, vite builds).
+**QUEUE COMPLETE.** All of #2/#4+#9/#11/#6/#7/#5/#8 shipped. THEN a full adversarial audit was run
+and all 50 findings remediated (see `docs/AUDIT-2026-07.md` + `REMEDIATION.md` "Third review").
+Suite now **456 tests** green (root + web typecheck + vite build clean).
 
-**Deferred/lower (the remaining act-on-it stubs + polish):**
-- **Autopilot physical auto-SEND** of AI-SDR answers — needs the outbound-reply/threading transport
-  (today autopilot marks `autoSend:true`; HITL queues a suggested reply for one-click human send).
-- **Mailbox OAuth consent round-trip** live test (senders + connect flow built; needs real MS/Google apps).
-- **IMAP live validation** (`npm install imapflow mailparser` + real creds) — logic-tested only.
-- #3 live cadence validation (needs real provider keys); #10 first-party advocate capture (customer-base
-  merchants only); SES dedicated-domain rail; calendar booking + payout rails; branching/conditional
-  sequences (open/click branching); optional cheap-LLM pass on the content gate.
+**⚠️ Everything here is logic-tested OFFLINE against mocks/stubs — NO provider key has ever run.**
+The build is correct-by-construction, NOT go-live validated. Before real prospects: install the
+optional deps (`nodemailer imapflow mailparser` + playwright) and run the keyed validation pass in
+`CLAUDE.md` → **Tier 0** (real mailbox SMTP+IMAP round-trip, OAuth consent, ESP delivery, a keyed
+discovery run, mailbox warmup). "Remediated" ≠ "safe to point at real prospects."
+
+**Deferred/lower (the remaining act-on-it stubs + polish; NOT the go-live blocker):**
+- **Autopilot physical auto-SEND** of AI-SDR answers — the transport now EXISTS (`sendReplyToProspect`,
+  used by the Handoffs "Send reply" endpoint); wiring `autoSend:true` to fire it automatically (vs the
+  HITL handoff) is the small remaining step.
+- **Branching/conditional sequences** (open/click branching); **calendar adapter** (`bookingUrl` ships;
+  `CalcomBooking` per-prospect tracked booking is a skeleton); **payout rails**; **SES rail**; #10
+  first-party advocate capture (customer-base merchants only); optional cheap-LLM pass on the content
+  gate; podcast RSS `pubDate` freshness (YouTube date captured, podcast isn't); campaign PATCH schema
+  widening (send-window/mailbox edit-on-create only).

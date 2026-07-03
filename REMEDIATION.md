@@ -1,8 +1,14 @@
 # Security & correctness remediation
 
-In response to a security/correctness review. Each item links to the fix and, where
-applicable, a regression test. 121 tests pass; full monorepo typechecks; the
-reviewer's own double-pay probe now reports the correct total.
+In response to a series of adversarial reviews (three so far — see the sections below; the
+2026-07 outreach/discovery audit is the newest and is detailed in `docs/AUDIT-2026-07.md`).
+Each item links to the fix and, where applicable, a regression test. The suite now stands at
+**456 tests** green; full monorepo typechecks; web typecheck + vite build clean.
+
+> **All three reviews are fixed IN CODE and tested OFFLINE (mocks/stubs). No provider key has
+> ever run** — real SMTP/IMAP/OAuth/ESP/SERP/DataForSEO/Hunter/scrape/proxy + Postgres are
+> unvalidated until a keyed go-live pass (see `CLAUDE.md` → Tier 0). "Remediated" ≠ "production-
+> validated"; don't overclaim.
 
 ## Critical — fixed
 
@@ -58,6 +64,43 @@ corresponding API keys/proxies. The code paths, adapters, and gating are in plac
 unit-tested with mocks/deterministic providers; with keys set they run end-to-end with
 no pipeline change. Backlink/competitor-backlink mining remains an honest empty result
 until a backlink API (`BACKLINK_API_KEY`) is wired.
+
+## Third review — outreach + discovery/enrichment audit (2026-07)
+
+A multi-agent adversarial audit (7 subsystem auditors, every finding independently verified
+against the code; 0 refuted) surfaced **50 confirmed findings** after the §16 outreach build.
+**All 50 are remediated** across 12 commits (`6b5febf`→`b29d8f6`); the suite went 377 → **456**
+green (root + web typecheck + vite build clean). Full per-finding detail + file/line evidence is
+in [`docs/AUDIT-2026-07.md`](docs/AUDIT-2026-07.md); highlights by tier:
+
+- **T0 "fabricated success" (the worst class):** a mailer `failed` result is no longer recorded
+  as `sent` (no phantom sends, no billing, retryable); mailbox creds persist AES-256-GCM in the DB
+  (`DbSecretStore`) so a restart can't silently fall back to the mock sender; the standalone worker
+  builds the same full `AppContext` as the API (`packages/api/src/worker.ts`); the transactional
+  ESP is env-wired (Resend/Postmark).
+- **T1 reply-loop safety:** quoted-reply extraction never falls back to the raw email (killed the
+  bottom-posted-"I'm interested"→global-suppression bug); tenant-scoped matching; Message-Id dedup
+  on every inbound path; bare `STOP` honored; OOO snooze; a real public `/#/join/:merchantId` page.
+- **T2 enforcement:** daily-cap/warmup/auto-pause enforced on the CAMPAIGN's mailbox (not a
+  sibling); `launchCampaign` obeys the same guards; SMTP bounce regex no longer matches port 587;
+  unsubscribe link HMAC-signed + confirm-on-GET; circuit breaker uses a rolling window and counts
+  complaints ≠ unsubscribes; the GDPR/geo gate is armed (enrich persists ISO geo).
+- **T4/T5 discovery + enrichment correctness:** no synthetic SERP in prod; bare `amzn.to` detected;
+  exact-merchant-id backlink filter (was a substring LIKE); youtube `/watch` no longer collapses;
+  no identity over-merge (video/share URLs aren't owned handles); Hunter verify outranks domain MX.
+- **#22 mail-rail parity:** Graph sends raw-MIME (List-Unsubscribe + threading survive) + maps
+  recipient errors to bounced.
+- **New capabilities (verified worth building):** bulk import (prospects + affiliate roster — also
+  guards a merchant's own affiliates from cold email); IG/TikTok discovery; content-freshness;
+  merchant `bookingUrl` (removed the fabricated `cal.vantage.dev` stub URL); audience-quality flag.
+
+**⚠️ Remediated ≠ go-live validated.** As with the first two reviews, everything above is fixed IN
+CODE and tested **offline against mocks/stubs** — **no provider key has ever run.** Real SMTP/IMAP/
+OAuth/ESP/DataForSEO/SERP/Hunter/scrape/proxy behavior and the Postgres path are UNVALIDATED, and
+the optional deps (`nodemailer imapflow mailparser`, playwright) aren't installed. The
+"unsafe-by-construction" bugs are gone; production validation is a keyed on-the-box pass — see
+**Tier 0 — go-live validation** in `CLAUDE.md`. Do not describe the system as "safe to point at
+real prospects" until that pass is done.
 
 ## Knowingly still open (not yet addressed)
 

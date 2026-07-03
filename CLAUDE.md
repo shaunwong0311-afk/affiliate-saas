@@ -112,8 +112,9 @@ The full **discovery + enrich + score + recursive-frontier** AND the **outreach/
 half now exist end-to-end behind ports; runs on labeled demo data until keys are set.
 
 A **multi-agent adversarial audit was run and fully remediated** — see `docs/AUDIT-2026-07.md`
-(all 50 verified findings fixed across 12 commits). Load-bearing outcomes now hold in a real
-keyed deploy: a mailer `failed` result is never recorded as sent (no phantom sends / billing);
+(all 50 verified findings fixed across 12 commits). IN CODE, these load-bearing outcomes are now
+correct — **verified OFFLINE against mocks/stubs, not against any live system** (see the honest
+caveat below): a mailer `failed` result is never recorded as sent (no phantom sends / billing);
 mailbox credentials persist AES-256-GCM-encrypted in the DB (survive restart, no silent mock
 fallback); the standalone worker builds the SAME full `AppContext` as the API (env-gated real
 sources/senders/poller — `packages/api/src/worker.ts`); the transactional ESP is env-wired
@@ -127,6 +128,19 @@ capabilities: **bulk import** (prospects + affiliate roster — also guards a me
 affiliates from cold email), **IG/TikTok discovery** (`SocialCreatorDiscoverySource` + social SERP
 fallback), **content-freshness** (`activityRecency`), **merchant `bookingUrl`** (honest A-tier
 calendar, no fabricated stub URL), and an **audience-quality flag** (bought-audience reach discount).
+
+> ### ⚠️ HONEST CAVEAT — remediated ≠ go-live validated (do not overclaim)
+> The audit fixed **logic and failure modes**, all tested **offline against mocks/stubs**. **NO
+> provider key has ever run.** It is NOT yet validated to work against real systems, and must not
+> be described as "safe to point at real prospects" until a keyed validation pass is done. Still
+> untested end-to-end: real DataForSEO/SERP/YouTube/Hunter/scrape/proxy behavior (mocks return
+> clean shapes; live APIs return rate limits, bans, odd/empty payloads); real SMTP send + IMAP
+> reply poll + Microsoft/Google OAuth consent + token refresh (never touched a real account); ESP
+> delivery (no welcome/magic-link email actually delivered); deliverability/warmup/bounce against a
+> real inbox provider; the Postgres path (DDL exists, unrun). The optional deps aren't even
+> installed — **`npm install nodemailer imapflow mailparser` (+ playwright)** — so real SMTP/IMAP/
+> headless-fetch are inert until then. What IS true: the "unsafe-by-construction" bugs are gone.
+> What is NOT: production validation. See **Tier 0 — go-live validation** in Next steps.
 
 The **`docs/OUTREACH-SPEC.md` §16 queue is COMPLETE** — all seven items shipped: IMAP reply
 poller (SMTP-rail inbound, PEEK-only, wired into the scheduler), activation welcome email
@@ -206,33 +220,46 @@ fetching (`PlaywrightFetcher`/`EscalatingFetcher`/`looksBlocked`, env `BROWSER_F
 
 ## Next steps (priority tiers — what to work on)
 
-The discovery/enrichment HALF is deep and done; the **act-on-it half** (send → close →
-pay) still has stub adapters. Recommended order:
+Discovery→enrich→score AND the outreach recruit→close half now exist end-to-end in code
+(and the §16 queue + the 2026-07 audit are done). The dominant remaining blocker is **not
+more building — it is validating the built system against real keys/services.** Order:
 
-**Tier 1 — go live (setup, not building):** set provider keys on the box
-(`DATAFORSEO_LOGIN/PASSWORD` + `SERPAPI_KEY` + `PROXY_URL`, `BROWSER_FETCH=true` after
-`npm install playwright`); `USE_POSTGRES`/`DATABASE_URL`; prod hardening
-(`JWT_SECRET`, `NODE_ENV=production`, `ALLOW_SYNTHETIC_DISCOVERY=false`); deploy per
-`DEPLOYMENT.md` (one small VPS/Hetzner origin + Cloudflare edge/static; the 3 Hetzner
-rules: never email from box IP, scrape via proxies, back ledger off-box).
+**Tier 0 — GO-LIVE VALIDATION (the real blocker; needs keys + a box, not more code).**
+Nothing below the code layer has been exercised against a live system. Do this before pointing
+the engine at any real prospect list:
+1. `npm install nodemailer imapflow mailparser` (+ `playwright && npx playwright install chromium`
+   if scraping JS-rendered pages) — these OPTIONAL deps are what make real SMTP send / IMAP reply
+   poll / headless fetch actually run. Until installed they're inert.
+2. Prod hardening on the box: `JWT_SECRET`, `SECRETS_ENC_KEY`, `NODE_ENV=production`,
+   `ALLOW_SYNTHETIC_DISCOVERY=false`, `USE_POSTGRES`/`DATABASE_URL`, `PUBLIC_API_URL`,
+   `CORS_ORIGINS`. Deploy per `DEPLOYMENT.md` (VPS/Hetzner origin + Cloudflare edge; the 3
+   Hetzner rules: never email from box IP, scrape via proxies, back ledger off-box).
+3. Connect ONE real mailbox; run the SMTP send + IMAP reply round-trip end-to-end (email a test
+   address, reply, watch `ingestReplies`/`processInboundReply` route + stop the sequence).
+4. Run the Microsoft/Google OAuth consent round-trip once; confirm token refresh + a real send.
+5. Wire an ESP key (Resend/Postmark); confirm a welcome/magic-link email actually delivers.
+6. Small keyed discovery run (`DATAFORSEO_LOGIN/PASSWORD`, `SERPAPI_KEY`/`YOUTUBE_API_KEY`,
+   `HUNTER_API_KEY`, `SCRAPE_API_URL`, `PROXY_URL`) — eyeball that outputs are real + honestly
+   labeled, and that live payloads (rate limits, bans, empties) are handled.
+7. Warm a mailbox properly before ANY volume; watch bounce/complaint on the Deliverability
+   dashboard. Run the seed/placement test.
+(Everything above is logic-tested with mocks only — the mock returns clean shapes; the real world
+does not. This is the honesty gap, not a nice-to-have.)
 
-**Tier 2 — finish the recruit→close→pay half (outreach SENDING is now built — see above):**
-- **Mailbox OAuth consent flow** (Gmail/MS Graph): the *senders* are real and the SMTP rail
-  ships today; the remaining rung is the OAuth consent round-trip + token refresh + storing
-  creds (MailboxCredentials kind microsoft/gmail_oauth). MS Graph first (no CASA).
-- **IMAP reply poller** transport (the `ImapReplyIngestion` skeleton) — the webhook reply path
-  + `processInboundReply` logic are done; the SMTP-rail IMAP poll is the missing transport.
-- **Branching/conditional sequences + full channel orchestration**: the model (step `channel`,
-  `variants`) is in; the scheduler auto-advancing email→DM steps + open/click branching is next.
-- **Calendar booking** (Cal.com / Google) for the A-tier meeting handoff — stub.
+**Tier 1 — remaining act-on-it stubs (real building):**
+- **Branching/conditional sequences**: the model (step `channel`, `variants`) is in and email→DM
+  steps auto-advance; open/click-triggered branching is the next rung.
+- **Calendar booking adapter** (Cal.com / Google) — `bookingUrl` (merchant-pasted link) ships;
+  a per-prospect tracked adapter (`CalcomBooking`) is still a skeleton.
 - **Payout rails** (Stripe Connect / PayPal / Wise) — stubs.
 - **SES dedicated-domain rail** + DNS automation (scale/deliverability) — OUTREACH-SPEC Phase 2.
-- **Web pages**: a public apply-to-join page + DM-queue/activation dashboards (routes exist).
+- **Autopilot physical auto-send** of AI-SDR answers now has its transport (`sendReplyToProspect`);
+  wiring `autoSend:true` to actually fire it (vs the HITL handoff) is a small follow-up.
+- **Campaign PATCH** currently accepts only `sequence/status/dailyCap` (send-window/mailbox are
+  edit-on-create); widen the schema if the editor needs them. Podcast RSS `pubDate` freshness
+  (YouTube date is captured; podcast isn't yet).
 
-**Tier 3 — discovery polish / levers (we may keep iterating here):**
-- **Go-live VALIDATION**: no provider keys are wired here, so the real-data path is
-  logic-tested only (244→261 tests, all mocked). The actual DataForSEO/SERP/YouTube/proxy/
-  Playwright behavior against the live web is untested — that's a key-on-the-box task.
+**Tier 2 — discovery polish / levers (optional iteration):**
 - **Per-merchant ICP override UI** for competitor program IDs + an explicit target-market
   field (audienceOverlap currently derives it from billing currency).
 - **DataForSEO Labs niche graph** (`competitors_domain`/`serp_competitors`) to feed the
