@@ -23,6 +23,7 @@ const merchantPatchSchema = z.object({
   competitors: z.array(z.string()).optional(),
   physicalAddress: z.string().nullish(),
   defaultCurrency: z.string().length(3).optional(),
+  bookingUrl: z.string().url().nullish(),
 });
 
 const addUserSchema = z.object({
@@ -79,6 +80,7 @@ export const merchantRoutes: RouteModule = (app, ctx) => {
     if (body.competitors !== undefined) patch.competitors = body.competitors;
     if (body.physicalAddress !== undefined) patch.physicalAddress = body.physicalAddress ?? null;
     if (body.defaultCurrency !== undefined) patch.defaultCurrency = body.defaultCurrency.toUpperCase();
+    if (body.bookingUrl !== undefined) patch.bookingUrl = body.bookingUrl ?? null;
     const updated = await ctx.db.merchants.update(merchantId, patch);
     await writeAudit(ctx, {
       merchantId,

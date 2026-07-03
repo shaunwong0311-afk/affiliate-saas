@@ -7,6 +7,8 @@
  * point of the score is attributable to a named factor for the explainability UX.
  */
 
+import { audienceQualityFlag } from "./audience-quality.js";
+
 export type Tier = "A" | "B" | "C";
 
 export interface ScoringSignals {
@@ -76,6 +78,8 @@ export interface ScoreResult {
   confidence: number;
   /** Factors that could not be scored because their data provider isn't wired. */
   unknownFactors: string[];
+  /** "suspicious" when reach+engagement show a bought/inactive-audience shape; null when unknown. */
+  audienceQuality: "suspicious" | "ok" | null;
 }
 
 export interface TierThresholds {
@@ -118,10 +122,16 @@ export function scoreProspect(
       ? null
       : clamp01(((da != null ? clamp01(da / 100) : 0) + (eng != null ? clamp01(eng) : 0)) / ((da != null ? 1 : 0) + (eng != null ? 1 : 0)));
 
+  // Audience-quality discount: a bought/inactive audience shouldn't earn full reach credit.
+  // Derived from the reach + engagement we already measure; null (no adjustment) when unknown.
+  const qualityFlag = audienceQualityFlag(signals.reach, signals.engagementRate);
+  const reachDiscount = qualityFlag?.suspicious ? 1 - 0.6 * qualityFlag.severity : 1; // up to −60%
+  const reachNormalized = signals.reach == null ? null : normalizeReach(signals.reach) * reachDiscount;
+
   const factors: Array<{ factor: string; weight: number; normalized: number | null; note: string }> = [
     { factor: "relevance", weight: weights.relevance, normalized: clamp01(signals.relevance), note: "topical match (embedding similarity)" },
     { factor: "affiliatePropensity", weight: weights.affiliatePropensity, normalized: propensity.value, note: propensity.note },
-    { factor: "reach", weight: weights.reach, normalized: signals.reach == null ? null : normalizeReach(signals.reach), note: signals.reach == null ? "reach unknown (no provider)" : `audience ≈ ${signals.reach.toLocaleString()}` },
+    { factor: "reach", weight: weights.reach, normalized: reachNormalized, note: signals.reach == null ? "reach unknown (no provider)" : qualityFlag?.suspicious ? `audience ≈ ${signals.reach.toLocaleString()} — DISCOUNTED (${qualityFlag.reason})` : `audience ≈ ${signals.reach.toLocaleString()}` },
     { factor: "quality", weight: weights.quality, normalized: quality, note: quality == null ? "DA/engagement unknown (no provider)" : `DA ${da ?? "?"}, engagement ${eng != null ? (eng * 100).toFixed(0) + "%" : "?"}` },
     { factor: "commercialIntent", weight: weights.commercialIntent, normalized: clamp01(signals.commercialIntent), note: "produces reviews/comparisons/best-of" },
     { factor: "contactability", weight: weights.contactability, normalized: signals.contactable ? 1 : 0, note: signals.contactable ? "verified contact path" : "no verified contact" },
@@ -151,8 +161,10 @@ export function scoreProspect(
     .sort((a, b) => b.contribution - a.contribution)
     .map((b) => `${b.factor}: ${b.note} (+${b.contribution.toFixed(1)})`);
   if (unknownFactors.length) explanation.push(`unknown (no data provider): ${unknownFactors.join(", ")}`);
+  if (qualityFlag?.suspicious) explanation.push(`⚠ audience credibility: ${qualityFlag.reason}`);
 
-  return { score, tier, breakdown, explanation, confidence, unknownFactors };
+  const audienceQuality = qualityFlag == null ? null : qualityFlag.suspicious ? "suspicious" : "ok";
+  return { score, tier, breakdown, explanation, confidence, unknownFactors, audienceQuality };
 }
 
 /**

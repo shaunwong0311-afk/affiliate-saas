@@ -55,6 +55,21 @@ describe("scoring", () => {
     const half = blendWeights(defaultWeights, { affiliatePropensity: 0.5 }, 0.5);
     expect(half.affiliatePropensity).toBeCloseTo((0.3 + 0.5) / 2);
   });
+
+  it("flags a bought-audience shape (big reach, tiny engagement) and discounts its reach credit", () => {
+    // Same signals, only engagement differs: healthy vs inorganic on a large audience.
+    const healthy = scoreProspect({ ...strongProspect, reach: 300_000, engagementRate: 0.05 });
+    const bought = scoreProspect({ ...strongProspect, reach: 300_000, engagementRate: 0.001 });
+    expect(healthy.audienceQuality).toBe("ok");
+    expect(bought.audienceQuality).toBe("suspicious");
+    expect(bought.score).toBeLessThan(healthy.score); // the discount actually lowers the score
+    expect(bought.explanation.join(" ")).toContain("audience credibility");
+  });
+
+  it("leaves audienceQuality null when reach or engagement is unknown (never fabricated)", () => {
+    expect(scoreProspect({ ...strongProspect, reach: null }).audienceQuality).toBeNull();
+    expect(scoreProspect({ ...strongProspect, engagementRate: null }).audienceQuality).toBeNull();
+  });
 });
 
 describe("scoring with unknown (un-provided) signals", () => {

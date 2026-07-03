@@ -46,6 +46,9 @@ export interface Merchant {
   /** Outreach personalization plan (billed differently). Default "hybrid" when unset:
    *  template = tokens only · hybrid = LLM for A-tier, tokens otherwise · llm = LLM for all. */
   personalizationPlan?: "template" | "hybrid" | "llm";
+  /** The merchant's own scheduling link (Calendly/Cal.com/SavvyCal) pasted at onboarding.
+   *  Used verbatim for the A-tier meeting handoff — honest, zero external services. */
+  bookingUrl?: string | null;
   createdAt: Timestamp;
 }
 

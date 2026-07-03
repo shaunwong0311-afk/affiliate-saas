@@ -128,7 +128,13 @@ export async function routeReply(deps: RecruitmentDeps, prospectId: string, raw:
     const owner = await deps.db.merchantUsers.findOne((u) => u.merchantId === prospect.merchantId && u.role === "owner");
     let bookingRef: string | null = null;
     let bookingUrl: string | null = null;
-    if (deps.calendar) {
+    // Prefer the merchant's OWN scheduling link (real, pasted at onboarding). Only fall back
+    // to a calendar adapter when one is genuinely wired — never fabricate a booking URL.
+    const merchant = await deps.db.merchants.get(prospect.merchantId);
+    if (merchant?.bookingUrl) {
+      bookingUrl = merchant.bookingUrl;
+      bookingRef = "merchant_link";
+    } else if (deps.calendar && deps.calendar.provider !== "stub") {
       const booking = await deps.calendar.createBookingLink({
         merchantId: prospect.merchantId,
         prospectId,

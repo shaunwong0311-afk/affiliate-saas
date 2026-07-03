@@ -74,6 +74,23 @@ describe("routeReply safety", () => {
   });
 });
 
+describe("A-tier meeting booking link", () => {
+  it("uses the merchant's OWN scheduling link verbatim — never a fabricated stub URL", async () => {
+    await db.merchants.update("m1", { bookingUrl: "https://cal.com/lumen/intro" });
+    const p = await db.prospects.insert(prospect({ tier: "A" }));
+    const out = await handleReply(makeDeps(), p.id, "This sounds great, let's talk!", { meetingTier: "A" });
+    expect(out.action).toBe("meeting_booked");
+    expect(out.meeting?.bookingUrl).toBe("https://cal.com/lumen/intro");
+  });
+
+  it("leaves the booking link null (honest) when no real calendar is wired — no cal.vantage.dev", async () => {
+    const p = await db.prospects.insert(prospect({ tier: "A" }));
+    const out = await handleReply(makeDeps(), p.id, "Very interested — let's chat!", { meetingTier: "A" });
+    expect(out.action).toBe("meeting_booked");
+    expect(out.meeting?.bookingUrl ?? null).toBeNull(); // never a fabricated URL
+  });
+});
+
 describe("processInboundReply guards", () => {
   it("scopes prospect matching to the mailbox's merchant (no cross-tenant routing)", async () => {
     await db.merchants.insert(merchant("m2", "Rival"));

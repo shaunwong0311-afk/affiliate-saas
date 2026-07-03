@@ -33,6 +33,7 @@ export * from "./recruitment/scoring.js";
 export * from "./recruitment/state-machine.js";
 export * from "./recruitment/affiliate-detection.js";
 export * from "./recruitment/audience-overlap.js";
+export * from "./recruitment/audience-quality.js";
 export * from "./recruitment/triage.js";
 export * from "./recruitment/activation-email.js";
 export * from "./recruitment/ai-sdr.js";

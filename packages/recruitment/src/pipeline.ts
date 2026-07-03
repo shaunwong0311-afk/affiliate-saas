@@ -497,7 +497,7 @@ export async function score(deps: RecruitmentDeps, prospectId: string): Promise<
     score: result.score,
     tier: result.tier,
     confidence: result.confidence,
-    scoreBreakdown: { breakdown: result.breakdown, explanation: result.explanation, confidence: result.confidence, unknownFactors: result.unknownFactors },
+    scoreBreakdown: { breakdown: result.breakdown, explanation: result.explanation, confidence: result.confidence, unknownFactors: result.unknownFactors, audienceQuality: result.audienceQuality },
     state: "scored",
     updatedAt: deps.clock.now().toISOString(),
   });

@@ -8,6 +8,7 @@ interface Merchant {
   niche: string | null;
   competitors: string[];
   physicalAddress: string | null;
+  bookingUrl?: string | null;
   defaultCurrency: string;
   postbackSecret: string;
 }
@@ -69,7 +70,7 @@ export function Settings() {
 
 function GeneralTab({ mid }: { mid: string }) {
   const { data, loading, error, reload } = useApi<Merchant>(() => api.get(`/merchants/${mid}`), [mid]);
-  const [form, setForm] = useState<{ name: string; niche: string; competitors: string; physicalAddress: string } | null>(null);
+  const [form, setForm] = useState<{ name: string; niche: string; competitors: string; physicalAddress: string; bookingUrl: string } | null>(null);
   const [saving, setSaving] = useState(false);
   const [rotating, setRotating] = useState(false);
   const [revealed, setRevealed] = useState(false);
@@ -86,6 +87,7 @@ function GeneralTab({ mid }: { mid: string }) {
       niche: data.niche ?? "",
       competitors: data.competitors.join(", "),
       physicalAddress: data.physicalAddress ?? "",
+      bookingUrl: data.bookingUrl ?? "",
     };
 
   async function save() {
@@ -98,6 +100,7 @@ function GeneralTab({ mid }: { mid: string }) {
         niche: f.niche.trim() || null,
         competitors: f.competitors.split(",").map((c) => c.trim()).filter(Boolean),
         physicalAddress: f.physicalAddress.trim() || null,
+        bookingUrl: f.bookingUrl.trim() || null,
       });
       setMsg("Workspace updated.");
       setForm(null);
@@ -164,6 +167,18 @@ function GeneralTab({ mid }: { mid: string }) {
           </Field>
           <div className="faint" style={{ fontSize: 11, marginTop: -6, marginBottom: 12 }}>
             Required in the footer of every outreach email to stay compliant.
+          </div>
+
+          <Field label="Booking link (for A-tier meetings)">
+            <input
+              className="input"
+              value={f.bookingUrl}
+              onChange={(e) => setForm({ ...f, bookingUrl: e.target.value })}
+              placeholder="https://cal.com/you/intro"
+            />
+          </Field>
+          <div className="faint" style={{ fontSize: 11, marginTop: -6, marginBottom: 12 }}>
+            Your Calendly/Cal.com/SavvyCal link — the AI-SDR hands this to warm A-tier replies to book a call.
           </div>
 
           <div className="row gap-8">
