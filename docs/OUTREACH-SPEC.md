@@ -1,6 +1,17 @@
 # Email Outreach — Design Spec
 
-Status: **FINALIZED v1 — approved direction; ready to build Phase 1.** Scope: make the
+Status: **BUILT** — Phase 1 and parts of Phases 2–3 are implemented (§16), audited twice
+(July and October 2026) and corrected (§17). **Sections 1–15 are the original design, kept as
+the record of intent; where they differ from the code, §16–§17 and the code are right.** Known
+differences: the sender resolver is `buildMailboxSender` + a per-send `mailboxResolver` (not
+`resolveMailboxSender`); there is no mailbox rotation (the campaign's own mailbox is gated);
+Microsoft replies are **polled** through Graph, not pushed by a webhook; `POST /webhooks/graph`,
+`POST /webhooks/ses`, the SES rail, `threadId`, `MailboxOAuthState` and per-message LLM token
+counts were not built; preview is `POST /recruitment/prospects/:id/preview` and the plan is set
+with `PUT /recruitment/personalization`; A/B variants and the Gmail OAuth flow were built
+earlier than planned.
+
+Original scope: make the
 recruitment engine actually **send, personalize, and process replies** as the merchant,
 with **dead-simple mailbox onboarding**. The outreach *engine* — sequencing, send-windows,
 warmup, mailbox rotation, bounce/complaint circuit breaker, two-track reply router,
@@ -353,3 +364,46 @@ discovery run, mailbox warmup). "Remediated" ≠ "safe to point at real prospect
   first-party advocate capture (customer-base merchants only); optional cheap-LLM pass on the content
   gate; podcast RSS `pubDate` freshness (YouTube date captured, podcast isn't); campaign PATCH schema
   widening (send-window/mailbox edit-on-create only).
+
+---
+
+## 17. October 2026 corrections (see `docs/AUDIT-2026-10.md`, section O)
+
+The second audit ran the code. What changed in the outreach half:
+
+- **Locking.** Every path that queues or sends (cycle, manual cycle, launch, send-reply) runs
+  inside `withMerchantLock` (database lock across processes); state checks stop a prospect
+  being queued twice or a message sent twice.
+- **Failure classification.** Only recipient-level permanent failures are bounces. Sender-side,
+  policy, quota and auth rejections are `failed`: no suppression, and consecutive failures
+  back the mailbox off (`sendFailures`, `sendBackoffUntil`). A bounce consumes the cap.
+- **No mock in production.** A resolver error yields a failing sender; the console
+  transactional mailer does not report "sent" in production.
+- **Inbound per rail.** SMTP → IMAP poll. Microsoft → `GraphReplyIngestion` (delegated
+  `Mail.Read`, polled from a stored cursor). Gmail-via-Google → none yet. `GET /mailboxes`
+  reports `inbound {working, reason}`; a mailbox whose replies cannot be read sends first
+  touches only (**follow-ups hold**). An SMTP mailbox fed only by the inbound-parse webhook
+  is still treated as unable to hear replies.
+- **Correlation.** Replies are matched by `In-Reply-To` / `References` before the From
+  address. Suppression follows only an unsubscribe request in the new text of a correlated
+  reply. Delivery-status notifications are parsed: a permanent failure marks the prospect
+  bounced and counts in mailbox health.
+- **MIME and threading.** The raw-MIME builder is fixed (header/body separator, CRLF, encoded
+  non-ASCII headers). Every rail sends our own `Message-Id`, and that is what is stored.
+- **Autopilot.** Deterministic knowledge-base answers are sent through the reply transport;
+  everything else becomes a handoff. Generative answers never auto-send.
+- **Cadence.** Sourcing runs on `sourcingIntervalHours` (default 24); sends, follow-ups and
+  reply ingestion run every tick. LLM personalization is metered on a successful send.
+- **Gates.** No sending without a merchant postal address. The campaign time zone (IANA) and,
+  where known, the recipient's local time are honoured in the autonomous path. A content-gate
+  block lifts when the step copy changes.
+- **OAuth.** The callback checks the consented account against `mailbox.email`, `state` is
+  one-time, and token refresh is serialized per mailbox with failures surfaced.
+- **Transactional mail.** From comes from `TRANSACTIONAL_FROM`; the activation email skips
+  suppressed addresses; its sign-in link is single-use.
+- **Complaints.** There is no feed; figures read "not available".
+
+Unvalidated against a live service: Graph inbox polling, Graph/Gmail raw-MIME sends (including
+whether they keep our `Message-Id`), IMAP resume by UID, the bounce-wording tables, Microsoft
+`id_token` claims, Resend/Postmark, token refresh. SMTP sending has been exercised against a
+local mail catcher only.

@@ -26,25 +26,33 @@ The operator's job becomes **approve-and-monitor**, not find-and-write.
 
 | Stage | What it does | Where |
 |---|---|---|
-| **1. Source** | SERP mining (buyer-intent queries → result pages → affiliate-link detection), competitor-affiliate mining, creator discovery, first-party customer mining (reads real orders) | `integrations/discovery-real.ts`, `discovery.ts`, `core/recruitment/affiliate-detection.ts` |
-| **2. Enrich** | email-finder + verify, DA/engagement signals; records a usage event | `recruitment/pipeline.ts` `enrich()`, `integrations/enrichment.ts` |
+| **1. Source** | SERP mining (buyer-intent queries → result pages → affiliate-link detection), competitor-affiliate (backlink) mining, YouTube / podcast / social creator discovery. First-party customer mining exists but the planner always skips it: customers carry hashed emails only, so there is no contact path. | `integrations/discovery-real.ts`, `discovery.ts`, `core/recruitment/affiliate-detection.ts` |
+| **2. Enrich** | contact resolution over pages the creator owns, verification, reach/engagement/DA signals; records a usage event. No published address and no Hunter key = no contact (never a guess). | `recruitment/pipeline.ts` `enrich()`, `integrations/enrichment.ts` |
 | **3. Score** | fit + propensity, weights **blended toward this merchant's producer outcomes** | `pipeline.ts` `score()` + `learning.ts` `weightsForMerchant()` |
 | **4. Outreach** | send-as-merchant, tiered personalization, multi-step cadence (initial → follow-up → breakup) with send windows, per-mailbox caps, hard stops | `pipeline.ts`, `automation.ts` `advanceSequences()`, `sequencing.ts` |
-| **5. Reply** | classify (LLM when configured, else keyword) → two-track router | `reply-router.ts` |
+| **5. Reply** | ingest (IMAP / Graph poll, or the inbound webhook) → correlate by thread → classify (LLM when configured, else keyword) → two-track router; delivery-status mail marks bounces | `reply-router.ts`, `integrations/reply-ingestion.ts` |
 | **6. Closed loop** | append-only `ProspectOutcome` → source-yield pruning + learned scoring | `learning.ts`, `service.ts` `recordOutcome()` |
 
 The scheduler (`worker.ts` `runScheduler`/`tickScheduler`) runs `autonomousCycle`
-per merchant whose automation is `running`. Run it in-process with
-`SCHEDULER=true npm run api`, or as a separate worker against Postgres/Redis.
+per merchant whose automation is `running`; one merchant's failure is logged and does not
+stop the others, and replies are ingested every tick regardless. Run it in-process with
+`SCHEDULER=true npm run api` (dev), or as the standalone worker (`npm run worker`) against
+the same Postgres database as the API — one or the other, never both.
+
+**Cadence.** Sends, follow-ups and reply ingestion run every tick (default 60 s). **Sourcing
+runs on its own interval** — `AutomationState.sourcingIntervalHours`, default 24 — so
+discovery queries are not re-issued every minute. A manual "Run cycle" forces sourcing.
+Every path that queues or sends holds a per-merchant lock, so a tick, a manual run and a
+campaign launch cannot double-send.
 
 ## What requires a human vs. what's autonomous
 
 | Autonomous | Human gate (deliberate) |
 |---|---|
 | Sourcing, enrichment, scoring, tiering | **A-tier (or below `hitlTier`) outreach approval** — held in the review queue |
-| Auto-send for B/C ≥ `autoSendMinScore` | **Warm A-tier replies** — AI-SDR books a meeting; a human closes |
+| Auto-send for B/C ≥ `autoSendMinScore` | **Warm A-tier replies** — the AI-SDR opens a handoff with the merchant's booking link; a human books and closes |
 | Multi-step follow-ups, send-window/cap enforcement | (everything else runs unattended) |
-| Long-tail interested replies → self-serve signup | |
+| Long-tail interested replies → a handoff with a ready-to-send signup link; in autopilot, deterministic knowledge-base answers are sent automatically | |
 | Suppression, geo-gating, circuit breaker | |
 
 Tunable per merchant via `AutomationState` (`autoSendMinScore`, `hitlTier`,
@@ -57,26 +65,43 @@ Every web-touching capability is a **port** with a deterministic local fallback
 production. The proxy/SERP/etc. decision is a config swap behind the port, never a
 rewrite:
 
-| Capability | Port | Default (offline) | Production adapter |
-|---|---|---|---|
-| Scrape HTTP | `HttpFetcher` | `DeterministicFetcher` | `ProxyHttpFetcher` + rotating/residential `ProxyPool` (**never the origin IP** — Section 11) |
-| SERP | `SerpProvider` | `DeterministicSerpProvider` | `SerpApiProvider` (SerpApi/Serper key) |
-| Backlinks | `DiscoverySource` | (defers to SERP) | `BacklinkDiscoverySource` (Ahrefs/SEMrush) |
-| Email find/verify | `EmailFinder` | `StubEmailFinder` | `HunterFinder` (+ waterfall: Hunter→Findymail→Prospeo→ZeroBounce) |
-| Reply ingest | `ReplyIngestionSource` | webhook (`/recruitment/reply-webhook/:merchantId`) | `ImapReplyIngestion` |
-| LLM (AI-SDR + personalization) | `LlmClient` | `DeterministicLlm` | `AnthropicLlmClient` (Claude Opus 4.8) — auto-used when `ANTHROPIC_API_KEY` set |
-| Meeting booking | `CalendarBooking` | `StubCalendarBooking` | `GoogleCalendarBooking` (reuses the mailbox OAuth) / `CalcomBooking` |
-| Send mailbox | `MailboxSender` | `MockMailboxSender` | `GmailSender` / `MicrosoftGraphSender` |
+| Capability | Port | Default (offline) | Real adapter | Live-validated? |
+|---|---|---|---|---|
+| Scrape HTTP | `HttpFetcher` | `DeterministicFetcher` | `ProxyHttpFetcher` (`undici` proxy pool, SSRF guard, timeouts) → `PlaywrightFetcher` when a page looks blocked | proxy path tested locally; no real proxy vendor |
+| SERP | `SerpProvider` | `DeterministicSerpProvider` (demo only) | `SerpApiProvider`, `DataForSEOSerpProvider` | no |
+| Backlinks | `DiscoverySource` | (none) | `BacklinkDiscoverySource` + `DataForSEOBacklinkProvider` | no |
+| Creator discovery | `DiscoverySource` | synthetic generators (demo only) | `YouTubeDiscoverySource`, `PodcastDiscoverySource`, `SocialCreatorDiscoverySource` | no |
+| Email find/verify | `EmailFinder` / `EmailVerifier` | `StubEmailFinder` (demo prospects only) | `HunterFinder`, `MxEmailVerifier` | no |
+| Send mailbox | `MailboxSender` | `MockMailboxSender` (never in production) | `SmtpSender` (launch rail), `MicrosoftGraphSender`, `GmailSender` | SMTP against a local catcher only |
+| Reply ingest | reply poller | inbound webhook | `ImapReplyIngestion` (SMTP mailboxes), `GraphReplyIngestion` (Microsoft). Gmail-via-Google: none yet → follow-ups hold | no |
+| Transactional mail | `TransactionalMailer` | console (refuses to report "sent" in production) | `ResendMailer`, `PostmarkMailer` | no |
+| LLM | `LlmClient` | `DeterministicLlm` | `AnthropicLlmClient` (`claude-opus-4-8`), `OpenAiCompatibleLlmClient` | no |
+| Meeting booking | `CalendarBooking` | `StubCalendarBooking` | merchant-pasted `bookingUrl` (used verbatim); Cal.com is a skeleton | n/a |
 
 ## Deliverability & compliance (woven in)
 
-- **Warmup** ramp + per-mailbox **daily caps** + **rotation** (`deliverability.ts`).
-- **Circuit breaker**: pauses sending when bounce > 2% or complaints > 0.3%
-  (Google/Yahoo/Microsoft 2025 bulk-sender posture).
-- **CAN-SPAM**: real physical address + one-click List-Unsubscribe in every send.
-- **GDPR/CASL**: EU + Canada cold outreach is geo-gated in `send()`.
-- **Suppression**: global one-click unsubscribe honored across all merchants;
-  hard bounces auto-suppress.
+- **Warmup** ramp + per-mailbox **daily cap** (a rolling 24 hours), enforced on the campaign's
+  own mailbox (`deliverability.ts`). There is no mailbox rotation.
+- **Bounces.** Only recipient-level permanent failures count. Sender-side, policy, quota and
+  auth rejections are `failed`: nobody is suppressed, and repeated failures back the mailbox
+  off. Delivery-status notifications that arrive later are parsed and recorded as bounces.
+- **Circuit breaker**: pauses sending when the bounce rate over a rolling window passes 2%.
+  There is **no complaint feed**, so complaint figures read "not available" — the 0.3%
+  complaint threshold is not enforceable until one exists.
+- **Reply visibility.** A mailbox whose replies cannot be read sends first touches only;
+  follow-ups hold until the inbox can be read.
+- **CAN-SPAM**: sending is blocked until the merchant has a postal address on file; every
+  send carries it plus `List-Unsubscribe` and `List-Unsubscribe-Post` (RFC 8058).
+- **Unsubscribe**: a signed link; GET shows a confirm page, POST suppresses. Form posts and
+  one-click posts both work. A STOP reply to mail we actually sent does the same.
+- **Suppression scope**: unsubscribes and STOP replies to delivered mail apply platform-wide;
+  anything a merchant enters by hand applies to that merchant only; hard bounces are
+  merchant-scoped.
+- **GDPR/CASL**: EU + Canada cold outreach is blocked when the prospect's country is known.
+  An unknown country is not blocked — only YouTube and scrape enrichment set it today.
+- **Send time**: the campaign's time zone and, when the country is known, the recipient's
+  local time.
+- **Demo data** never leaves through a real mailbox.
 
 ## The metric that matters
 
@@ -123,7 +148,7 @@ runs end-to-end behind ports and lights up with real data when provider keys are
 - **Affiliate-network registry** (`core/profile/affiliate-networks.ts`) — ~15 networks.
   `identifyProgram(url)` → `{network, merchantId | vanityHost}`; `backlinkTargetsFor` →
   the precise backlink query (vanity host directly, or network domain filtered by
-  merchant id); `parseProgramInput` → forgiving manual entry (paste a link / "Network id");
+  merchant id);
   `merchantDomainFromLink` → resolves shared-network links to the brand domain via the
   destination param (`urllink`/`murl`/`ued`); `competitorHostsFromLinks` → the OTHER
   merchants an affiliate promotes (the recursive signal).
@@ -152,7 +177,8 @@ runs end-to-end behind ports and lights up with real data when provider keys are
   `GET /recruitment/frontier`, `POST /recruitment/frontier/expand`.
 
 **Honesty rule (REMEDIATION.md):** evidence-backed real data OR labeled demo — never
-fabricate. `synthetic` flag on every prospect; provider signals null when unwired;
+fabricate. A real prospect never receives a guessed address; a contact is taken only from a
+page the creator demonstrably owns; a demo prospect is never emailed through a real mailbox. `synthetic` flag on every prospect; provider signals null when unwired;
 no invented links on failed fetch. In demo mode the Niche Map seeds + mines but won't
 snowball (expansion needs a real fetcher/backlink key for co-promotion data).
 
@@ -192,7 +218,9 @@ let "build our own Ahrefs" dilute the recruitment wedge.
   page parsing/detection is OUR code (`web-evidence.ts` + `core/profile`), regex/
   heuristics — no scraping SaaS.
 - **Fetching ladder** (`HttpFetcher` port): cheap static fetch (`ProxyHttpFetcher`, UA +
-  proxy rotation, never the box IP) → **headless browser** (`PlaywrightFetcher`, env
+  proxy rotation; with `PROXY_URL` set a fetch that cannot use the proxy fails rather than
+  going direct; every fetch goes through `net-guard.ts`, which refuses internal addresses
+  and re-checks each redirect hop) → **headless browser** (`PlaywrightFetcher`, env
   `BROWSER_FETCH`, optional `npm install playwright`) which `EscalatingFetcher` triggers
   ONLY when a page looks blocked/empty/challenged (`looksBlocked`). The browser passes
   JS anti-bot challenges (Cloudflare "checking your browser"); CAPTCHA walls are NOT
@@ -230,8 +258,8 @@ all behind ports, key-gated, offline-testable:
   (`query-strategy.ts` reserves ~35% for platform channels + `SerpDiscoverySource` caps
   primary queries) so YouTube/Substack/Reddit creator queries aren't starved.
 - **Cross-platform prospect merge** (`core/profile/identity-merge.ts`): `ingestCandidate`
-  computes `identitySignalsFromProfile` (account keys / emails / website domains) and, on
-  `identitiesOverlap` with an existing prospect, MERGES (`mergeProfiles` + union links/
+  computes `identitySignalsFromProfile` (owned account keys / own-domain emails / website
+  domains) and, when they match an existing prospect in the per-run identity index, MERGES (`mergeProfiles` + union links/
   contacts, fill missing URLs, OR signals) and returns null instead of inserting a dup.
   One creator across YouTube + website + socials = one comprehensive prospect.
 - **Triage + guards** (`core/recruitment/triage.ts`, `recruitment/guards.ts`,
@@ -252,3 +280,34 @@ all behind ports, key-gated, offline-testable:
   to bypass the captcha-gated About page. Replaces the fixed waterfall in `enrich`; Hunter
   stays the final fallback. Email acquisition is now strong across backlink/SERP/podcast/
   YouTube (customer mining is contact-less by design — hashed email).
+
+## Changed in October 2026 (see `docs/AUDIT-2026-10.md`)
+
+Where this file's older sections disagree with the list below, the list is right.
+
+- **Contacts.** The resolver accepts an address only from a page the creator owns (their own
+  site, or an account with seed / bio-aggregator / reciprocal provenance). Outbound links are
+  not followed for contacts; addresses at a competitor's or the merchant's own domain are
+  rejected; the podcast feed's owner email is used first. The pattern-guessing finder runs
+  for demo prospects only.
+- **Ingest exclusions.** The competitor's own domains, the merchant's own domains (from
+  connected mailboxes and sending domains), marketplaces and social hosts are not prospects.
+- **Identity merge.** Owned handles and own-domain emails only; a shared third-party address
+  or a handle-less platform URL no longer merges two creators.
+- **Scoring.** A new nullable `activity` factor (weight 0.05); engagement is mapped on a
+  scale (1% → 0.5, 3% → 0.85, ≥5% → 1) instead of used raw; unknown relevance, DA and
+  engagement stay null and are reported in `unknownFactors`. A prospect whose relevance is
+  unknown stays `enriched` and is scored on the next run.
+- **Pruning.** A source is dropped only when at least 20 of its prospects were contacted 30+
+  days ago and under 2% produced — and never the last usable source.
+- **Frontier.** A host is promoted to a seed only when the network registry identifies it or
+  a HIGH-confidence signal points at it; generic `ref=` / `via=` / `/go/` never promotes.
+- **Query plan.** The reserved platform slots rotate, so podcast, Reddit, Instagram and
+  TikTok queries run as well as YouTube and newsletters.
+- **Provider errors** are surfaced (`SourcingSummary.sourceErrors`) instead of looking like
+  "no results"; failures are not cached as misses.
+- **Removed as dead code:** `parseProgramInput`, manual competitor-program overrides,
+  `knownNetworks`, `learnedWeights`, `identitiesOverlap`.
+- **Still unverified against live providers:** the scrape actor's request contract, Hunter's
+  email-finder (it wants a person's name), DataForSEO's nested filter form and US/en SERP
+  locale, YouTube quota behaviour, CJ path-style links, Playwright with proxy credentials.

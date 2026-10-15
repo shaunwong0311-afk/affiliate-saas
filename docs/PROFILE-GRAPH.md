@@ -38,16 +38,24 @@ Only after 1–3 can fit + propensity be scored honestly.
 
 ## Status
 
-- **Phase 0 — model & contracts** ✅ `Account` / `Profile` / `AudienceEstimate` types + pure resolution (`classifyAccountUrl`, `seedAccount`, `buildProfile`, `addPageToProfile`); `ProfileSource` + `AudienceProvider` port contracts; `extractHrefs`. Persisted on `Prospect.evidence.profile`.
+- **Phase 0 — model & contracts** ✅ `Account` / `Profile` / `AudienceEstimate` types + pure resolution (`classifyAccountUrl`, `seedAccount`, `buildProfile`, `addPageToProfile`); `extractHrefs`. Persisted on `Prospect.evidence.profile`. (The `ProfileSource` collector port is declared but has no implementation or consumer, and an `AudienceProvider` port was never written — enrichment went through `AccountEnricher` instead.)
 - **Phase 1 — identity from links we already fetch** ✅ `discover` builds the seed + primary-page accounts; `enrich` grows the graph from bio-aggregator/contact pages it fetches (double duty with email extraction). Bio-aggregator listings are high-confidence; one-directional page links are low. Surfaced in the Recruitment review UI ("Identity graph").
 - **Phase 2 — per-platform reach + engagement enrichment** ✅ `AccountEnricher` + `EnricherRegistry`, wired into `enrich` over the graph's primary/high-confidence accounts; fills real `reach` + `engagement` signals (were null) and `profile.audience`. Adapters: `YouTubeEnricher` (free Data API — subs + real engagement from recent uploads + country), `ScrapeMetricsEnricher` (IG/TikTok/X public counts via a scraping-API actor, `SCRAPE_API_URL`-gated skeleton), `OnPageSubscriberEnricher` (Substack/beehiiv on-page count). All key-gated; unknown stays null. Surfaced on the UI identity card.
 - **Phase 3 — inferred audience** ⏳ content language, commenter-language sampling, and (where no enricher exists) coarse geo proxies — confidence-scored, behind the same registry.
 - **Phase 4 — paid audience demographics** ⏳ optional Modash/HypeAuditor adapter (`source: "provider"`) for A-tier only (cost control) — adds audience geo/age/interests.
-- **Phase 5 — fit-scoring upgrade** ⏳ audience overlap (merchant customer geo/lang vs creator audience), multi-platform reach, brand-safety, closed loop.
+- **Phase 5 — fit-scoring upgrade** ◐ partly built: `audienceOverlap` (creator geo/language vs a currency-derived target market), an audience-quality discount, and a content-freshness `activity` factor are scoring inputs; engagement is mapped on a documented scale. Not built: multi-platform reach aggregation, brand-safety, a closed loop that actually learns weights.
 
 **Live keys needed (cannot be exercised here):** `YOUTUBE_API_KEY` for real YouTube stats; `SCRAPE_API_URL`/`SCRAPE_API_KEY` for the IG/TikTok/X actor. Both are built to the documented shapes, unit-tested with mocked HTTP, and run via deterministic/empty paths offline.
 
 ## How it maps to the code
 
 - `Prospect` generalizes toward a `Profile` owning multiple `Account`s. For now the resolved graph lives on `Prospect.evidence.profile` (lightweight); a dedicated `profiles`/`accounts`/`edges` store is a later option if the graph needs to be queried independently.
-- Ports: `ProfileSource` (collector) and `AudienceProvider` (paid/inferred), both with deterministic stubs + key-gated real adapters.
+- Ports actually in use: `AccountEnricher` + `EnricherRegistry` (wrapped in `CachingEnricher`). `ProfileSource` is declared and unused; `AudienceProvider` does not exist.
+
+## Identity rules after October 2026
+
+The graph merges two prospects only on evidence the creator controls: an owned handle
+(platform-aware parsing — a post, reel, video or share URL is not a handle), or an email at
+the creator's own domain. A shared third-party address (an ad network's, an agency's) and a
+handle-less platform URL are not identities. The `shared_domain` provenance in the trust
+order above is never assigned by the code. See `docs/AUDIT-2026-10.md` (D6).
