@@ -98,24 +98,53 @@ export interface OutboundEmail {
   body: string;
   /** For threading follow-ups. */
   inReplyTo?: string | null;
-  /** A caller-supplied Message-Id to stamp on the outgoing MIME (rails that don't return one,
-   *  e.g. Graph, use this so follow-ups can still thread + replies can be correlated). */
+  /** Full References chain, oldest first (mail clients thread on it). Defaults to `inReplyTo`. */
+  references?: string[] | null;
+  /** OUR Message-Id (`<id@domain>`) to stamp on the outgoing message. Set by the pipeline on
+   *  every send so follow-ups thread and replies/bounces correlate on EVERY rail; a sender
+   *  generates one itself when the caller passes none. */
   messageId?: string;
   /** Extra RFC822 headers — e.g. the one-click List-Unsubscribe (RFC 8058) required by
    *  Gmail/Yahoo bulk-sender rules. Senders include these on the outgoing message. */
   headers?: Record<string, string>;
 }
 
+/**
+ * Why a send that did NOT go out failed. Only a permanent problem with the RECIPIENT's own
+ * address is a bounce; everything here is the sending side's (or a transient) problem and must
+ * never suppress the prospect:
+ *  - network: connection / DNS / TLS / timeout / provider 5xx
+ *  - auth: the mailbox's credentials or OAuth grant were refused (needs a reconnect)
+ *  - sender: the sending address/domain was rejected (MAIL FROM, relay denied)
+ *  - quota: provider or host sending limit reached
+ *  - policy: blocked for reputation/content/authentication policy
+ *  - recipient: a SOFT, recipient-specific condition (mailbox full, greylisted) — retry later
+ *  - config: the rail is not usable as configured (missing credentials, optional dep absent)
+ */
+export type SendFailureKind = "network" | "auth" | "sender" | "quota" | "policy" | "recipient" | "config" | "unknown";
+
 export interface SendResult {
+  /** The RFC 5322 Message-Id of the message that went out (ours — never a provider-internal
+   *  API id). "" when nothing was transmitted. */
   messageId: string;
+  /** sent = accepted for delivery · bounced = the RECIPIENT address is permanently bad ·
+   *  failed = not sent for any other reason (see `failure`). */
   status: "sent" | "bounced" | "failed";
   reason?: string;
+  /** Set on `failed` — drives mailbox backoff vs. a plain per-message retry. */
+  failure?: SendFailureKind;
 }
 
 export interface MailboxSender {
   readonly provider: string;
   send(email: OutboundEmail): Promise<SendResult>;
 }
+
+// The barrel (`index.ts`) is outside the outreach fix stream's ownership, and it star-exports
+// this file — so the inbound adapters/parsers added by AUDIT-2026-10 (O5/O6/O9) are surfaced
+// from here. Coordinator: these two lines can move into `index.ts` next to their modules.
+export { GraphReplyIngestion, parseDeliveryStatus, parseAddress, type DeliveryStatusReport, type GraphHttpClient } from "./reply-ingestion.js";
+export { buildRfc822, newMessageId, classifySmtpFailure, unavailableMailboxSender, type SmtpFailureInput } from "./mailbox.js";
 
 // ---- Email finding + verification (Section 8.2) ----------------------------
 export interface EmailCandidate {

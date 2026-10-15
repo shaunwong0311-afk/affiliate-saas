@@ -5,7 +5,10 @@ import { systemClock, newId } from "@affiliate/core";
 import { advanceSequences, type RecruitmentDeps } from "../src/index.js";
 
 let db: Database;
-const NOW = new Date("2026-07-05T12:00:00.000Z");
+// A Thursday, 09:00 for a US recipient. (Was a Sunday 12:00 UTC: since AUDIT-2026-10 O12 the
+// autonomous path applies the recipient-local send-time gate too, and a US prospect is not
+// emailed at 06:00 on a Sunday. The assertions are unchanged.)
+const NOW = new Date("2026-07-02T15:00:00.000Z");
 const clock = { now: () => NOW };
 
 function makeDeps(): RecruitmentDeps {
@@ -35,8 +38,11 @@ function prospect(over: Partial<Prospect> = {}): Prospect {
 
 beforeEach(async () => {
   db = createMemoryDatabase();
-  await db.merchants.insert({ id: "m1", name: "Lumen", status: "active", niche: "skincare", competitors: [], billingStatus: "active", defaultCurrency: "USD", postbackSecret: "s", physicalAddress: null, createdAt: NOW.toISOString() });
-  await db.mailboxes.insert({ id: "mbx1", merchantId: "m1", provider: "smtp", email: "team@lumen.com", status: "connected", dailyCap: 50, warmupStatus: "ready", credentialsRef: "r" });
+  // Fixture updated for AUDIT-2026-10 (the assertions are unchanged): an email follow-up now
+  // needs what a compliant, connected setup has — the merchant's postal address (O13) and a
+  // mailbox whose replies are being read (`inboundStatus: "ok"`, O5).
+  await db.merchants.insert({ id: "m1", name: "Lumen", status: "active", niche: "skincare", competitors: [], billingStatus: "active", defaultCurrency: "USD", postbackSecret: "s", physicalAddress: "1 Market St, San Francisco, CA", createdAt: NOW.toISOString() });
+  await db.mailboxes.insert({ id: "mbx1", merchantId: "m1", provider: "smtp", email: "team@lumen.com", status: "connected", dailyCap: 50, warmupStatus: "ready", credentialsRef: "r", inboundStatus: "ok" });
   await db.campaigns.insert(campaign);
   await db.prospects.insert(prospect());
   // First touch already sent at step 1 (a day ago) → the DM step (2) is now due.

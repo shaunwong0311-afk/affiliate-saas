@@ -75,6 +75,13 @@ import {
 } from "@affiliate/integrations";
 import { loadConfig, type AppConfig } from "./config.js";
 import { oauthProviderFor } from "./services/oauth.js";
+// Outreach wiring (AUDIT-2026-10). A separate import on purpose: the discovery fix stream
+// edits the block above, and two streams should not both touch the same import lines.
+import { GraphReplyIngestion, unavailableMailboxSender } from "@affiliate/integrations";
+import type { RecruitmentDeps } from "@affiliate/recruitment";
+
+/** What one inbound read of a mailbox produced (the recruitment engine's contract). */
+type ReplyPollOutcome = Awaited<ReturnType<NonNullable<RecruitmentDeps["replyPoller"]>>>;
 
 /**
  * AppContext is the dependency container wired once at startup. Everything is an
@@ -91,11 +98,14 @@ export interface AppContext {
   rails: PayoutRailRegistry;
   mailer: MailboxSender;
   /** Resolves the per-campaign send-as-the-merchant sender from the connected mailbox's
-   * encrypted credentials (SMTP/Graph/Gmail). Falls back to `mailer` when none is connected. */
+   * encrypted credentials (SMTP/Graph/Gmail). Outside production an unconnected mailbox
+   * resolves to `mailer` (the mock); in production it resolves to a sender that fails. */
   mailboxResolver: (mailboxId: string | null) => Promise<MailboxSender>;
-  /** Pulls new inbound replies for a mailbox (SMTP-rail IMAP poll; PEEK-only). Returns []
-   * for mailboxes it can't poll (OAuth rails, no IMAP config). The scheduler dedups + routes. */
-  replyPoller: (mailbox: Mailbox) => Promise<InboundReply[]>;
+  /** Reads new inbound mail for a mailbox from its cursor without touching read flags — IMAP
+   * for the SMTP rail, Microsoft Graph for the Microsoft OAuth rail. Says `unavailable` for a
+   * rail with no inbound path (Gmail OAuth, SMTP without IMAP) and throws when the read
+   * fails; the scheduler dedups + routes, and holds follow-ups unless the last read worked. */
+  replyPoller: (mailbox: Mailbox) => Promise<ReplyPollOutcome>;
   emailFinder: EmailFinder;
   embedder: Embedder;
   llm: LlmClient;
@@ -268,21 +278,71 @@ export function createContext(overrides: Partial<AppContext> = {}): AppContext {
     overrides.relevanceScorer ?? (relevanceLlm ? new LlmRelevanceScorer(relevanceLlm) : new EmbeddingRelevanceScorer(embedder));
 
   // Send-as-the-merchant: resolve the campaign's connected mailbox to the right adapter
-  // (SMTP for cPanel/host + Gmail app-password; Graph/Gmail OAuth later), loading its
-  // encrypted credentials from the SecretStore. Falls back to the mock when unconnected.
-  const mailer = overrides.mailer ?? new MockMailboxSender();
+  // (SMTP for cPanel/host + Gmail app-password; Graph/Gmail OAuth), loading its
+  // encrypted credentials from the SecretStore. The DEFAULT mailer is the dev/test mock — and
+  // in production it is a sender that FAILS: every "no mailbox / no resolver" path lands on it,
+  // so none of them can report mail as sent that never left (AUDIT-2026-10 O4).
+  const mailer = overrides.mailer ?? (config.isProduction ? unavailableMailboxSender("no connected mailbox is available for this send") : new MockMailboxSender());
   // Secrets persist WITH the database (encrypted at the app level) — an in-memory-only store
   // would orphan every connected mailbox on restart and silently degrade sends to the mock.
   const secrets = overrides.secrets ?? new DbSecretStore(db.secrets, process.env.SECRETS_ENC_KEY ?? config.jwtSecret);
   const prod = config.isProduction;
   // A sender that refuses to send, with the reason surfaced on the message row. In production
   // a broken mailbox must FAIL — silently "sending" via the mock would fabricate sent state.
-  const failingSender = (reason: string): MailboxSender => ({
-    provider: "unavailable",
-    async send() {
-      return { messageId: "", status: "failed", reason };
-    },
-  });
+  const failingSender = (reason: string): MailboxSender => unavailableMailboxSender(reason);
+
+  // ---- Mailbox credentials (+ OAuth access-token refresh) -----------------------------------
+  // Shared by the sender resolver and the reply poller. Token refresh is SERIALIZED per mailbox
+  // — in this process by a shared in-flight promise, across processes by `db.withLock` where
+  // the adapter has it — and re-reads the stored credentials inside the lock: providers rotate
+  // the refresh token on use, so two concurrent refreshes with the same token end with one of
+  // them (and soon the mailbox) holding a dead one. A failed refresh is REPORTED, never
+  // swallowed: the caller fails the send / marks the inbound path broken with the reason
+  // (audit-07 #23, never fixed until now).
+  type LoadedCredentials = { creds: MailboxCredentials } | { error: string };
+  const readCredentials = async (mailbox: Mailbox): Promise<LoadedCredentials> => {
+    const raw = await secrets.get(mailbox.credentialsRef);
+    if (!raw) return { error: "mailbox credentials missing from the secret store" };
+    try {
+      return { creds: JSON.parse(raw) as MailboxCredentials };
+    } catch {
+      return { error: "mailbox credentials unreadable" };
+    }
+  };
+  const isOAuth = (c: MailboxCredentials) => c.kind === "microsoft" || c.kind === "gmail_oauth";
+  const tokenExpiring = (c: MailboxCredentials) => !!c.expiresAt && new Date(c.expiresAt).getTime() < Date.now() + 60_000;
+  const refreshesInFlight = new Map<string, Promise<LoadedCredentials>>();
+  const refreshCredentials = (mailbox: Mailbox): Promise<LoadedCredentials> => {
+    const inFlight = refreshesInFlight.get(mailbox.id);
+    if (inFlight) return inFlight;
+    const refresh = async (): Promise<LoadedCredentials> => {
+      const current = await readCredentials(mailbox); // re-read: someone else may just have refreshed
+      if ("error" in current || !tokenExpiring(current.creds)) return current;
+      const creds = current.creds;
+      if (!creds.refreshToken) return { error: "the mailbox's access token has expired and no refresh token is stored — reconnect the mailbox" };
+      const provider = creds.kind === "microsoft" ? "microsoft" : "google";
+      const cfg = oauthProviderFor(config, provider);
+      if (!cfg) return { error: `${provider} OAuth is not configured on this server, so the mailbox's token cannot be refreshed` };
+      try {
+        const t = await refreshAccessToken(cfg, creds.refreshToken);
+        const next: MailboxCredentials = { ...creds, accessToken: t.accessToken, refreshToken: t.refreshToken ?? creds.refreshToken, expiresAt: t.expiresAt };
+        await secrets.put(mailbox.credentialsRef, JSON.stringify(next));
+        return { creds: next };
+      } catch (e) {
+        return { error: `the mailbox's access token could not be refreshed (${e instanceof Error ? e.message : String(e)}) — reconnect the mailbox`.slice(0, 300) };
+      }
+    };
+    const lockingDb = db as Database & { withLock?: <R>(key: string, fn: () => Promise<R>) => Promise<R> };
+    const run = (typeof lockingDb.withLock === "function" ? lockingDb.withLock(`mailbox-oauth:${mailbox.id}`, refresh) : refresh()).finally(() => refreshesInFlight.delete(mailbox.id));
+    refreshesInFlight.set(mailbox.id, run);
+    return run;
+  };
+  const loadCredentials = async (mailbox: Mailbox): Promise<LoadedCredentials> => {
+    const loaded = await readCredentials(mailbox);
+    if ("error" in loaded || !isOAuth(loaded.creds) || !tokenExpiring(loaded.creds)) return loaded;
+    return refreshCredentials(mailbox);
+  };
+
   const mailboxResolver =
     overrides.mailboxResolver ??
     (async (mailboxId: string | null): Promise<MailboxSender> => {
@@ -294,59 +354,56 @@ export function createContext(overrides: Partial<AppContext> = {}): AppContext {
         return failingSender(`mailbox ${mailbox.status === "error" ? "auto-paused by the deliverability monitor" : "disconnected"}`);
       }
       if (!mailbox.credentialsRef) return prod ? failingSender("mailbox has no credentials connected") : mailer;
-      const raw = await secrets.get(mailbox.credentialsRef);
-      if (!raw) return prod ? failingSender("mailbox credentials missing from the secret store") : mailer;
-      let creds: MailboxCredentials;
-      try {
-        creds = JSON.parse(raw) as MailboxCredentials;
-      } catch {
-        return prod ? failingSender("mailbox credentials unreadable") : mailer;
-      }
-      // OAuth rails: refresh the access token if it's expired/expiring, and persist it.
-      if ((creds.kind === "microsoft" || creds.kind === "gmail_oauth") && creds.refreshToken && creds.expiresAt && new Date(creds.expiresAt).getTime() < Date.now() + 60_000) {
-        const cfg = oauthProviderFor(config, creds.kind === "microsoft" ? "microsoft" : "google");
-        if (cfg) {
-          try {
-            const t = await refreshAccessToken(cfg, creds.refreshToken);
-            creds = { ...creds, accessToken: t.accessToken, refreshToken: t.refreshToken ?? creds.refreshToken, expiresAt: t.expiresAt };
-            await secrets.put(mailbox.credentialsRef, JSON.stringify(creds));
-          } catch {
-            /* refresh failed → build with the stale token; the send fails + surfaces as an error */
-          }
-        }
-      }
-      return buildMailboxSender(creds, { http: jsonHttp });
+      const stored = await readCredentials(mailbox);
+      if ("error" in stored) return prod ? failingSender(stored.error) : mailer;
+      // OAuth rails: refresh the access token if it's expired/expiring, and persist it. A
+      // refresh that fails fails the SEND, with the reason — in every environment.
+      const loaded = isOAuth(stored.creds) && tokenExpiring(stored.creds) ? await refreshCredentials(mailbox) : stored;
+      if ("error" in loaded) return unavailableMailboxSender(loaded.error, "auth");
+      return buildMailboxSender(loaded.creds, { http: jsonHttp });
     });
 
-  // Inbound: pull replies for a mailbox over IMAP (the SMTP rail's read side). Loads the
-  // mailbox's encrypted IMAP creds, fetches mail newer than its cursor WITHOUT touching the
-  // \Seen flag (it's the merchant's real inbox), and normalizes to InboundReply. OAuth rails
-  // return [] here — their inbound arrives via Graph/Gmail (a later rung) or the webhook.
+  // Inbound: read replies (and bounce notifications) for a mailbox from its stored cursor,
+  // WITHOUT touching read state — it is the merchant's real inbox.
+  //  - SMTP rail  → IMAP (PEEK-only), resuming by UID so nothing is downloaded twice;
+  //  - Microsoft  → Graph `Mail.Read` on the Inbox (the scope the connect flow already asks for);
+  //  - Gmail via Google sign-in → NOT BUILT. It says so (`unavailable`) rather than returning an
+  //    empty list: the engine holds that mailbox's follow-ups and the UI warns, instead of
+  //    following up people whose replies and STOPs it cannot see (AUDIT-2026-10 O5).
+  // A read that FAILS throws; `ingestReplies` records the mailbox's inbound path as broken.
   const replyPoller =
     overrides.replyPoller ??
-    (async (mailbox: Mailbox): Promise<InboundReply[]> => {
-      if (!mailbox.credentialsRef) return [];
-      const raw = await secrets.get(mailbox.credentialsRef);
-      if (!raw) return [];
-      let creds: MailboxCredentials;
-      try {
-        creds = JSON.parse(raw) as MailboxCredentials;
-      } catch {
-        return [];
-      }
-      if (creds.kind !== "smtp" || !creds.imapHost || !creds.user || creds.pass == null) return [];
+    (async (mailbox: Mailbox): Promise<ReplyPollOutcome> => {
+      if (!mailbox.credentialsRef) return { unavailable: "the mailbox is not connected" };
+      const loaded = await loadCredentials(mailbox);
+      if ("error" in loaded) throw new Error(loaded.error);
+      const creds = loaded.creds;
       const since = mailbox.lastPolledAt ? new Date(mailbox.lastPolledAt) : null;
-      const poller = new ImapReplyIngestion({
-        config: {
-          host: creds.imapHost,
-          port: creds.imapPort ?? 993,
-          user: creds.user,
-          pass: creds.pass,
-          secure: (creds.imapPort ?? 993) === 993,
-        },
-        since,
-      });
-      return poller.poll();
+      if (creds.kind === "smtp") {
+        if (!creds.imapHost || !creds.user || creds.pass == null) {
+          return { unavailable: "no IMAP server is set for this mailbox, so replies and STOP requests cannot be read — add its IMAP settings to enable follow-ups" };
+        }
+        const poller = new ImapReplyIngestion({
+          config: {
+            host: creds.imapHost,
+            port: creds.imapPort ?? 993,
+            user: creds.user,
+            pass: creds.pass,
+            secure: (creds.imapPort ?? 993) === 993,
+          },
+          since,
+          cursor: mailbox.inboundCursor ?? null,
+        });
+        const replies = await poller.poll();
+        return { replies, cursor: poller.nextCursor };
+      }
+      if (creds.kind === "microsoft") {
+        if (!creds.accessToken) throw new Error("the Microsoft mailbox has no access token — reconnect it");
+        const poller = new GraphReplyIngestion({ accessToken: creds.accessToken, http: jsonHttp, since, cursor: mailbox.inboundCursor ?? null, mailboxEmail: mailbox.email });
+        const replies = await poller.poll();
+        return { replies, cursor: poller.nextCursor };
+      }
+      return { unavailable: "reading replies is not built yet for Gmail connected with Google sign-in — connect this mailbox with an app password (SMTP + IMAP) to enable follow-ups" };
     });
 
   return {
@@ -384,18 +441,28 @@ export function createContext(overrides: Partial<AppContext> = {}): AppContext {
 /**
  * Transactional mail (activation welcomes, magic links, payout notices) — env-gated ESP:
  * RESEND_API_KEY → Resend, POSTMARK_SERVER_TOKEN → Postmark (ESP_PROVIDER breaks ties when
- * both are set). Without a key this mail never leaves the process, so production boots with
- * a loud warning — otherwise recruits silently never receive their welcome/portal emails.
+ * both are set). TRANSACTIONAL_FROM is the sending address — it must be on a domain verified
+ * with that ESP; there is no built-in default, because a hard-coded address on a domain the
+ * deployment does not own is rejected by the ESP (or worse, spoofs someone).
+ *
+ * Without a key this mail never leaves the process. Outside production the console mailer
+ * records it; IN production the console mailer reports `failed`, so nothing is stamped as
+ * delivered that was not (AUDIT-2026-10 O13) — and boot warns loudly.
  */
 function buildTransactionalMailer(prod: boolean, http: FetchJsonClient): TransactionalMailer {
   const resendKey = process.env.RESEND_API_KEY;
   const postmarkToken = process.env.POSTMARK_SERVER_TOKEN;
   const preferred = (process.env.ESP_PROVIDER ?? "").toLowerCase();
-  if (resendKey && (preferred !== "postmark" || !postmarkToken)) return new ResendMailer({ apiKey: resendKey, http });
-  if (postmarkToken) return new PostmarkMailer({ serverToken: postmarkToken, http });
+  const from = process.env.TRANSACTIONAL_FROM?.trim() || undefined;
+  if ((resendKey || postmarkToken) && !from) {
+    // eslint-disable-next-line no-console
+    console.warn("[boot] TRANSACTIONAL_FROM is not set — activation + magic-link emails will FAIL until it names an address on a domain verified with the ESP.");
+  }
+  if (resendKey && (preferred !== "postmark" || !postmarkToken)) return new ResendMailer({ apiKey: resendKey, http, from });
+  if (postmarkToken) return new PostmarkMailer({ serverToken: postmarkToken, http, from });
   if (prod) {
     // eslint-disable-next-line no-console
     console.warn("[boot] No transactional ESP configured (RESEND_API_KEY / POSTMARK_SERVER_TOKEN) — activation + magic-link emails will NOT be delivered.");
   }
-  return new ConsoleTransactionalMailer();
+  return new ConsoleTransactionalMailer({ production: prod });
 }

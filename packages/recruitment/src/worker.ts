@@ -1,8 +1,10 @@
 import { InMemoryQueue, type JobQueue } from "./queue.js";
-import type { RecruitmentDeps } from "./deps.js";
+import { loggerOf, type RecruitmentDeps } from "./deps.js";
 import { enrich, score, send } from "./pipeline.js";
-import { autonomousCycle } from "./automation.js";
+import { autonomousCycle, setAutomationState, type CycleSummary } from "./automation.js";
 import { ingestReplies } from "./reply-router.js";
+import { capacityAvailable } from "./deliverability.js";
+import { withMerchantLock } from "./merchant-lock.js";
 
 /**
  * Stage workers over a durable queue (Section 8.7). Each stage is registered as a
@@ -19,7 +21,17 @@ export function registerWorkers(queue: JobQueue, deps: RecruitmentDeps): void {
     await score(deps, prospectId);
   });
   queue.process<{ messageId: string }>("send", async ({ messageId }) => {
-    await send(deps, messageId);
+    // A queued send obeys the same rules as every other send path: the merchant's send lock,
+    // and the campaign mailbox's window / daily cap / backoff, re-checked inside it.
+    const message = await deps.db.outreachMessages.require(messageId);
+    const prospect = await deps.db.prospects.require(message.prospectId);
+    await withMerchantLock(deps, prospect.merchantId, async () => {
+      const campaign = await deps.db.campaigns.get(message.campaignId);
+      if (campaign && !(await capacityAvailable(deps, prospect.merchantId, campaign, deps.clock.now()))) {
+        throw new Error("no send capacity right now — retry later");
+      }
+      await send(deps, messageId);
+    });
   });
 }
 
@@ -31,24 +43,64 @@ export function buildQueue(): JobQueue {
   });
 }
 
+export interface TickError {
+  merchantId: string | null;
+  phase: "replies" | "cycle";
+  error: string;
+}
+
+export interface TickResult {
+  merchants: number;
+  cycles: unknown[];
+  replies: { mailboxes: number; polled: number; matched: number; bounced?: number; failed?: number };
+  /** What went wrong this tick, per merchant. Empty on a clean tick. */
+  errors: TickError[];
+}
+
 /**
- * The scheduler — drives the autonomous from-scratch engine. For every merchant
- * with automation `running`, it runs one `autonomousCycle` per tick (source →
- * enrich → score → auto-send + follow-ups, gated by the deliverability circuit
- * breaker and the HITL tier). In production this is a cron/interval; here it is a
- * single `tick()` plus a `loop()` so it is testable and embeddable.
+ * The scheduler — drives the autonomous from-scratch engine. One `tick()`:
+ *
+ *  1. reads every connected mailbox for replies and bounces — ALWAYS, and FIRST: for merchants
+ *     whose automation is paused too, and whatever happens to any merchant's cycle afterwards.
+ *     A reply or STOP that has arrived is processed before anyone is emailed again;
+ *  2. runs one `autonomousCycle` for each merchant with automation `running` (sourcing only
+ *     when its interval has elapsed; sends and follow-ups every tick, gated by the
+ *     deliverability circuit breaker and the HITL tier).
+ *
+ * Merchants are ISOLATED (AUDIT-2026-10 O1): one merchant's failure is caught, logged,
+ * recorded on its automation state and returned in `errors`; every other merchant still gets
+ * its cycle. Nothing is swallowed silently. In production this is a cron/interval; here it is
+ * a single `tick()` plus a `loop()` so it is testable and embeddable.
  */
-export async function tickScheduler(deps: RecruitmentDeps): Promise<{ merchants: number; cycles: unknown[]; replies: { mailboxes: number; polled: number; matched: number } }> {
+export async function tickScheduler(deps: RecruitmentDeps): Promise<TickResult> {
+  const log = loggerOf(deps);
+  const errors: TickError[] = [];
+
+  let replies: TickResult["replies"] = { mailboxes: 0, polled: 0, matched: 0 };
+  try {
+    replies = await ingestReplies(deps);
+  } catch (e) {
+    const error = errorMessage(e);
+    errors.push({ merchantId: null, phase: "replies", error });
+    log.error("reply ingestion failed", { error });
+  }
+
   const states = await deps.db.automationStates.find((s) => s.status === "running");
   const cycles: unknown[] = [];
   for (const state of states) {
-    cycles.push(await autonomousCycle(deps, state.merchantId));
+    try {
+      // The inbox was read just above for every mailbox — the cycle need not read it again.
+      const summary: CycleSummary = await autonomousCycle(deps, state.merchantId, { skipReplyIngestion: true });
+      cycles.push(summary);
+    } catch (e) {
+      const error = errorMessage(e);
+      errors.push({ merchantId: state.merchantId, phase: "cycle", error });
+      log.error("autonomous cycle failed", { merchantId: state.merchantId, error });
+      // Make it visible to the operator, not just to whoever reads the logs.
+      await setAutomationState(deps, state.merchantId, { lastError: error.slice(0, 300), lastErrorAt: deps.clock.now().toISOString() }).catch(() => {});
+    }
   }
-  // Pull inbound replies (SMTP-rail IMAP poll) across ALL connected mailboxes — replies
-  // must be ingested even for merchants whose outbound automation is paused, so a human
-  // who paused sending still sees answers + sequences still stop on reply.
-  const replies = await ingestReplies(deps).catch(() => ({ mailboxes: 0, polled: 0, matched: 0 }));
-  return { merchants: states.length, cycles, replies };
+  return { merchants: states.length, cycles, replies, errors };
 }
 
 export interface SchedulerHandle {
@@ -62,8 +114,10 @@ export function runScheduler(deps: RecruitmentDeps, intervalMs = 60_000): Schedu
     if (stopped) return;
     try {
       await tickScheduler(deps);
-    } catch {
-      /* isolate cycle failures */
+    } catch (e) {
+      // tickScheduler isolates per merchant; reaching here means the tick itself broke (the
+      // database is unreachable, say). Log it and keep the loop alive for the next interval.
+      loggerOf(deps).error("scheduler tick failed", { error: errorMessage(e) });
     }
     if (!stopped) timer = setTimeout(run, intervalMs);
   };
@@ -74,6 +128,10 @@ export function runScheduler(deps: RecruitmentDeps, intervalMs = 60_000): Schedu
       clearTimeout(timer);
     },
   };
+}
+
+function errorMessage(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
 }
 
 // The standalone worker ENTRYPOINT lives in packages/api/src/worker.ts — it builds the same

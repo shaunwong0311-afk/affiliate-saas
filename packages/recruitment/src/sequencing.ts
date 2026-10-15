@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { OutreachCampaign, SequenceStep } from "@affiliate/db";
 
 /**
@@ -6,11 +7,53 @@ import type { OutreachCampaign, SequenceStep } from "@affiliate/db";
  * caps. Pure helpers so the scheduling logic is unit-testable.
  */
 
+/** True when `timeZone` is an IANA zone this runtime knows (validated on campaign create/patch). */
+export function isValidTimeZone(timeZone: string): boolean {
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** The wall-clock hour (0–23) at `at` in an IANA time zone, DST included. An unknown or empty
+ *  zone reads as UTC rather than throwing mid-cycle. */
+export function hourInTimeZone(at: Date, timeZone: string | null | undefined): number {
+  if (timeZone && timeZone.toUpperCase() !== "UTC") {
+    try {
+      const hour = new Intl.DateTimeFormat("en-US", { timeZone, hour: "numeric", hourCycle: "h23" }).formatToParts(at).find((p) => p.type === "hour")?.value;
+      const h = Number(hour);
+      if (Number.isInteger(h)) return h % 24;
+    } catch {
+      /* unknown zone → UTC */
+    }
+  }
+  return at.getUTCHours();
+}
+
+/**
+ * Whether `at` falls inside the campaign's send window, measured in the campaign's OWN time
+ * zone. (It used to compare against the UTC hour and ignore the stored zone, so a 9–17 Los
+ * Angeles window sent at 03:00 local.)
+ */
 export function isWithinSendWindow(campaign: OutreachCampaign, at: Date): boolean {
-  const { startHour, endHour } = campaign.sendWindow;
-  const hour = at.getUTCHours();
+  const { startHour, endHour, timezone } = campaign.sendWindow;
+  const hour = hourInTimeZone(at, timezone);
   if (startHour <= endHour) return hour >= startHour && hour < endHour;
   return hour >= startHour || hour < endHour; // window wraps midnight
+}
+
+/**
+ * A fingerprint of the copy a step renders from (subject, body, variants). Stamped on each
+ * queued message, so a content-gate block can be told apart from "the operator has since
+ * fixed the copy" — the block is held only while the fingerprint is unchanged.
+ */
+export function stepFingerprint(step: SequenceStep): string {
+  return createHash("sha1")
+    .update(JSON.stringify([step.subject, step.body, (step.variants ?? []).map((v) => [v.subject, v.body])]))
+    .digest("hex")
+    .slice(0, 16);
 }
 
 /**

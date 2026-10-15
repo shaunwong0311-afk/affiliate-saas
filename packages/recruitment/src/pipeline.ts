@@ -523,13 +523,107 @@ export async function score(deps: RecruitmentDeps, prospectId: string): Promise<
 }
 
 // ---- 4. Outreach: build the first message for a campaign --------------------
+// Imports for the queue/send half live here (not in the block at the top of the file) so the
+// outreach and discovery fix streams, which each own one half of this module, do not both
+// edit the same import lines.
+import { newMessageId, unavailableMailboxSender, type MailboxSender, type SendResult } from "@affiliate/integrations";
+import { stepFingerprint } from "./sequencing.js";
+import { withMerchantLock } from "./merchant-lock.js";
+import { inboundState, mailboxBackingOff, recordSendFailure, recordSendSuccess } from "./deliverability.js";
+
+/**
+ * Why NO outreach may be sent for this merchant right now, or null. Compliance is not
+ * optional: every outreach email must carry the sender's valid physical postal address
+ * (CAN-SPAM), so a merchant without one sends nothing — and is told why — instead of sending
+ * mail with the address silently left out of the footer.
+ */
+export function outreachBlockedReason(merchant: Pick<Merchant, "physicalAddress">): string | null {
+  if (!merchant.physicalAddress?.trim()) {
+    return "compliance: no business postal address is set — every outreach email must carry one, so nothing is sent until it is added in Settings";
+  }
+  return null;
+}
+
+/** A failed transmission is retried no sooner than this (doubling per attempt, capped). */
+const RETRY_BASE_MS = 3_600_000;
+const RETRY_MAX_MS = 24 * 3_600_000;
+
+/** When a message that has failed `attempts` times may next be tried. */
+export function nextAttemptAfter(attempts: number, now: Date): string {
+  return new Date(now.getTime() + Math.min(RETRY_MAX_MS, RETRY_BASE_MS * 2 ** Math.max(0, attempts - 1))).toISOString();
+}
+
+/** True when a failed message is still inside its retry delay. */
+export function retryNotDue(message: Pick<OutreachMessage, "nextAttemptAt">, now: Date): boolean {
+  return !!message.nextAttemptAt && new Date(message.nextAttemptAt).getTime() > now.getTime();
+}
+
+function firstTouchTokens(merchant: Merchant, prospect: Prospect): Record<string, string> {
+  const depth = personalizationDepth(prospect.tier);
+  return {
+    name: prospect.identity,
+    merchant: merchant.name,
+    offer: merchant.niche ?? "our products",
+    angle:
+      depth === "deep"
+        ? "I saw your reviews in this exact niche and your affiliate links — you'd be a strong fit."
+        : depth === "medium"
+          ? "Your content is a great match for our products."
+          : "Thought our affiliate program might interest you.",
+  };
+}
+
+/** Render the first-touch copy for a prospect (A/B variant pick + the merchant's plan). */
+async function renderFirstTouch(
+  deps: RecruitmentDeps,
+  merchant: Merchant,
+  prospect: Prospect,
+  step: NonNullable<ReturnType<typeof firstStep>>,
+): Promise<{ subject: string; body: string; variant: string }> {
+  const depth = personalizationDepth(prospect.tier);
+  // A/B: when the step defines variants, pick one (even, deterministic per prospect) and
+  // personalize within it. The chosen variant is recorded for reply-rate-by-variant analysis.
+  let effectiveStep = step;
+  let abLabel: string | null = null;
+  if (step.variants?.length) {
+    const picked = pickVariant(step.variants, prospect.id);
+    effectiveStep = { ...step, subject: picked.value.subject, body: picked.value.body };
+    abLabel = `ab:v${picked.index}`;
+  }
+  // Personalize per the merchant's plan (template / hybrid / llm). The LLM path cites the
+  // prospect's real evidence; falls back to the token template otherwise or on any failure.
+  const personalized = await personalizeOutreach(deps, { merchant, prospect, step: effectiveStep, tokens: firstTouchTokens(merchant, prospect) });
+  // LLM bodies are personalized per-prospect (no fixed variant to test); template sends
+  // carry the A/B label so variant reply-rates are comparable.
+  return { subject: personalized.subject, body: personalized.body, variant: personalized.mode === "llm" ? "llm" : abLabel ?? depth };
+}
+
+/**
+ * Queue the first touch for a prospect. Runs under the merchant's send lock and is safe to
+ * call twice (AUDIT-2026-10 O3): only a SCORED prospect is queued, and there is exactly one
+ * first-touch row per prospect and campaign — a second run finds it and does not add another.
+ *
+ *  - already sent → null (and a prospect that slipped back to `scored` is put right);
+ *  - a failed attempt → the SAME row is retried once its retry delay has passed: no new row,
+ *    no second LLM personalization, nothing billed again (O10);
+ *  - blocked by the content gate → held only while the step copy is unchanged; once the
+ *    operator edits the copy it is re-rendered and released (O11).
+ */
 export async function queueFirstTouch(
   deps: RecruitmentDeps,
   prospectId: string,
   campaign: OutreachCampaign,
 ): Promise<OutreachMessage | null> {
+  return withMerchantLock(deps, campaign.merchantId, () => queueFirstTouchLocked(deps, prospectId, campaign));
+}
+
+async function queueFirstTouchLocked(deps: RecruitmentDeps, prospectId: string, campaign: OutreachCampaign): Promise<OutreachMessage | null> {
   const prospect = await deps.db.prospects.require(prospectId);
   if (!prospect.email) return null;
+  // A campaign only ever emails its own merchant's prospects.
+  if (prospect.merchantId !== campaign.merchantId) return null;
+  // Read fresh, under the lock: whoever listed this prospect as `scored` may be a run behind.
+  if (prospect.state !== "scored") return null;
   if (await isSuppressed(deps, prospect.merchantId, prospect.email)) {
     await deps.db.prospects.update(prospectId, { state: "suppressed", suppressionStatus: "suppressed" });
     return null;
@@ -541,61 +635,55 @@ export async function queueFirstTouch(
   }
   const step = firstStep(campaign);
   if (!step) return null;
-  // A content-gate-blocked first touch is deterministic — re-queuing would fail identically and
-  // grow a failed row per cycle. Hold the prospect until the operator fixes the copy (the failed
-  // message + blockedReason are the operator surface).
-  const gateBlocked = await deps.db.outreachMessages.findOne(
-    (m) => m.prospectId === prospectId && m.campaignId === campaign.id && m.step === step.step && m.status === "failed" && (m.blockedReason ?? "").startsWith("content gate"),
-  );
-  if (gateBlocked) return null;
+  const now = deps.clock.now();
+  const nowIso = now.toISOString();
+  const fingerprint = stepFingerprint(step);
   const merchant = await deps.db.merchants.require(prospect.merchantId);
 
-  const depth = personalizationDepth(prospect.tier);
-  const tokens = {
-    name: prospect.identity,
-    merchant: merchant.name,
-    offer: merchant.niche ?? "our products",
-    angle:
-      depth === "deep"
-        ? "I saw your reviews in this exact niche and your affiliate links — you'd be a strong fit."
-        : depth === "medium"
-          ? "Your content is a great match for our products."
-          : "Thought our affiliate program might interest you.",
-  };
-
-  // A/B: when the step defines variants, pick one (even, deterministic per prospect) and
-  // personalize within it. The chosen variant is recorded for reply-rate-by-variant analysis.
-  let effectiveStep = step;
-  let abLabel: string | null = null;
-  if (step.variants?.length) {
-    const picked = pickVariant(step.variants, prospectId);
-    effectiveStep = { ...step, subject: picked.value.subject, body: picked.value.body };
-    abLabel = `ab:v${picked.index}`;
+  const rows = await deps.db.outreachMessages.find((m) => m.prospectId === prospectId && m.campaignId === campaign.id && m.step === step.step);
+  if (rows.some((m) => m.status === "sent" || m.status === "replied")) {
+    // The first touch already went out; the prospect's state lost that fact. Never send it again.
+    await deps.db.prospects.update(prospectId, { state: "contacted", updatedAt: nowIso });
+    return null;
   }
-  // Personalize per the merchant's plan (template / hybrid / llm). The LLM path cites the
-  // prospect's real evidence; falls back to the token template otherwise or on any failure.
-  const personalized = await personalizeOutreach(deps, { merchant, prospect, step: effectiveStep, tokens });
+  if (rows.some((m) => m.status === "bounced")) return null;
 
-  const now = deps.clock.now().toISOString();
+  const existing = rows.find((m) => m.status === "queued") ?? rows[rows.length - 1];
+  if (existing) {
+    if (existing.status === "failed") {
+      const copyChanged = existing.stepFingerprint !== fingerprint;
+      const gateBlocked = (existing.blockedReason ?? "").startsWith("content gate");
+      // A content-gate block is deterministic for a given copy: hold it until the copy changes.
+      if (gateBlocked && !copyChanged) return null;
+      if (!gateBlocked && !copyChanged && retryNotDue(existing, now)) return null;
+      if (copyChanged) {
+        const fresh = await renderFirstTouch(deps, merchant, prospect, step);
+        await deps.db.outreachMessages.update(existing.id, { ...fresh, stepFingerprint: fingerprint, attempts: 0, nextAttemptAt: null });
+      }
+    }
+    const requeued = await deps.db.outreachMessages.update(existing.id, { status: "queued", blockedReason: undefined });
+    await deps.db.prospects.update(prospectId, { state: "queued", updatedAt: nowIso });
+    return requeued;
+  }
+
+  const rendered = await renderFirstTouch(deps, merchant, prospect, step);
   const message: OutreachMessage = {
     id: newId("omsg"),
     prospectId,
     campaignId: campaign.id,
     step: step.step,
-    // LLM bodies are personalized per-prospect (no fixed variant to test); template sends
-    // carry the A/B label so variant reply-rates are comparable.
-    variant: personalized.mode === "llm" ? "llm" : abLabel ?? depth,
-    subject: personalized.subject,
-    body: personalized.body,
+    variant: rendered.variant,
+    subject: rendered.subject,
+    body: rendered.body,
     sentAt: null,
     status: "queued",
+    stepFingerprint: fingerprint,
+    attempts: 0,
   };
   await deps.db.outreachMessages.insert(message);
-  // Meter LLM personalizations for plan-tier billing (one event per LLM-written email).
-  if (personalized.mode === "llm") {
-    await deps.db.usageEvents.insert({ id: newId("use"), merchantId: prospect.merchantId, kind: "personalization", quantity: 1, sourceId: message.id, ts: now });
-  }
-  await deps.db.prospects.update(prospectId, { state: "queued", updatedAt: now });
+  // LLM personalization is metered when the message is actually SENT (see send()), not here:
+  // metering at queue time billed a personalization on every tick of an SMTP outage.
+  await deps.db.prospects.update(prospectId, { state: "queued", updatedAt: nowIso });
   return message;
 }
 
@@ -604,38 +692,68 @@ export async function previewOutreach(
   deps: RecruitmentDeps,
   prospectId: string,
   campaign: OutreachCampaign,
-): Promise<{ subject: string; body: string; mode: "template" | "llm"; scan: ReturnType<typeof scanContent> } | null> {
+): Promise<{ subject: string; body: string; mode: "template" | "llm"; scan: ReturnType<typeof scanContent>; blockedReason: string | null } | null> {
   const prospect = await deps.db.prospects.require(prospectId);
   const step = firstStep(campaign);
   if (!step) return null;
   const merchant = await deps.db.merchants.require(prospect.merchantId);
-  const depth = personalizationDepth(prospect.tier);
-  const tokens = {
-    name: prospect.identity,
-    merchant: merchant.name,
-    offer: merchant.niche ?? "our products",
-    angle:
-      depth === "deep"
-        ? "I saw your reviews in this exact niche and your affiliate links — you'd be a strong fit."
-        : depth === "medium"
-          ? "Your content is a great match for our products."
-          : "Thought our affiliate program might interest you.",
-  };
-  const rendered = await personalizeOutreach(deps, { merchant, prospect, step, tokens });
-  // Surface the pre-send content gate in the preview so the operator sees issues before launch.
-  return { ...rendered, scan: scanContent({ subject: rendered.subject, body: rendered.body }) };
+  const rendered = await personalizeOutreach(deps, { merchant, prospect, step, tokens: firstTouchTokens(merchant, prospect) });
+  // Surface the pre-send content gate — and anything that would stop the send outright — in
+  // the preview, so the operator sees it before launch.
+  return { ...rendered, scan: scanContent({ subject: rendered.subject, body: rendered.body }), blockedReason: outreachBlockedReason(merchant) };
 }
 
 // ---- 4b. Send a queued message as the merchant ------------------------------
+/** Prospect states in which an outreach email may still go out. Anything else (replied,
+ *  converted, suppressed, bounced, dead) means the conversation moved on while it waited. */
+const SENDABLE_STATES: ReadonlySet<string> = new Set(["scored", "queued", "contacted", "in_sequence"]);
+
+/**
+ * Transmit one outreach message as the merchant. Runs under the merchant's send lock and
+ * re-reads everything inside it (AUDIT-2026-10 O3): a message that is already sent is left
+ * alone, so two overlapping runs cannot both transmit it.
+ *
+ * What the outcome means:
+ *  - sent     → recorded, billed, the prospect advances;
+ *  - bounced  → the RECIPIENT address is permanently bad: suppressed for this merchant,
+ *               counted against the mailbox's daily cap and its bounce rate;
+ *  - failed   → nothing was sent and nothing is recorded as sent. The prospect is NOT
+ *               suppressed; the row is retried later with the same copy and Message-Id, and
+ *               the mailbox is held back so an outage cannot burn through the list (O2/O10).
+ */
 export async function send(deps: RecruitmentDeps, messageId: string): Promise<OutreachMessage> {
+  const queued = await deps.db.outreachMessages.require(messageId);
+  const owner = await deps.db.prospects.require(queued.prospectId);
+  return withMerchantLock(deps, owner.merchantId, () => sendLocked(deps, messageId));
+}
+
+async function sendLocked(deps: RecruitmentDeps, messageId: string): Promise<OutreachMessage> {
   const message = await deps.db.outreachMessages.require(messageId);
+  // Claim check: only a queued (or retryable failed) row is transmitted.
+  if (message.status !== "queued" && message.status !== "failed") return message;
   const prospect = await deps.db.prospects.require(message.prospectId);
   const campaign = await deps.db.campaigns.require(message.campaignId);
   const merchant = await deps.db.merchants.require(prospect.merchantId);
-  if (!prospect.email) return message;
   const now0 = deps.clock.now().toISOString();
+  /** Not sent, for a reason that is nobody's transport failure: record why, keep it retryable,
+   *  and never leave a first-touch prospect stranded in `queued`. */
+  const block = async (blockedReason: string): Promise<OutreachMessage> => {
+    if (prospect.state === "queued") await deps.db.prospects.update(prospect.id, { state: "scored", updatedAt: now0 });
+    return deps.db.outreachMessages.update(messageId, { status: "failed", blockedReason });
+  };
+  if (!prospect.email) return block("prospect has no email address");
+  const toEmail = prospect.email;
 
-  if (await isSuppressed(deps, prospect.merchantId, prospect.email)) {
+  if (!SENDABLE_STATES.has(prospect.state)) {
+    return deps.db.outreachMessages.update(messageId, { status: "failed", blockedReason: `not sent: prospect is ${prospect.state}` });
+  }
+
+  if (await isSuppressed(deps, prospect.merchantId, toEmail)) {
+    // They opted out (the unsubscribe link, a STOP, a bounce) after this was queued. Take the
+    // prospect out of the cadence too, so the next cycle does not come back to it.
+    if (canTransition(prospect.state, "suppressed")) {
+      await deps.db.prospects.update(prospect.id, { state: "suppressed", suppressionStatus: "suppressed", updatedAt: now0 });
+    }
     return deps.db.outreachMessages.update(messageId, { status: "failed", blockedReason: "suppressed contact" });
   }
 
@@ -646,83 +764,155 @@ export async function send(deps: RecruitmentDeps, messageId: string): Promise<Ou
     return deps.db.outreachMessages.update(messageId, { status: "failed", blockedReason: `geo-gated (${prospect.country.toUpperCase()} — GDPR/CASL)` });
   }
 
+  // Compliance (O13): no postal address → no send, with a reason the operator can see.
+  const compliance = outreachBlockedReason(merchant);
+  if (compliance) return block(compliance);
+
   // Pre-send content gate (§16 #7): scan the personalized subject+body BEFORE it leaves. A
   // hard-block (empty field, egregious spam) fails the send with a reason for the operator to
   // fix, rather than burning domain reputation. Warnings pass through. Scans the raw personalized
   // content (the compliance footer's unsubscribe link is added after + is legitimate).
-  // A blocked FIRST touch reverts the prospect to `scored` so it isn't stranded in `queued`
-  // (queueFirstTouch skips re-queuing while a content-gate-failed message exists at that step).
+  // A blocked FIRST touch reverts the prospect to `scored` so it isn't stranded in `queued`;
+  // queueFirstTouch holds it there until the step copy changes.
   const scan = scanContent({ subject: message.subject, body: message.body });
   if (!scan.ok) {
-    if (prospect.state === "queued") await deps.db.prospects.update(prospect.id, { state: "scored", updatedAt: now0 });
-    return deps.db.outreachMessages.update(messageId, {
-      status: "failed",
-      blockedReason: `content gate: ${scan.issues.filter((i) => i.severity === "block").map((i) => i.message).join("; ")}`,
-    });
+    return block(`content gate: ${scan.issues.filter((i) => i.severity === "block").map((i) => i.message).join("; ")}`);
   }
 
   const mailbox = campaign.mailboxId ? await deps.db.mailboxes.get(campaign.mailboxId) : null;
   // A mailbox the deliverability monitor auto-paused (status "error") must never send —
   // even when the resolver would happily build a working transport for it.
   if (mailbox && (mailbox.status === "error" || mailbox.status === "disconnected")) {
-    if (prospect.state === "queued") await deps.db.prospects.update(prospect.id, { state: "scored", updatedAt: now0 });
-    return deps.db.outreachMessages.update(messageId, { status: "failed", blockedReason: `mailbox ${mailbox.status === "error" ? "auto-paused" : "disconnected"}` });
+    return block(`mailbox ${mailbox.status === "error" ? "auto-paused" : "disconnected"}`);
   }
+  // Nor one being held back after transport failures (callers check capacity first; this is
+  // the backstop for anything that calls send() directly).
+  if (mailbox && mailboxBackingOff(mailbox, deps.clock.now())) {
+    return block(`mailbox is backing off until ${mailbox.sendBackoffUntil} after send failures${mailbox.lastSendError ? `: ${mailbox.lastSendError}` : ""}`);
+  }
+
   const unsubUrl = unsubscribeLink(prospect.merchantId, prospect.email);
-  // CAN-SPAM compliant footer: valid physical address + one-click unsubscribe.
-  const footer =
-    `\n\n—\n${merchant.name}` +
-    (merchant.physicalAddress ? `\n${merchant.physicalAddress}` : "") +
-    `\nUnsubscribe: reply STOP, or ${unsubUrl}`;
+  // CAN-SPAM compliant footer: valid physical address (guaranteed present above) + one-click
+  // unsubscribe. "Reply STOP" is offered only when replies to this mailbox are actually being
+  // read: a mailbox with no working inbound path (O5) must not promise an opt-out it cannot
+  // hear. The signed link always works.
+  const footer = `\n\n—\n${merchant.name}\n${merchant.physicalAddress}\nUnsubscribe: ${inboundState(mailbox).working ? "reply STOP, or " : ""}${unsubUrl}`;
   // One-click List-Unsubscribe (RFC 8058) — REQUIRED by Gmail/Yahoo bulk-sender rules. The
   // POST variant lets the inbox unsubscribe the user without opening the link.
   const headers: Record<string, string> = {
     "List-Unsubscribe": `<${unsubUrl}>`,
     "List-Unsubscribe-Post": "List-Unsubscribe=One-Click",
   };
-  // Thread follow-ups into the same conversation: reference the previous step's provider
-  // Message-Id so step 2+ lands as a reply, not a fresh cold email.
+  // Thread follow-ups into the same conversation: reference the earlier steps' Message-Ids
+  // (ours — the ones we stamped) so step 2+ lands as a reply, not a fresh cold email.
   let inReplyTo: string | undefined;
+  let references: string[] | undefined;
   if (message.step > 1) {
     const prior = (await deps.db.outreachMessages.find(
       (m) => m.prospectId === prospect.id && m.campaignId === campaign.id && m.status === "sent" && m.step < message.step && !!m.providerMessageId,
-    )).sort((a, b) => b.step - a.step)[0];
-    inReplyTo = prior?.providerMessageId ?? undefined;
+    )).sort((a, b) => a.step - b.step);
+    // Only real Message-Ids: rows sent before every rail stamped its own may hold a provider's
+    // API id (Gmail) or a mock id, which must never be put in a threading header.
+    const ids = prior.map((m) => m.providerMessageId!).filter((id) => /^<?[^\s<>]+@[^\s<>]+>?$/.test(id)).map((id) => (id.startsWith("<") ? id : `<${id}>`));
+    if (ids.length) {
+      references = ids;
+      inReplyTo = ids[ids.length - 1];
+    }
   }
-  // Send AS the merchant: resolve their connected mailbox (SMTP/Graph/Gmail). Falls back to
-  // the default mailer (the dev/test mock) when no resolver is wired or the mailbox is gone.
-  const sender = deps.mailboxResolver ? await deps.mailboxResolver(campaign.mailboxId).catch(() => deps.mailer) : deps.mailer;
-  const result = await sender.send({
-    fromName: merchant.name,
-    // Never invent a plausible-looking from domain: without a connected mailbox the send can
-    // only be the dev/test mock, so use an RFC 2606 reserved address that cannot be mistaken
-    // for (or delivered as) a real identity.
-    fromEmail: mailbox?.email ?? "no-reply@example.invalid",
-    toEmail: prospect.email,
-    subject: message.subject,
-    body: message.body + footer,
-    headers,
-    inReplyTo,
+  // Never invent a plausible-looking from domain: without a connected mailbox the send can
+  // only be the dev/test mock, so use an RFC 2606 reserved address that cannot be mistaken
+  // for (or delivered as) a real identity.
+  const fromEmail = mailbox?.email ?? "no-reply@example.invalid";
+  // OUR Message-Id, fixed before the first attempt and reused by every retry of this row: it
+  // is what the reply (or the bounce) will reference, on every rail (O9).
+  const ourMessageId = message.providerMessageId && message.providerMessageId.includes("@") ? message.providerMessageId : newMessageId(fromEmail);
+  const attempts = (message.attempts ?? 0) + 1;
+  await deps.db.outreachMessages.update(messageId, { providerMessageId: ourMessageId, attempts });
+
+  // Send AS the merchant: resolve their connected mailbox (SMTP/Graph/Gmail). With no resolver
+  // wired this is the dev/test default mailer. A resolver that THROWS yields a sender that
+  // fails — it must never fall back to the default mailer, which is a mock that would record
+  // mail as sent that never left (O4).
+  let sender: MailboxSender;
+  if (deps.mailboxResolver) {
+    try {
+      sender = await deps.mailboxResolver(campaign.mailboxId);
+    } catch (e) {
+      sender = unavailableMailboxSender(`mailbox sender could not be resolved: ${e instanceof Error ? e.message : String(e)}`.slice(0, 200));
+    }
+  } else {
+    sender = deps.mailer;
+  }
+  let result: SendResult;
+  try {
+    result = await sender.send({
+      fromName: merchant.name,
+      fromEmail,
+      toEmail: prospect.email,
+      subject: message.subject,
+      body: message.body + footer,
+      headers,
+      messageId: ourMessageId,
+      inReplyTo,
+      ...(references ? { references } : {}),
+    });
+  } catch (e) {
+    // Adapters are meant never to throw; if one does, it is a failed send, not a crashed tick.
+    result = { messageId: "", status: "failed", reason: `sender error: ${e instanceof Error ? e.message : String(e)}`.slice(0, 200), failure: "unknown" };
+  }
+
+  const nowDate = deps.clock.now();
+  const now = nowDate.toISOString();
+  // Record the outcome as ONE unit — the message row first, then the prospect, the usage and
+  // the suppression rows — so a crash cannot leave "sent" without its prospect state, or a
+  // bounce without its suppression. (A crash between the transport's answer and this point
+  // leaves the row queued; the retry goes out under the same Message-Id.)
+  return deps.db.transaction(async (tx) => {
+    const txDeps: RecruitmentDeps = { ...deps, db: tx };
+    if (result.status === "bounced") {
+      // `sentAt` is set: a bounced message was transmitted, so it spends the mailbox's daily cap.
+      const bounced = await tx.outreachMessages.update(messageId, { status: "bounced", sentAt: now, blockedReason: undefined, deliveryError: result.reason, nextAttemptAt: null });
+      await suppress(txDeps, { merchantId: prospect.merchantId, email: toEmail, reason: "hard bounce", scope: "merchant" });
+      await tx.prospects.update(prospect.id, { state: "bounced", suppressionStatus: "bounced", updatedAt: now });
+      return bounced;
+    }
+    // A transport failure (outage, expired token, quota, sender/policy rejection) is NOT a send:
+    // keep the row retryable after a delay, do NOT advance the prospect, do NOT bill. A failed
+    // first touch returns the prospect to `scored`. Unless the failure is specific to this one
+    // recipient (greylisted, mailbox full), the MAILBOX is held back too.
+    if (result.status === "failed") {
+      const failedRow = await tx.outreachMessages.update(messageId, {
+        status: "failed",
+        blockedReason: `send failed: ${result.reason ?? "transport error"}`,
+        nextAttemptAt: nextAttemptAfter(attempts, nowDate),
+      });
+      if (prospect.state === "queued") await tx.prospects.update(prospect.id, { state: "scored", updatedAt: now });
+      if (mailbox && result.failure !== "recipient") {
+        await recordSendFailure(txDeps, mailbox.id, result.reason ?? "transport error", nowDate);
+      }
+      return failedRow;
+    }
+
+    const sent = await tx.outreachMessages.update(messageId, {
+      status: "sent",
+      sentAt: now,
+      // Store the Message-Id that is on the wire: ours, unless the sender reports the id it
+      // actually used. Never a provider-internal API id (those carry no "@").
+      providerMessageId: result.messageId && result.messageId.includes("@") ? result.messageId : ourMessageId,
+      blockedReason: undefined,
+      nextAttemptAt: null,
+    });
+    const nextState = prospect.state === "queued" || prospect.state === "scored" ? "contacted" : "in_sequence";
+    await tx.prospects.update(prospect.id, { state: nextState, updatedAt: now });
+    await tx.usageEvents.insert({ id: newId("use"), merchantId: prospect.merchantId, kind: "send", quantity: 1, sourceId: message.id, ts: now });
+    // Meter LLM personalizations for plan-tier billing — one event per LLM-written email that
+    // actually went out (a row is sent at most once, so this cannot double-bill).
+    if (message.variant === "llm") {
+      await tx.usageEvents.insert({ id: newId("use"), merchantId: prospect.merchantId, kind: "personalization", quantity: 1, sourceId: message.id, ts: now });
+    }
+    if (mailbox) await recordSendSuccess(txDeps, mailbox.id);
+    return sent;
   });
-
-  const now = deps.clock.now().toISOString();
-  if (result.status === "bounced") {
-    await suppress(deps, { merchantId: prospect.merchantId, email: prospect.email, reason: "hard bounce", scope: "merchant" });
-    await deps.db.prospects.update(prospect.id, { state: "bounced", suppressionStatus: "bounced", updatedAt: now });
-    return deps.db.outreachMessages.update(messageId, { status: "bounced", sentAt: now });
-  }
-  // A transient transport failure (SMTP outage, expired token, network) is NOT a send: keep the
-  // message retryable, do NOT advance the prospect, do NOT bill. A failed first touch returns the
-  // prospect to `scored` so the next cycle retries with a fresh message.
-  if (result.status === "failed") {
-    if (prospect.state === "queued") await deps.db.prospects.update(prospect.id, { state: "scored", updatedAt: now });
-    return deps.db.outreachMessages.update(messageId, { status: "failed", blockedReason: `send failed: ${result.reason ?? "transport error"}` });
-  }
-
-  const nextState = prospect.state === "queued" ? "contacted" : "in_sequence";
-  await deps.db.prospects.update(prospect.id, { state: nextState, updatedAt: now });
-  await deps.db.usageEvents.insert({ id: newId("use"), merchantId: prospect.merchantId, kind: "send", quantity: 1, sourceId: message.id, ts: now });
-  return deps.db.outreachMessages.update(messageId, { status: "sent", sentAt: now, providerMessageId: result.messageId || undefined });
 }
 
 // ---- 5. Reply handling ------------------------------------------------------

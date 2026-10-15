@@ -11,6 +11,8 @@ import {
   ingestReplies,
   processInboundReply,
   sendReplyToProspect,
+  withMerchantLock,
+  nextSourcingAt,
 } from "@affiliate/recruitment";
 import { parseInboundWebhook } from "@affiliate/integrations";
 import { verifyHmacSignature, newId } from "@affiliate/core";
@@ -33,7 +35,9 @@ export const automationRoutes: RouteModule = (app, ctx) => {
   // ---- Automation control ---------------------------------------------------
   app.get("/recruitment/automation", async (request, reply) => {
     const { merchantId } = await requireMerchant(ctx, request, "read");
-    return ok(reply, await getAutomationState(ctx, merchantId));
+    const state = await getAutomationState(ctx, merchantId);
+    // Sourcing runs on its own interval (default daily); sends and reply ingestion every tick.
+    return ok(reply, { ...state, nextSourcingAt: nextSourcingAt(state)?.toISOString() ?? null });
   });
 
   app.put("/recruitment/automation", async (request, reply) => {
@@ -46,6 +50,8 @@ export const automationRoutes: RouteModule = (app, ctx) => {
         meetingTier: tier.optional(),
         aiSdrMode: z.enum(["hitl", "autopilot"]).optional(),
         sourcingLimitPerCycle: z.number().int().min(1).max(200).optional(),
+        // How often the (paid) sourcing run happens. Sends and replies are unaffected by it.
+        sourcingIntervalHours: z.number().min(1).max(24 * 30).optional(),
       }),
       request,
     );
@@ -64,10 +70,13 @@ export const automationRoutes: RouteModule = (app, ctx) => {
     return ok(reply, await setAutomationState(ctx, merchantId, { status: "paused" }));
   });
 
-  // Manually run one autonomous cycle now (the scheduler runs these on a cadence).
+  // Manually run one autonomous cycle now (the scheduler runs these on a cadence). The
+  // operator asked for it, so it sources regardless of the sourcing interval. Safe to press
+  // twice or while the scheduler is mid-cycle: everything that queues or sends is serialized
+  // per merchant, and the second run finds the first one's work already done.
   app.post("/recruitment/automation/cycle", async (request, reply) => {
     const { merchantId } = await requireMerchant(ctx, request, "write");
-    return ok(reply, await autonomousCycle(ctx, merchantId));
+    return ok(reply, await autonomousCycle(ctx, merchantId, { forceSourcing: true }));
   });
 
   // ---- Deliverability + source yield ---------------------------------------
@@ -203,14 +212,20 @@ export const automationRoutes: RouteModule = (app, ctx) => {
     const handoff = await ctx.db.handoffs.get(id);
     if (!handoff || handoff.merchantId !== merchantId) throw notFound("handoff");
     const body = parseBody(z.object({ reply: z.string().min(1) }), request);
-    const inboundReply = handoff.replyId ? await ctx.db.replies.get(handoff.replyId) : null;
-    const result = await sendReplyToProspect(ctx, {
-      prospectId: handoff.prospectId,
-      body: body.reply,
-      inReplyToMessageId: inboundReply?.inboundMessageId ?? null,
+    // Check-send-resolve as one step under the merchant's send lock: a double click (or two
+    // operators) sends the reply once — the second request finds the handoff resolved.
+    const updated = await withMerchantLock(ctx, merchantId, async () => {
+      const current = await ctx.db.handoffs.get(id);
+      if (!current || current.status !== "open") throw badRequest("this handoff is already resolved — nothing was sent");
+      const inboundReply = current.replyId ? await ctx.db.replies.get(current.replyId) : null;
+      const result = await sendReplyToProspect(ctx, {
+        prospectId: current.prospectId,
+        body: body.reply,
+        inReplyToMessageId: inboundReply?.inboundMessageId ?? null,
+      });
+      if (!result.sent) throw badRequest(`could not send: ${result.reason ?? "unknown"}`);
+      return ctx.db.handoffs.update(id, { status: "resolved", resolvedAt: ctx.clock.now().toISOString() });
     });
-    if (!result.sent) throw badRequest(`could not send: ${result.reason ?? "unknown"}`);
-    const updated = await ctx.db.handoffs.update(id, { status: "resolved", resolvedAt: ctx.clock.now().toISOString() });
     await writeAudit(ctx, { merchantId, actorId: null, action: "recruitment.handoff.replied", subjectType: "prospect", subjectId: handoff.prospectId, metadata: { handoffId: id } });
     return ok(reply, { sent: true, handoff: updated });
   });

@@ -144,12 +144,33 @@ export interface Mailbox {
   dailyCap: number;
   warmupStatus: "not_started" | "warming" | "ready";
   credentialsRef: string;
-  /** IMAP reply-poll cursor: replies are fetched with received-time > this. Advanced each poll. */
+  /** When the inbox was last read SUCCESSFULLY (the time cursor of the reply poll). */
   lastPolledAt?: Timestamp | null;
   /** When warmup started — the clock the warming→ready schedule (~21 days) counts from. */
   warmupStartedAt?: Timestamp | null;
   /** Set when the deliverability monitor auto-paused this mailbox (bounce breach). Cleared on resume. */
   autoPausedReason?: string | null;
+  // ---- AUDIT-2026-10 (outreach stream). All optional: rows written before it read as "unknown".
+  /**
+   * Health of this mailbox's INBOUND path, written by every reply poll (O5). "ok" = the last
+   * poll read the inbox · "error" = the last poll failed · "unavailable" = this rail cannot
+   * read replies at all (Gmail OAuth, SMTP without IMAP). Unset = never polled. Automated
+   * follow-ups go out only while it is "ok": a mailbox that cannot see replies or STOP
+   * requests must not keep emailing.
+   */
+  inboundStatus?: "ok" | "error" | "unavailable";
+  /** Why the inbound path is not working — shown to the operator. */
+  inboundError?: string | null;
+  /** Rail-specific resume position of the reply poll (IMAP UID position / Graph timestamp). */
+  inboundCursor?: string | null;
+  /** Consecutive transport failures on this mailbox; a successful send resets it (O2/O10). */
+  sendFailures?: number;
+  /** Sending through this mailbox is held until this time (exponential backoff on failures). */
+  sendBackoffUntil?: Timestamp | null;
+  /** The last transport failure, for the operator ("reconnect", "host limit reached"). */
+  lastSendError?: string | null;
+  /** Nonce of the OAuth connect request in flight; the callback consumes it (single use, O15). */
+  oauthNonce?: string | null;
 }
 
 export interface SendingDomain {
@@ -447,8 +468,21 @@ export interface OutreachMessage {
   status: "queued" | "sent" | "bounced" | "replied" | "failed";
   /** Why this message failed to send (content gate, transport failure, paused mailbox, …). */
   blockedReason?: string;
-  /** Provider Message-Id from the actual send — threads follow-ups + correlates replies. */
+  /** The RFC 5322 Message-Id WE stamped on this message (never a provider API id). Assigned
+   *  before the first transmission attempt and reused by a retry; threads follow-ups and
+   *  correlates replies and bounce notifications on every rail. */
   providerMessageId?: string;
+  // ---- AUDIT-2026-10 (outreach stream), all optional.
+  /** Transmission attempts made for this row. A retry re-sends the SAME row — it never
+   *  inserts (or re-personalizes, or re-bills) a new one. */
+  attempts?: number;
+  /** A failed transmission is not retried before this time (doubling delay per attempt). */
+  nextAttemptAt?: Timestamp | null;
+  /** Fingerprint of the campaign step copy this message was rendered from. A content-gate
+   *  block is held only while the copy is unchanged; edit the step and it is re-rendered. */
+  stepFingerprint?: string;
+  /** What a later delivery-status notification said about this message. */
+  deliveryError?: string;
 }
 
 export interface Reply {
@@ -460,6 +494,9 @@ export interface Reply {
   ts: Timestamp;
   /** Provider Message-Id of the inbound email (IMAP/webhook), for cross-tick dedup. */
   inboundMessageId?: string;
+  /** The address the reply came FROM when it is not the address we wrote to (an alias reply,
+   *  matched by its In-Reply-To/References). AUDIT-2026-10 O5. */
+  fromEmail?: string;
 }
 
 export interface Suppression {
@@ -531,6 +568,18 @@ export interface AutomationState {
    * safe to auto-send. Topic-gated/ungrounded replies ALWAYS go to a human regardless.
    */
   aiSdrMode?: "hitl" | "autopilot";
+  // ---- AUDIT-2026-10 (outreach stream), all optional.
+  /**
+   * Hours between SOURCING runs (default 24). The scheduler ticks every minute: sends,
+   * follow-ups and reply ingestion run on every tick, but the discovery query set is paid
+   * for per run, so it runs only when this interval has elapsed since `lastSourcedAt`.
+   */
+  sourcingIntervalHours?: number;
+  /** When sourcing last ran for this merchant (the cadence clock). */
+  lastSourcedAt?: Timestamp | null;
+  /** The last cycle error for this merchant, if its cycle threw (cleared by a clean cycle). */
+  lastError?: string | null;
+  lastErrorAt?: Timestamp | null;
 }
 
 /**

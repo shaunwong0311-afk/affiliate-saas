@@ -48,14 +48,21 @@ describe("AI-SDR reply routing", () => {
     expect(out.handoff?.suggestedReply).toContain("15%");
   });
 
-  it("auto-sends a deterministic allow-listed answer in autopilot mode (no handoff)", async () => {
+  // CHANGED by AUDIT-2026-10 O8. This test used to assert the defect: autopilot returned
+  // `autoSend: true` with NO handoff and nothing consuming the flag — the reply was stored
+  // and nobody, human or machine, ever answered it. Autopilot now either really sends (an
+  // emailed reply — see autopilot-send.test.ts) or hands off. A reply PASTED by the operator
+  // has no email to answer, so here it must produce a handoff carrying the answer.
+  it("autopilot never ends in silence: with no email to answer, the answer goes to a handoff", async () => {
     const p = await db.prospects.insert(prospect());
     const out = await handleReply(makeDeps(), p.id, "How long is the cookie window?", { aiSdrMode: "autopilot" });
     expect(out.action).toBe("ai_sdr");
-    expect(out.autoSend).toBe(true);
     expect(out.answer).toContain("30 days");
-    expect(out.handoff).toBeUndefined();
-    expect(await db.handoffs.count(() => true)).toBe(0);
+    expect(out.autoSend).toBe(false); // nothing was sent, so nothing claims to have been
+    expect(out.needsHuman).toBe(true);
+    expect(out.handoff?.reason).toBe("approval");
+    expect(out.handoff?.suggestedReply).toContain("30 days");
+    expect(await db.handoffs.count(() => true)).toBe(1);
   });
 
   it("routes an ungrounded open question to a human (no LLM wired → won't guess)", async () => {

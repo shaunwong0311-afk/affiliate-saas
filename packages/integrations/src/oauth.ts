@@ -61,6 +61,39 @@ export interface TokenSet {
   refreshToken: string | null;
   /** ISO timestamp when the access token expires. */
   expiresAt: string;
+  /**
+   * The address of the account that actually CONSENTED, read from the OpenID Connect
+   * `id_token` the token endpoint returns for the `openid email` scopes. Null when the
+   * provider returned none. The connect flow compares it with the mailbox being connected:
+   * consenting as a different account would otherwise send (and read mail) as someone else.
+   */
+  accountEmail?: string | null;
+  /** Every address-like identity claim of that account (`email`, `preferred_username`,
+   *  `upn`): a Microsoft sign-in name can differ from the mailbox's primary address. */
+  accountEmails?: string[];
+}
+
+/**
+ * The email claim of an OIDC `id_token`. The token is read, not signature-verified: it comes
+ * straight from the provider's token endpoint over TLS in the authorization-code flow, which
+ * OpenID Connect Core §3.1.3.7 accepts in place of checking the signature. Microsoft puts the
+ * sign-in address in `preferred_username` when `email` is absent.
+ */
+function accountEmailsFromIdToken(idToken: unknown): string[] {
+  if (typeof idToken !== "string") return [];
+  const payload = idToken.split(".")[1];
+  if (!payload) return [];
+  const found: string[] = [];
+  try {
+    const claims = JSON.parse(Buffer.from(payload, "base64url").toString("utf8")) as Record<string, unknown>;
+    for (const key of ["email", "preferred_username", "upn"]) {
+      const v = claims[key];
+      if (typeof v === "string" && /^[^\s@]+@[^\s@]+$/.test(v) && !found.includes(v.toLowerCase())) found.push(v.toLowerCase());
+    }
+  } catch {
+    /* not a JWT we can read → unknown */
+  }
+  return found;
 }
 
 async function postForm(url: string, form: Record<string, string>): Promise<{ status: number; json: any }> {
@@ -84,7 +117,8 @@ async function tokenRequest(cfg: OAuthProviderConfig, extra: Record<string, stri
   const j = res.json;
   if (!j?.access_token) throw new Error(`oauth token error (${res.status}): ${j?.error_description ?? j?.error ?? "no access_token"}`);
   const expiresAt = new Date(Date.now() + (Number(j.expires_in) || 3600) * 1000).toISOString();
-  return { accessToken: j.access_token, refreshToken: j.refresh_token ?? null, expiresAt };
+  const accountEmails = accountEmailsFromIdToken(j.id_token);
+  return { accessToken: j.access_token, refreshToken: j.refresh_token ?? null, expiresAt, accountEmail: accountEmails[0] ?? null, accountEmails };
 }
 
 /** Exchange the authorization code (from the callback) for the first token set. */

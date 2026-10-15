@@ -47,3 +47,41 @@ export function isGoodLocalSendTime(country: string | null | undefined, atUtc: D
   if (win.weekdaysOnly && (t.weekday === 0 || t.weekday === 6)) return false;
   return t.hour >= win.startHour && t.hour < win.endHour;
 }
+
+/**
+ * Whether to HOLD a send for the recipient's local time. Only when it is a poor local time
+ * now AND a good one is coming up inside the hours the campaign is allowed to send in
+ * (`windowOpen`). When the two never overlap — a campaign on Singapore business hours writing
+ * to US creators — holding would mean never sending, so the campaign's own window decides.
+ * Unknown geo never holds. Looks a week ahead so weekends are seen past.
+ */
+export function shouldDeferForLocalTime(
+  country: string | null | undefined,
+  atUtc: Date,
+  windowOpen: (at: Date) => boolean,
+  win: LocalSendWindow = DEFAULT_LOCAL_WINDOW,
+): boolean {
+  if (isGoodLocalSendTime(country, atUtc, win)) return false;
+  for (let h = 1; h <= 7 * 24; h++) {
+    const later = new Date(atUtc.getTime() + h * 3_600_000);
+    if (windowOpen(later) && isGoodLocalSendTime(country, later, win)) return true;
+  }
+  return false;
+}
+
+/**
+ * The same decision, remembered per country for one run: the answer depends only on the
+ * recipient's country, the clock and the campaign window, so it is worked out once.
+ */
+export function localTimeDeferral(atUtc: Date, windowOpen: (at: Date) => boolean): (country: string | null | undefined) => boolean {
+  const memo = new Map<string, boolean>();
+  return (country) => {
+    const key = (country ?? "").toUpperCase();
+    let defer = memo.get(key);
+    if (defer === undefined) {
+      defer = shouldDeferForLocalTime(country, atUtc, windowOpen);
+      memo.set(key, defer);
+    }
+    return defer;
+  };
+}

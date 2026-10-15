@@ -12,6 +12,9 @@ import { badRequest, notFound } from "../errors.js";
 import { writeAudit } from "../services/audit.js";
 import { assertWithinEntitlement, recordUsage } from "../services/entitlements.js";
 import { sendActivationEmail } from "../services/activation-email.js";
+// Campaign handlers (outreach fix stream) — a separate import so it does not collide with other
+// streams' edits to the import block above.
+import { isValidTimeZone } from "@affiliate/recruitment";
 
 const outcomeLabel = z.enum([
   "bad_fit",
@@ -23,10 +26,13 @@ const outcomeLabel = z.enum([
   "produced_sales",
 ]);
 
+// The window is measured in `timezone` (an IANA zone) — it is what the scheduler compares the
+// clock against, so an unknown zone is rejected here instead of silently meaning UTC.
+// `endHour` is exclusive; 24 means "until midnight" (0–24 = all day).
 const sendWindowSchema = z.object({
   startHour: z.number().int().min(0).max(23),
-  endHour: z.number().int().min(0).max(23),
-  timezone: z.string(),
+  endHour: z.number().int().min(0).max(24),
+  timezone: z.string().refine(isValidTimeZone, "must be an IANA time zone, e.g. America/Los_Angeles"),
 });
 
 const campaignSchema = z.object({
@@ -230,9 +236,18 @@ export const recruitmentRoutes: RouteModule = (app, ctx) => {
     return ok(reply, campaigns);
   });
 
+  /** A campaign may only send through a mailbox of ITS OWN merchant. (The id used to be
+   *  stored unchecked — a campaign could name another tenant's mailbox and send as them.) */
+  const assertOwnMailbox = async (merchantId: string, mailboxId: string | null | undefined): Promise<void> => {
+    if (!mailboxId) return;
+    const mailbox = await ctx.db.mailboxes.get(mailboxId);
+    if (!mailbox || mailbox.merchantId !== merchantId) throw badRequest("mailboxId does not name one of your mailboxes");
+  };
+
   app.post("/recruitment/campaigns", async (request, reply) => {
     const { merchantId } = await requireMerchant(ctx, request, "write");
     const body = parseBody(campaignSchema, request);
+    await assertOwnMailbox(merchantId, body.mailboxId);
     const campaign: OutreachCampaign = {
       id: newId("camp"),
       merchantId,
@@ -262,12 +277,18 @@ export const recruitmentRoutes: RouteModule = (app, ctx) => {
     if (!campaign || campaign.merchantId !== merchantId) throw notFound("campaign");
     const body = parseBody(
       z.object({
+        name: z.string().min(1).optional(),
         status: z.enum(["draft", "active", "paused", "archived"]).optional(),
         sequence: z.array(z.any()).optional(),
         dailyCap: z.number().int().min(1).max(10000).optional(),
+        // The window (with its time zone) and the mailbox are editable, not create-only: a
+        // campaign made before the zone was honored needs its zone corrected in place.
+        sendWindow: sendWindowSchema.optional(),
+        mailboxId: z.string().nullish(),
       }),
       request,
     );
+    await assertOwnMailbox(merchantId, body.mailboxId);
     const updated = await ctx.db.campaigns.update(id, body as Partial<OutreachCampaign>);
     return ok(reply, updated);
   });
@@ -538,17 +559,28 @@ export const recruitmentRoutes: RouteModule = (app, ctx) => {
     if (!step) throw badRequest("campaign has no sequence steps");
     const tokens = { name: "there", merchant: merchant.name, offer: merchant.niche ?? "our products", angle: "Your content is a great match for our products." };
     const mailbox = campaign.mailboxId ? await ctx.db.mailboxes.get(campaign.mailboxId) : null;
-    const sender = await ctx.mailboxResolver(campaign.mailboxId);
-    const results: Array<{ seed: string; status: string }> = [];
+    const results: Array<{ seed: string; status: string; reason?: string }> = [];
+    // A resolver failure is a failed seed send with its reason — never a 500, never the mock.
+    let sender;
+    try {
+      sender = await ctx.mailboxResolver(campaign.mailboxId);
+    } catch (e) {
+      const reason = `mailbox sender could not be resolved: ${e instanceof Error ? e.message : String(e)}`.slice(0, 200);
+      return ok(reply, { results: body.seeds.map((seed) => ({ seed, status: "failed", reason })), note: "Nothing was sent." });
+    }
     for (const seed of body.seeds) {
-      const r = await sender.send({
-        fromName: merchant.name,
-        fromEmail: mailbox?.email ?? `team@${merchant.name.toLowerCase().replace(/\s+/g, "")}.com`,
-        toEmail: seed,
-        subject: `[seed] ${renderTemplate(step.subject, tokens)}`,
-        body: renderTemplate(step.body, tokens),
-      });
-      results.push({ seed, status: r.status });
+      const r = await sender
+        .send({
+          fromName: merchant.name,
+          // The campaign mailbox's own address. Never an invented `team@<name>.com`: without a
+          // connected mailbox only the dev/test mock can send, from a reserved .invalid address.
+          fromEmail: mailbox?.email ?? "no-reply@example.invalid",
+          toEmail: seed,
+          subject: `[seed] ${renderTemplate(step.subject, tokens)}`,
+          body: renderTemplate(step.body, tokens),
+        })
+        .catch((e: unknown) => ({ status: "failed" as const, reason: e instanceof Error ? e.message : String(e) }));
+      results.push({ seed, status: r.status, ...(r.reason ? { reason: r.reason } : {}) });
     }
     await writeAudit(ctx, { merchantId, actorId: null, action: "recruitment.seed_test", subjectType: "campaign", subjectId: id, metadata: { count: body.seeds.length } });
     return ok(reply, { results, note: "Check each seed inbox for primary-vs-spam placement. Automated detection requires seed-inbox IMAP or a GlockApps integration." });

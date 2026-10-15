@@ -150,6 +150,15 @@ export async function processBacklog(deps: RecruitmentDeps, merchantId: string):
   return { enriched, scored };
 }
 
+// Imports for campaign launch (kept beside it: the outreach and discovery fix streams each own
+// one half of this module and should not both edit the import block at the top).
+import { outreachBlockedReason } from "./pipeline.js";
+import { withMerchantLock } from "./merchant-lock.js";
+import { localTimeDeferral } from "./send-timing.js";
+// (`isGoodLocalSendTime`, still imported at the top, is superseded here by `localTimeDeferral`;
+// that import line is left as it was so it cannot collide with another stream's edits and can
+// be dropped at merge.)
+
 export interface LaunchSummary {
   queued: number;
   sent: number;
@@ -173,10 +182,26 @@ export async function launchCampaign(
   campaignId: string,
   opts?: { minTier?: "A" | "B" | "C"; max?: number; respectLocalTime?: boolean },
 ): Promise<LaunchSummary> {
+  const found: OutreachCampaign = await deps.db.campaigns.require(campaignId);
+  // The whole launch runs under the merchant's send lock (AUDIT-2026-10 O3): a double-click,
+  // or a launch that overlaps the scheduler's cycle, waits its turn and then finds the
+  // prospects already contacted — instead of emailing them twice and overshooting the cap.
+  return withMerchantLock(deps, found.merchantId, () => launchCampaignLocked(deps, campaignId, opts));
+}
+
+async function launchCampaignLocked(
+  deps: RecruitmentDeps,
+  campaignId: string,
+  opts?: { minTier?: "A" | "B" | "C"; max?: number; respectLocalTime?: boolean },
+): Promise<LaunchSummary> {
   const campaign: OutreachCampaign = await deps.db.campaigns.require(campaignId);
   const now = deps.clock.now();
   const none: LaunchSummary = { queued: 0, sent: 0, bounced: 0, skipped: 0, deferred: 0 };
   if (!isWithinSendWindow(campaign, now)) return { ...none, blockedReason: "outside the campaign send window" };
+  // Compliance: nothing goes out without the merchant's postal address — say so up front
+  // rather than queue a list of messages that will each fail.
+  const compliance = outreachBlockedReason(await deps.db.merchants.require(campaign.merchantId));
+  if (compliance) return { ...none, blockedReason: compliance };
   const health = await deliverabilityHealth(deps, campaign.merchantId);
   if (health.circuitOpen) return { ...none, blockedReason: "deliverability circuit breaker is open" };
 
@@ -192,6 +217,7 @@ export async function launchCampaign(
   let bounced = 0;
   let skipped = 0;
   let deferred = 0;
+  const deferForLocalTime = localTimeDeferral(now, (at) => isWithinSendWindow(campaign, at));
   for (const p of ordered) {
     // The campaign mailbox's remaining warmup-ramped cap is re-checked per send, so repeated
     // manual launches can never exceed the mailbox's daily budget.
@@ -200,8 +226,9 @@ export async function launchCampaign(
       break;
     }
     // Send-time optimization: hold prospects whose local time isn't a good send window
-    // (picked up on the next run). Unknown geo never defers.
-    if (opts?.respectLocalTime && !isGoodLocalSendTime(p.country, now)) {
+    // (picked up on the next run) — when a good one will come up inside the campaign's own
+    // window; otherwise holding would mean never sending. Unknown geo never defers.
+    if (opts?.respectLocalTime && deferForLocalTime(p.country)) {
       deferred++;
       continue;
     }

@@ -1,6 +1,7 @@
 import { newId, newCode, buildActivationEmail, commissionLineFromOffer, firstSaleBonusText } from "@affiliate/core";
 import type { AffiliateCode, Offer } from "@affiliate/core";
 import { linkCode } from "@affiliate/tracking-edge";
+import { isSuppressed, withKeyLock } from "@affiliate/recruitment";
 import { signJwt } from "../auth/jwt.js";
 import { writeAudit } from "./audit.js";
 import type { AppContext } from "../context.js";
@@ -9,7 +10,6 @@ import type { AppContext } from "../context.js";
 const MAGIC_TTL_SECONDS = 7 * 24 * 3600;
 /** Fast-start window (days) — matches the activation "fast-start" metric. */
 const FAST_START_DAYS = 14;
-const ACTIVATION_FROM = "no-reply@vantage.dev";
 
 export interface ActivationEmailResult {
   sent: boolean;
@@ -21,15 +21,24 @@ export interface ActivationEmailResult {
  * §16 #4+#9). Resolves the real facts — a passwordless magic link, the pre-generated
  * site-wide tracking link, a personal attribution code, the actual commission line, and a
  * real first-sale bonus when one exists — then renders + sends via the transactional ESP
- * (never the box IP). IDEMPOTENT: stamps `activationEmailSentAt` and never re-sends. Called
- * from every path that turns a relationship active (approve, auto-apply, inbound join,
- * prospect conversion); safe to call redundantly.
+ * (never the box IP). IDEMPOTENT: stamps `activationEmailSentAt` and never re-sends — the
+ * check-send-stamp runs under a per-relationship lock, so two overlapping calls (a double
+ * click on approve) cannot both send. Called from every path that turns a relationship active
+ * (approve, auto-apply, inbound join, prospect conversion); safe to call redundantly.
+ *
+ * It is `sent` only when the ESP accepted it. With no ESP configured in production, or no
+ * sending identity (TRANSACTIONAL_FROM), the result is a failure with the reason and nothing
+ * is stamped — it used to "send" to the console and record a delivery that never happened.
  */
 export async function sendActivationEmail(
   ctx: AppContext,
   relationshipId: string,
   opts: { force?: boolean } = {},
 ): Promise<ActivationEmailResult> {
+  return withKeyLock(ctx, `activation-email:${relationshipId}`, () => sendActivationEmailLocked(ctx, relationshipId, opts));
+}
+
+async function sendActivationEmailLocked(ctx: AppContext, relationshipId: string, opts: { force?: boolean }): Promise<ActivationEmailResult> {
   const rel = await ctx.db.relationships.get(relationshipId);
   if (!rel) return { sent: false, reason: "relationship not found" };
   if (rel.status !== "active") return { sent: false, reason: "relationship not active" };
@@ -39,11 +48,19 @@ export async function sendActivationEmail(
   if (!affiliate || !affiliate.primaryEmail) return { sent: false, reason: "affiliate has no email" };
   const merchant = await ctx.db.merchants.get(rel.merchantId);
   if (!merchant) return { sent: false, reason: "merchant not found" };
+  // An address that unsubscribed, complained or hard-bounced gets NO mail from us — not this
+  // one either. The public join form takes any address, so without this check anyone could
+  // have a welcome email sent to a person who had opted out (AUDIT-2026-10 O13).
+  if (await isSuppressed(ctx, rel.merchantId, affiliate.primaryEmail)) {
+    return { sent: false, reason: "address is suppressed (unsubscribed or bounced) — not emailed" };
+  }
   const program = await ctx.db.programs.get(rel.programId);
 
   const appUrl = ctx.config.corsOrigins[0] ?? "http://localhost:5173";
 
   // 1) Passwordless magic link — the one-click CTA (7-day TTL; the verify route accepts it).
+  //    NOTE (AUDIT-2026-10 S8, security stream): tokens are becoming single-use behind a
+  //    helper that stream exposes — THIS is the minting call to swap for it.
   const magic = signJwt({ sub: affiliate.id, kind: "affiliate_magic", email: affiliate.primaryEmail }, ctx.config.jwtSecret, MAGIC_TTL_SECONDS);
   const magicLink = `${appUrl}/#/portal/verify?token=${magic}`;
   const portalUrl = `${appUrl}/#/portal`;
@@ -77,7 +94,9 @@ export async function sendActivationEmail(
     termsUrl: program?.termsUrl ?? null,
   });
 
-  const res = await ctx.transactionalMailer.send({ from: ACTIVATION_FROM, to: affiliate.primaryEmail, subject: email.subject, text: email.text });
+  // No `from` here: the mailer sends from the deployment's own verified identity
+  // (TRANSACTIONAL_FROM), shown under the merchant's name — never a hard-coded domain.
+  const res = await ctx.transactionalMailer.send({ fromName: merchant.name, to: affiliate.primaryEmail, subject: email.subject, text: email.text });
   if (res.status !== "sent") return { sent: false, reason: res.reason ?? "send failed" };
 
   const now = ctx.clock.now().toISOString();
