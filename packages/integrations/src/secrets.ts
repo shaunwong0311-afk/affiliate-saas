@@ -44,7 +44,8 @@ export interface SecretRepo {
  * process restart whenever the database does — without this, every connected mailbox's
  * `credentialsRef` dangles after a redeploy and outreach silently degrades to the mock
  * sender. The envelope is `v1:<iv>:<tag>:<ciphertext>` (base64url); the key is derived
- * from SECRETS_ENC_KEY (fall back: JWT_SECRET, which production already enforces strong).
+ * from the secret the caller resolves (the API passes SECRETS_ENC_KEY, else JWT_SECRET; an
+ * env var that is present but empty counts as unset, and production vets both at boot).
  */
 export class DbSecretStore implements SecretStore {
   private readonly key: Buffer;
@@ -52,6 +53,10 @@ export class DbSecretStore implements SecretStore {
     private readonly repo: SecretRepo,
     encryptionSecret: string,
   ) {
+    // Fail closed: an empty secret would silently derive the same well-known key everywhere.
+    if (typeof encryptionSecret !== "string" || encryptionSecret.trim() === "") {
+      throw new Error("DbSecretStore requires a non-empty encryption secret");
+    }
     this.key = createHash("sha256").update(encryptionSecret).digest();
   }
 

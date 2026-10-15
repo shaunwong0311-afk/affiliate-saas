@@ -33,17 +33,27 @@ export interface OrderNormalizer {
 }
 
 // ---- Payout rails (Section 4) ----------------------------------------------
+//
+// No custody: money never passes through the platform, and there are NO platform-wide rail
+// credentials. A payout is either MANUAL (the merchant pays from their own account and
+// marks it paid) or goes through an automated rail that the MERCHANT connected with their
+// own credentials. These types make the second case impossible to get wrong by accident:
+// a rail instance is bound to one merchant and refuses to pay for any other.
 export interface PayoutRequest {
   payoutId: string;
+  /** The merchant whose payout this is. Must be the merchant the rail is bound to. */
+  merchantId: string;
   affiliateId: string;
   accountRef: string;
   amountCents: number;
   currency: string;
+  /** The same key is sent again when the outcome of an attempt is unknown, so the rail can deduplicate. */
   idempotencyKey: string;
 }
 
 export interface PayoutResult {
   payoutId: string;
+  /** `processing`: accepted, outcome not known yet. A rail that THROWS has an unknown outcome too. */
   status: "paid" | "processing" | "failed";
   railReference: string | null;
   failureReason: string | null;
@@ -52,10 +62,32 @@ export interface PayoutResult {
 /** Orchestration without custody: the rail moves money, the platform conducts. */
 export interface PayoutRail {
   readonly rail: string;
+  /**
+   * The ONE merchant whose own credentials this instance holds. Null only for the dev mock,
+   * which holds no credentials and moves no money.
+   */
+  readonly merchantId: string | null;
   disburse(request: PayoutRequest): Promise<PayoutResult>;
   /** Verify a payout account is usable (KYC handled by the rail itself). */
   verifyAccount(accountRef: string): Promise<{ ok: boolean; reason?: string }>;
 }
+
+/** A merchant's OWN connection to an automated rail — never a platform account. */
+export interface MerchantRailCredentials {
+  merchantId: string;
+  rail: string;
+  /** The decrypted secret material of that merchant's connection (API key, client id/secret, …). */
+  secret: Record<string, string>;
+}
+
+/** Looks up one merchant's connection to one rail. Null = not connected → that payout is manual. */
+export type MerchantRailCredentialSource = (merchantId: string, rail: string) => Promise<MerchantRailCredentials | null>;
+
+/** Builds a rail instance bound to the merchant whose credentials it is given. */
+export type PayoutRailFactory = (credentials: MerchantRailCredentials) => PayoutRail;
+
+/** How a payout leaves: through a rail the merchant connected, or by the merchant's own hand. */
+export type ResolvedRail = { mode: "automated"; rail: PayoutRail } | { mode: "manual"; reason: string };
 
 // ---- Mailbox / sending (Section 8.4) ---------------------------------------
 export interface OutboundEmail {
@@ -66,24 +98,53 @@ export interface OutboundEmail {
   body: string;
   /** For threading follow-ups. */
   inReplyTo?: string | null;
-  /** A caller-supplied Message-Id to stamp on the outgoing MIME (rails that don't return one,
-   *  e.g. Graph, use this so follow-ups can still thread + replies can be correlated). */
+  /** Full References chain, oldest first (mail clients thread on it). Defaults to `inReplyTo`. */
+  references?: string[] | null;
+  /** OUR Message-Id (`<id@domain>`) to stamp on the outgoing message. Set by the pipeline on
+   *  every send so follow-ups thread and replies/bounces correlate on EVERY rail; a sender
+   *  generates one itself when the caller passes none. */
   messageId?: string;
   /** Extra RFC822 headers — e.g. the one-click List-Unsubscribe (RFC 8058) required by
    *  Gmail/Yahoo bulk-sender rules. Senders include these on the outgoing message. */
   headers?: Record<string, string>;
 }
 
+/**
+ * Why a send that did NOT go out failed. Only a permanent problem with the RECIPIENT's own
+ * address is a bounce; everything here is the sending side's (or a transient) problem and must
+ * never suppress the prospect:
+ *  - network: connection / DNS / TLS / timeout / provider 5xx
+ *  - auth: the mailbox's credentials or OAuth grant were refused (needs a reconnect)
+ *  - sender: the sending address/domain was rejected (MAIL FROM, relay denied)
+ *  - quota: provider or host sending limit reached
+ *  - policy: blocked for reputation/content/authentication policy
+ *  - recipient: a SOFT, recipient-specific condition (mailbox full, greylisted) — retry later
+ *  - config: the rail is not usable as configured (missing credentials, optional dep absent)
+ */
+export type SendFailureKind = "network" | "auth" | "sender" | "quota" | "policy" | "recipient" | "config" | "unknown";
+
 export interface SendResult {
+  /** The RFC 5322 Message-Id of the message that went out (ours — never a provider-internal
+   *  API id). "" when nothing was transmitted. */
   messageId: string;
+  /** sent = accepted for delivery · bounced = the RECIPIENT address is permanently bad ·
+   *  failed = not sent for any other reason (see `failure`). */
   status: "sent" | "bounced" | "failed";
   reason?: string;
+  /** Set on `failed` — drives mailbox backoff vs. a plain per-message retry. */
+  failure?: SendFailureKind;
 }
 
 export interface MailboxSender {
   readonly provider: string;
   send(email: OutboundEmail): Promise<SendResult>;
 }
+
+// The barrel (`index.ts`) is outside the outreach fix stream's ownership, and it star-exports
+// this file — so the inbound adapters/parsers added by AUDIT-2026-10 (O5/O6/O9) are surfaced
+// from here. Coordinator: these two lines can move into `index.ts` next to their modules.
+export { GraphReplyIngestion, parseDeliveryStatus, parseAddress, type DeliveryStatusReport, type GraphHttpClient } from "./reply-ingestion.js";
+export { buildRfc822, newMessageId, classifySmtpFailure, unavailableMailboxSender, type SmtpFailureInput } from "./mailbox.js";
 
 // ---- Email finding + verification (Section 8.2) ----------------------------
 export interface EmailCandidate {
@@ -95,6 +156,20 @@ export interface EmailCandidate {
 
 export interface EmailFinder {
   readonly name: string;
+  /**
+   * TRUE for a finder that FABRICATES plausible addresses instead of looking them up
+   * (the deterministic demo stub). The pipeline lets such a finder run only for
+   * synthetic (demo) prospects, never marks its output verified, and never lets it
+   * stand in as a verifier for a real prospect. Real finders leave this unset.
+   */
+  readonly guesses?: boolean;
+  /**
+   * FALSE when this finder cannot check deliverability at all (the "no finder
+   * configured" placeholder): its `verify` always says no, so it must not be consulted
+   * as the mailbox-level check — otherwise every address found on a page would be
+   * refused. Omitted = `verify` is a real check (Hunter).
+   */
+  readonly verifies?: boolean;
   find(input: { fullName?: string; domain?: string; siteUrl?: string }): Promise<EmailCandidate[]>;
   verify(email: string): Promise<{ deliverable: boolean; reason: string }>;
 }
@@ -107,6 +182,30 @@ export interface DiscoveryQuery {
   keywords: string[];
   channels: Array<"serp" | "youtube" | "blog" | "newsletter" | "podcast" | "community" | "social">;
   limit: number;
+  /**
+   * Which window of the query plan to run. A source that cannot afford its whole plan
+   * in one run (SERP: more planned queries than slots) uses this to cover a DIFFERENT
+   * slice each run, so every query gets its turn. Omitted → the source keeps its own
+   * per-merchant run counter. Set it to make a run reproducible.
+   */
+  rotation?: number;
+}
+
+/** A source-level problem worth telling the operator about (as opposed to "no results"). */
+export interface DiscoveryIssue {
+  sourceType: string;
+  /** Human-readable, safe to show: provider, HTTP status, the provider's own message. */
+  message: string;
+}
+
+/** Side channel a source reports through while it runs. */
+export interface DiscoveryHooks {
+  /**
+   * Called when part of a run FAILED — a provider rejected the key, the quota ran out, a
+   * request timed out. Sources isolate such failures and still return what they found;
+   * this is how the failure is kept from looking like an empty result.
+   */
+  onError?(issue: DiscoveryIssue): void;
 }
 
 export interface RawCandidate {
@@ -120,6 +219,13 @@ export interface RawCandidate {
   outboundLinks: string[];
   /** Raw page HTML (for contact extraction), if the source fetched it. */
   pageHtml?: string | null;
+  /**
+   * Contact addresses the SOURCE itself established as this candidate's own — a podcast
+   * feed's declared `<itunes:owner>` email, an address the merchant supplied on import.
+   * `source` says how (`"feed_owner"`, `"import"`). These are tried FIRST, ahead of
+   * anything scraped off a page. Never a guess.
+   */
+  contactEmails?: { email: string; source: string }[];
   reachHint?: number;
   /**
    * Domain authority (0..100) when the source already knows it — e.g. backlink mining
@@ -155,7 +261,12 @@ export interface EmailVerifier {
 
 export interface DiscoverySource {
   readonly sourceType: string;
-  discover(query: DiscoveryQuery): Promise<RawCandidate[]>;
+  /**
+   * Find candidates. A source isolates its own partial failures (one bad query does not
+   * sink the run) and reports them through `hooks.onError`; it THROWS only when it could
+   * do nothing at all, so the caller can tell "provider is refusing us" from "nothing found".
+   */
+  discover(query: DiscoveryQuery, hooks?: DiscoveryHooks): Promise<RawCandidate[]>;
 }
 
 // ---- Creator identity graph + audience (profile-graph plan) ----------------
@@ -189,7 +300,8 @@ export interface ProfileSource {
  * paid add (`source: "provider"`); this seam carries reach + engagement first. */
 export interface AccountMetrics {
   reach: number | null; // followers / subscribers
-  engagementRate: number | null; // 0..1, from recent public posts
+  /** Engagement as a FRACTION (0.03 = 3%), from recent public posts. null = not measured. */
+  engagementRate: number | null;
   primaryGeo: string | null; // the CREATOR's country, when exposed (not audience geo)
   language: string | null;
   source: "api" | "scrape" | "page" | "provider";
@@ -202,6 +314,12 @@ export interface AccountMetrics {
   /** Most recent content date (ISO) when the provider exposes it (YouTube upload, RSS
    * pubDate). Powers the activity-recency signal — a dead property scores lower. Null unknown. */
   lastContentAt?: string | null;
+  /**
+   * Other canonical URLs of THIS SAME account, when the platform reports them — a YouTube
+   * channel is both `/channel/UC…` and `/@handle`. Lets a back-link written in either
+   * form be recognized as pointing at the account.
+   */
+  aliases?: string[];
 }
 
 /**

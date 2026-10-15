@@ -4,13 +4,15 @@ import {
   detectAffiliateUrl,
   identifyProgram,
   backlinkTargetsFor,
+  hostIsOrUnder,
+  isNeverProspectHost,
   type AffiliateSignal,
   type BacklinkTarget,
   type ResolvedProgram,
 } from "@affiliate/core";
 import type { Database } from "@affiliate/db";
-import type { DiscoveryQuery, DiscoverySource, RawCandidate } from "./ports.js";
-import { DeterministicFetcher, type HttpFetcher } from "./http.js";
+import type { DiscoveryHooks, DiscoveryQuery, DiscoverySource, RawCandidate } from "./ports.js";
+import { DeterministicFetcher, ProviderError, ProxyUnavailableError, assertProviderOk, type HttpFetcher } from "./http.js";
 import { buildDiscoveryQueries } from "./query-strategy.js";
 import { extractHrefs } from "./web-evidence.js";
 
@@ -36,7 +38,54 @@ export interface SerpProvider {
   search(query: string, limit: number): Promise<SerpHit[]>;
 }
 
-/** Real SERP adapter skeleton (SerpApi-style). Requires an API key + HTTP client. */
+/**
+ * One discover() run's request outcomes. Sources isolate per-request failures (one bad
+ * query must not sink the run) — this keeps that isolation from HIDING them: partial
+ * failures are reported through the hooks, and a run in which every request failed
+ * throws, so "the provider is refusing us" never reads as "nothing found".
+ */
+class RunLog {
+  private succeeded = 0;
+  private readonly failures: { message: string; error: unknown }[] = [];
+  constructor(
+    private readonly sourceType: string,
+    private readonly hooks?: DiscoveryHooks,
+  ) {}
+
+  ok(): void {
+    this.succeeded++;
+  }
+
+  /** Record a failed request. Returns true when the rest of the run is pointless (bad key / quota). */
+  fail(what: string, error: unknown): boolean {
+    const detail = error instanceof Error ? error.message : String(error);
+    this.failures.push({ message: `${what}: ${detail}`, error });
+    return error instanceof ProviderError && error.kind !== "error";
+  }
+
+  /** Call once at the end: throw on total failure, otherwise report what went wrong. */
+  finish(): void {
+    if (this.failures.length === 0) return;
+    if (this.succeeded === 0) {
+      const first = this.failures[0]!;
+      if (first.error instanceof ProviderError) throw first.error;
+      throw new Error(`${this.sourceType}: all ${this.failures.length} request(s) failed — ${first.message}`, { cause: first.error });
+    }
+    for (const f of this.failures) this.hooks?.onError?.({ sourceType: this.sourceType, message: f.message });
+  }
+}
+
+/**
+ * Real SERP adapter (SerpApi-style). Requires an API key + HTTP client.
+ *
+ * UNVALIDATED against the live API (AUDIT-2026-10 D16). Two things to check on a first
+ * real run: (1) the error handling below assumes a rejected key / exhausted plan comes
+ * back as a non-2xx status and/or a body `error` string with no successful
+ * `search_metadata` — while a genuinely empty result set is a successful search that
+ * ALSO carries an `error` string ("Google hasn't returned any results…"), which must
+ * stay an empty list; (2) results are whatever SerpApi's default locale returns — no
+ * `gl`/`hl`/`location` is sent, so a non-US merchant gets US/English rankings.
+ */
 export class SerpApiProvider implements SerpProvider {
   readonly kind = "serpapi";
   constructor(private readonly opts: { apiKey: string; http?: { get(url: string): Promise<{ status: number; json: any }> } }) {}
@@ -45,9 +94,40 @@ export class SerpApiProvider implements SerpProvider {
     const res = await this.opts.http.get(
       `https://serpapi.com/search.json?engine=google&q=${encodeURIComponent(query)}&num=${limit}&api_key=${this.opts.apiKey}`,
     );
+    assertProviderOk("serpapi", res, (j) => j?.error);
+    const searched = res.json?.search_metadata?.status === "Success";
+    if (typeof res.json?.error === "string" && !searched && !Array.isArray(res.json?.organic_results)) {
+      throw new ProviderError("serpapi", 0, res.json.error.slice(0, 300));
+    }
     const organic = (res.json?.organic_results ?? []) as Array<{ title: string; link: string; snippet: string }>;
     return organic.slice(0, limit).map((r) => ({ title: r.title, url: r.link, snippet: r.snippet ?? "" }));
   }
+}
+
+/**
+ * DataForSEO reports most failures INSIDE an HTTP 200: a top-level `status_code` and a
+ * per-task `status_code`, where 20000 is success and 4xxxx/5xxxx are errors — 401xx an
+ * unauthorized login, 402xx payment / rate limit / "no subscription for this API" (the
+ * Backlinks API is a separate subscription). Reading only `tasks[0].result` made every
+ * one of those look like an empty result set.
+ *
+ * UNVALIDATED against the live API (AUDIT-2026-10 D16): the code ranges are from their
+ * documentation as remembered, so the auth/quota CLASSIFICATION below is a best effort —
+ * but any code ≥ 40000 is surfaced with the provider's own message either way.
+ */
+function dataForSeoItems(provider: string, res: { status: number; json: any }): any[] {
+  assertProviderOk(provider, res, (j) => j?.status_message ?? j?.tasks?.[0]?.status_message);
+  const kindOf = (code: number): "auth" | "quota" | "error" => (code >= 40100 && code < 40200 ? "auth" : code >= 40200 && code < 40300 ? "quota" : "error");
+  const top = res.json?.status_code;
+  if (typeof top === "number" && top >= 40000) {
+    throw new ProviderError(provider, 0, String(res.json?.status_message ?? `status_code ${top}`).slice(0, 300), kindOf(top));
+  }
+  const task = res.json?.tasks?.[0];
+  if (typeof task?.status_code === "number" && task.status_code >= 40000) {
+    throw new ProviderError(provider, 0, String(task.status_message ?? `task status_code ${task.status_code}`).slice(0, 300), kindOf(task.status_code));
+  }
+  const items = task?.result?.[0]?.items;
+  return Array.isArray(items) ? items : [];
 }
 
 /**
@@ -56,6 +136,10 @@ export class SerpApiProvider implements SerpProvider {
  * discovery (no separate SerpApi subscription). Live organic is ~$0.002/query — cheaper
  * than SerpApi — and returns the ranking URLs we then fetch + run the affiliate detector
  * over. Drops straight into SerpDiscoverySource (same SerpProvider port).
+ *
+ * Results are for ONE market: `locationCode` / `languageCode`, defaulting to United
+ * States / English. Nothing derives them from the merchant yet (AUDIT-2026-10 D16), so
+ * a non-US merchant is shown US rankings until the wiring passes its market in.
  */
 export class DataForSEOSerpProvider implements SerpProvider {
   readonly kind = "dataforseo-serp";
@@ -71,7 +155,7 @@ export class DataForSEOSerpProvider implements SerpProvider {
     };
     const headers = { Authorization: `Basic ${auth}`, "Content-Type": "application/json" };
     const res = this.opts.http ? await this.opts.http.post(url, [task], headers) : await postJson(url, [task], headers);
-    const items = (res.json?.tasks?.[0]?.result?.[0]?.items ?? []) as Array<{ type?: string; title?: string; url?: string; description?: string }>;
+    const items = dataForSeoItems("dataforseo-serp", res) as Array<{ type?: string; title?: string; url?: string; description?: string }>;
     return items
       .filter((i) => i.type === "organic" && i.url)
       .slice(0, limit)
@@ -165,6 +249,8 @@ export class SerpDiscoverySource implements DiscoverySource {
   readonly sourceType = "serp_mining";
   /** True when wired with deterministic providers (no real web data). */
   readonly synthetic: boolean;
+  /** Runs so far per merchant — slides the query window so every planned query gets its turn. */
+  private readonly runs = new Map<string, number>();
   constructor(
     private readonly serp: SerpProvider = new DeterministicSerpProvider(),
     private readonly fetcher: HttpFetcher = new DeterministicFetcher(),
@@ -173,13 +259,20 @@ export class SerpDiscoverySource implements DiscoverySource {
     this.synthetic = serp.kind === "deterministic-serp" || fetcher.kind === "deterministic";
   }
 
-  async discover(query: DiscoveryQuery): Promise<RawCandidate[]> {
-    // Prioritized, deduped, capped query set from the merchant ICP (competitor mining
-    // first, then buyer-intent, then platform-targeted creator discovery).
-    const plans = buildDiscoveryQueries(query, { max: this.opts.maxQueries });
+  async discover(query: DiscoveryQuery, hooks?: DiscoveryHooks): Promise<RawCandidate[]> {
+    // Prioritized, deduped, capped query set from the merchant ICP (competitor mining,
+    // buyer-intent, platform-targeted creator discovery). The plan is longer than the
+    // cap, so each run takes the next WINDOW of it (see query-strategy.ts).
+    const run = this.runs.get(query.merchantId) ?? 0;
+    this.runs.set(query.merchantId, run + 1);
+    const plans = buildDiscoveryQueries(query, { max: this.opts.maxQueries, rotation: query.rotation ?? run });
     const perQuery = Math.max(1, Math.ceil(query.limit / Math.max(1, plans.length)));
     const seen = new Set<string>();
     const out: RawCandidate[] = [];
+    const log = new RunLog(this.sourceType, hooks);
+    // A competitor's own site ranks first for "<competitor> review"; it is not a prospect.
+    const competitorHosts = query.competitors.map((c) => safeHost(c)?.toLowerCase()).filter((c): c is string => !!c);
+    let proxyDown = false;
 
     // Budget guard (Section 8.1): the platform-targeted creator queries (YouTube /
     // Substack / Reddit / podcast) sit at the TAIL of the priority list, so without a
@@ -200,13 +293,21 @@ export class SerpDiscoverySource implements DiscoverySource {
       let hits: SerpHit[];
       try {
         hits = await this.serp.search(plan.q, perQuery);
-      } catch {
-        continue; // isolate source failures (Section 8.1)
+        log.ok();
+      } catch (err) {
+        // Isolate the failure (Section 8.1) but keep it: a rejected key or spent quota
+        // makes every later query fail the same way, so stop paying for them.
+        if (log.fail(`query "${plan.q}"`, err)) break;
+        continue;
       }
       for (const hit of hits) {
         if (out.length >= query.limit) break;
-        const host = safeHost(hit.url);
+        const host = safeHost(hit.url)?.toLowerCase();
         if (!host) continue;
+        // Not prospects, so not worth a page fetch or a result slot: the competitor's own
+        // domain, and retailers / search / shorteners. (ingestCandidate enforces the same
+        // rule for every source; skipping here just saves the fetch.)
+        if (competitorHosts.some((c) => hostIsOrUnder(host, c)) || isNeverProspectHost(host)) continue;
         const key = candidateKey(hit.url) ?? host;
         if (seen.has(key)) continue; // platform-aware: distinct creators on a host survive
         seen.add(key);
@@ -225,15 +326,22 @@ export class SerpDiscoverySource implements DiscoverySource {
         let signals: AffiliateSignal[] = [];
         let pageHtml: string | null = null;
         let fetched = false;
-        try {
-          const page = await this.fetcher.get(hit.url);
-          if (page.status >= 200 && page.status < 300 && page.html && page.html.length > 200) {
-            pageHtml = page.html;
-            signals = detectAffiliateLinksInHtml(page.html);
-            fetched = true;
+        if (!proxyDown) {
+          try {
+            const page = await this.fetcher.get(hit.url);
+            if (page.status >= 200 && page.status < 300 && page.html && page.html.length > 200) {
+              pageHtml = page.html;
+              signals = detectAffiliateLinksInHtml(page.html, hit.url);
+              fetched = true;
+            }
+          } catch (err) {
+            // leave fetched=false, no links. A missing proxy path is a CONFIGURATION fault,
+            // not a flaky page: say so once and stop trying for the rest of the run.
+            if (err instanceof ProxyUnavailableError) {
+              proxyDown = true;
+              hooks?.onError?.({ sourceType: this.sourceType, message: `page fetches skipped — ${err.message}` });
+            }
           }
-        } catch {
-          /* leave fetched=false, no links */
         }
 
         out.push({
@@ -252,6 +360,7 @@ export class SerpDiscoverySource implements DiscoverySource {
         if (!isPlatform) primaryCount++;
       }
     }
+    log.finish();
     return out;
   }
 }
@@ -303,6 +412,13 @@ function hasExactParam(rawUrl: string, param: string, value: string): boolean {
 }
 
 // Build a DataForSEO OR-of-LIKE filter (capped at 8, their max combined filters).
+//
+// UNVALIDATED against the live API (AUDIT-2026-10 D16). This emits a FLAT chain —
+// [cond, "or", cond, "or", cond, …] — and DataForSEO's filter grammar may require more
+// than two conditions to be NESTED in pairs ([[cond, "or", cond], "or", cond]). If it
+// does, the apex query (which sends all 8 affiliate markers) is rejected with an
+// "invalid field"-style task error; that now surfaces as a ProviderError from
+// `dataForSeoItems` instead of an empty result, which is how you will find out.
 function orLikeFilter(field: string, values: string[]): unknown[] {
   const out: unknown[] = [];
   values.slice(0, 8).forEach((v, i) => {
@@ -316,8 +432,12 @@ interface PostJson {
   post(url: string, body: unknown, headers: Record<string, string>): Promise<{ status: number; json: any }>;
 }
 
+// Used when no HTTP client is injected. Fixed provider endpoint (not a scraped URL), so it
+// is not routed through the outbound guard — but it does get a deadline: a provider that
+// stops answering must not hang the whole sourcing run.
+const PROVIDER_TIMEOUT_MS = 30_000;
 async function postJson(url: string, body: unknown, headers: Record<string, string>): Promise<{ status: number; json: any }> {
-  const res = await fetch(url, { method: "POST", headers, body: JSON.stringify(body) });
+  const res = await fetch(url, { method: "POST", headers, body: JSON.stringify(body), signal: AbortSignal.timeout(PROVIDER_TIMEOUT_MS) });
   let json: any = null;
   try {
     json = await res.json();
@@ -357,7 +477,7 @@ export class DataForSEOBacklinkProvider implements BacklinkProvider {
     const body = [task];
     const headers = { Authorization: `Basic ${auth}`, "Content-Type": "application/json" };
     const res = this.opts.http ? await this.opts.http.post(url, body, headers) : await postJson(url, body, headers);
-    const items = (res.json?.tasks?.[0]?.result?.[0]?.items ?? []) as Array<{ url_from?: string; url_to?: string; anchor?: string; domain_from_rank?: number }>;
+    const items = dataForSeoItems("dataforseo-backlinks", res) as Array<{ url_from?: string; url_to?: string; anchor?: string; domain_from_rank?: number }>;
     return items
       .map((i) => ({ urlFrom: i.url_from ?? "", urlTo: i.url_to ?? "", anchor: i.anchor ?? null, domainFromRank: typeof i.domain_from_rank === "number" ? i.domain_from_rank : null }))
       .filter((r) => r.urlFrom && r.urlTo);
@@ -394,14 +514,18 @@ const AFFILIATE_CONTEXT = /affiliat|partner|refer/i;
 
 /**
  * Resolves a competitor domain to its affiliate program(s) — the network + merchant
- * id (or vanity host) needed to query the RIGHT backlinks. Tries a manual override
- * first, then reads the competitor's own site: the dedicated "Affiliates"/"Partners"
- * paths FIRST (a program link there is unambiguously theirs), the homepage only as a
- * context-guarded fallback. Cached per competitor with a TTL.
+ * id (or vanity host) needed to query the RIGHT backlinks — by reading the
+ * competitor's own site: the dedicated "Affiliates"/"Partners" paths FIRST (a program
+ * link there is unambiguously theirs), the homepage only as a context-guarded
+ * fallback. Cached per competitor with a TTL.
+ *
+ * There is no manual-override input: nothing stores per-merchant program ids yet, so
+ * the option that used to exist here was never passed (AUDIT-2026-10 D15). When that
+ * data exists, add it back as an explicit lookup that wins over the crawl.
  */
 export class CompetitorProgramResolver {
   private readonly cache = new Map<string, { programs: ResolvedProgram[]; expiresAt: number }>();
-  constructor(private readonly opts: { fetcher?: HttpFetcher; overrides?: Record<string, ResolvedProgram[]>; now?: () => number } = {}) {}
+  constructor(private readonly opts: { fetcher?: HttpFetcher; now?: () => number } = {}) {}
 
   private now(): number {
     return this.opts.now ? this.opts.now() : Date.now();
@@ -411,8 +535,7 @@ export class CompetitorProgramResolver {
     const domain = safeHost(competitor) ?? competitor.toLowerCase();
     const cached = this.cache.get(domain);
     if (cached && cached.expiresAt > this.now()) return cached.programs;
-    let programs = this.opts.overrides?.[domain] ?? [];
-    if (programs.length === 0 && this.opts.fetcher) programs = await this.fromSite(domain).catch(() => []);
+    const programs = this.opts.fetcher ? await this.fromSite(domain).catch(() => []) : [];
     const deduped = dedupePrograms(programs);
     this.cache.set(domain, { programs: deduped, expiresAt: this.now() + (deduped.length ? RESOLVER_HIT_TTL_MS : RESOLVER_MISS_TTL_MS) });
     return deduped;
@@ -516,17 +639,19 @@ export class BacklinkDiscoverySource implements DiscoverySource {
     this.synthetic = provider ? provider.kind === "deterministic-backlink" : false;
   }
 
-  async discover(query: DiscoveryQuery): Promise<RawCandidate[]> {
+  async discover(query: DiscoveryQuery, hooks?: DiscoveryHooks): Promise<RawCandidate[]> {
     if (!this.provider) return []; // not wired → honest empty
-    const competitors = query.competitors.map((c) => safeHost(c) ?? c.toLowerCase()).filter(Boolean);
+    const competitors = query.competitors.map((c) => (safeHost(c) ?? c).toLowerCase()).filter(Boolean);
     if (competitors.length === 0) return [];
 
     const perCompetitor = Math.max(1, Math.ceil(query.limit / competitors.length));
     const seen = new Set<string>();
     const out: RawCandidate[] = [];
+    const log = new RunLog(this.sourceType, hooks);
+    let stop = false;
 
     for (const competitor of competitors) {
-      if (out.length >= query.limit) break;
+      if (stop || out.length >= query.limit) break;
       // Resolve the program → precise backlink targets. Fall back to the apex domain.
       const programs = this.resolver ? await this.resolver.resolve(competitor).catch(() => []) : [];
       const targets = programs.flatMap((p) => backlinkTargetsFor(p, competitor));
@@ -546,7 +671,14 @@ export class BacklinkDiscoverySource implements DiscoverySource {
             perCompetitor * 4,
             networkTargeted ? { urlToContains: t.urlToContains } : { urlToContainsAny: AFFILIATE_MARKERS },
           );
-        } catch {
+          log.ok();
+        } catch (err) {
+          // Keep the failure (a missing Backlinks subscription used to read as "no
+          // affiliates"); a bad login or spent balance fails every later query too.
+          if (log.fail(`backlinks for ${t.target}`, err)) {
+            stop = true;
+            break;
+          }
           continue;
         }
         for (const row of rows) {
@@ -562,13 +694,21 @@ export class BacklinkDiscoverySource implements DiscoverySource {
             const th = safeHost(row.urlTo);
             if (!th || !competitors.some((c) => th === c || th.endsWith(`.${c}`))) continue;
           }
-          const host = safeHost(row.urlFrom);
-          if (!host || seen.has(host)) continue;
-          seen.add(host);
+          const host = safeHost(row.urlFrom)?.toLowerCase();
+          if (!host) continue;
+          // The competitor's own pages, and retailers / search / shorteners, are not affiliates.
+          if (competitors.some((c) => hostIsOrUnder(host, c)) || isNeverProspectHost(host)) continue;
+          // Platform-aware, like the SERP source: a referring page on youtube.com or
+          // reddit.com is ONE creator's page, not "youtube.com the website".
+          const key = candidateKey(row.urlFrom) ?? host;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          const isSocial = SOCIAL_HOSTS.includes(host);
+          const isPathPlatform = PATH_PLATFORM_HOSTS.includes(host);
           out.push({
-            identity: host,
-            siteUrl: `https://${host}`,
-            channelUrl: null,
+            identity: isPathPlatform ? key : host,
+            siteUrl: isSocial ? null : isPathPlatform ? cleanUrl(row.urlFrom) : `https://${host}`,
+            channelUrl: isSocial ? cleanUrl(row.urlFrom) : null,
             sourceType: this.sourceType,
             evidenceUrl: row.urlFrom,
             evidenceSummary: `Promotes ${competitor} with an affiliate link${row.anchor ? ` (anchor: "${row.anchor.slice(0, 60)}")` : ""} — a proven affiliate in your niche.`,
@@ -581,6 +721,7 @@ export class BacklinkDiscoverySource implements DiscoverySource {
         }
       }
     }
+    log.finish();
     return out;
   }
 }
@@ -641,12 +782,18 @@ interface SearchJsonHttp {
  * the distinct CHANNELS behind them. Reach / engagement / country are filled later for
  * free by {@link YouTubeEnricher} (the channel id flows through the identity graph).
  * Real source, key-gated; with no key it isn't wired at all (honest absence, not synthetic).
+ *
+ * QUOTA (AUDIT-2026-10 D16, unvalidated live): each `search.list` call costs 100 units
+ * of a 10,000-unit daily quota and this source makes up to `maxQueries` (default 3) per
+ * run — about 33 runs a day before the API answers 403 `quotaExceeded` for the rest of
+ * it. That 403 now stops the run and surfaces as a ProviderError rather than reading as
+ * "no creators"; the run cadence itself is the scheduler's job.
  */
 export class YouTubeDiscoverySource implements DiscoverySource {
   readonly sourceType = "youtube_discovery";
   constructor(private readonly opts: { apiKey: string; http: SearchJsonHttp; maxQueries?: number }) {}
 
-  async discover(query: DiscoveryQuery): Promise<RawCandidate[]> {
+  async discover(query: DiscoveryQuery, hooks?: DiscoveryHooks): Promise<RawCandidate[]> {
     const niche = (query.niche || "products").trim();
     const queries = [`${niche} review`, `best ${niche}`, ...query.competitors.slice(0, 2).map((c) => `${safeHost(c) ?? c} review`)]
       .filter(Boolean)
@@ -656,6 +803,7 @@ export class YouTubeDiscoverySource implements DiscoverySource {
     const seen = new Set<string>();
     const out: RawCandidate[] = [];
     const base = "https://www.googleapis.com/youtube/v3";
+    const log = new RunLog(this.sourceType, hooks);
 
     for (const q of queries) {
       if (out.length >= query.limit) break;
@@ -664,7 +812,10 @@ export class YouTubeDiscoverySource implements DiscoverySource {
         res = await this.opts.http.get(
           `${base}/search?part=snippet&type=video&order=relevance&maxResults=${perQuery}&q=${encodeURIComponent(q)}&key=${this.opts.apiKey}`,
         );
-      } catch {
+        assertYouTubeOk(res);
+        log.ok();
+      } catch (err) {
+        if (log.fail(`search "${q}"`, err)) break; // bad key / quota: every later query fails too
         continue; // isolate source failures (Section 8.1)
       }
       const items = (res.json?.items ?? []) as Array<{
@@ -691,8 +842,23 @@ export class YouTubeDiscoverySource implements DiscoverySource {
         });
       }
     }
+    log.finish();
     return out;
   }
+}
+
+/**
+ * The YouTube Data API reports failures as a non-2xx status with `{ error: { message,
+ * errors: [{ reason }] } }`. A spent quota is a 403 like a forbidden key, so the reason
+ * decides whether "wait" or "fix the key" is the right reading.
+ */
+export function assertYouTubeOk(res: { status: number; json: any }): void {
+  const err = res.json?.error;
+  if (res.status >= 200 && res.status < 300 && !err) return;
+  const reason = String(err?.errors?.[0]?.reason ?? "");
+  const detail = String(err?.message ?? "request rejected").replace(/<[^>]+>/g, "").slice(0, 300);
+  const kind = /quota|limit/i.test(reason) ? "quota" : res.status === 400 || res.status === 401 || res.status === 403 ? "auth" : "error";
+  throw new ProviderError("youtube", res.status, reason ? `${detail} [${reason}]` : detail, kind);
 }
 
 /** A creator returned by the scraping-API search actor (hashtag/keyword). */
@@ -717,13 +883,23 @@ interface ScrapedCreator {
  * RawCandidates with `channelUrl` set — the identity graph, ScrapeMetricsEnricher, and the
  * compliant DM-queue path take over from there. Key-gated: with no endpoint it isn't wired at
  * all (honest absence, never fabricated creators).
+ *
+ * UNVALIDATED request contract (AUDIT-2026-10 D16). No vendor is pinned, so the call
+ * below — `GET <endpoint>?type=search&platform=…&q=…&limit=…&token=…`, answered with an
+ * array (or `{data|results: [...]}`) of `{handle|username, followers|followerCount, …}` —
+ * is this codebase's OWN convention, not any vendor's documented API. ScrapeCreators,
+ * Social Fetch, Apify and the rest each use different paths, auth headers and field
+ * names; expect to write a thin adapter (or a proxy endpoint that speaks this shape)
+ * before the first real run. A non-2xx answer is surfaced as a ProviderError.
  */
 export class SocialCreatorDiscoverySource implements DiscoverySource {
   readonly sourceType = "social_discovery";
   constructor(private readonly opts: { endpoint?: string; apiKey?: string; http?: SearchJsonHttp; platforms?: string[]; maxQueries?: number }) {}
 
-  async discover(query: DiscoveryQuery): Promise<RawCandidate[]> {
+  async discover(query: DiscoveryQuery, hooks?: DiscoveryHooks): Promise<RawCandidate[]> {
     if (!this.opts.endpoint || !this.opts.http) return []; // not wired → honest empty, never invented
+    const log = new RunLog(this.sourceType, hooks);
+    let stop = false;
     const platforms = this.opts.platforms ?? ["instagram", "tiktok"];
     const niche = (query.niche || "products").trim();
     // Niche keyword + competitor brand tokens as search terms (hashtag-style).
@@ -736,6 +912,7 @@ export class SocialCreatorDiscoverySource implements DiscoverySource {
     const out: RawCandidate[] = [];
 
     for (const platform of platforms) {
+      if (stop) break;
       for (const term of terms) {
         if (out.length >= query.limit) break;
         let res: { status: number; json: any };
@@ -743,7 +920,13 @@ export class SocialCreatorDiscoverySource implements DiscoverySource {
           res = await this.opts.http.get(
             `${this.opts.endpoint}?type=search&platform=${platform}&q=${encodeURIComponent(term)}&limit=${perTerm}${this.opts.apiKey ? `&token=${this.opts.apiKey}` : ""}`,
           );
-        } catch {
+          assertProviderOk("scrape-api", res, (j) => j?.error?.message ?? j?.error ?? j?.message);
+          log.ok();
+        } catch (err) {
+          if (log.fail(`${platform} search "${term}"`, err)) {
+            stop = true;
+            break;
+          }
           continue; // isolate source failures (Section 8.1)
         }
         const creators = (res.json?.data ?? res.json?.results ?? res.json ?? []) as ScrapedCreator[];
@@ -774,6 +957,7 @@ export class SocialCreatorDiscoverySource implements DiscoverySource {
         }
       }
     }
+    log.finish();
     return out;
   }
 }

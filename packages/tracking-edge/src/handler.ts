@@ -61,6 +61,19 @@ export interface RedirectDecision {
 
 export const CLICK_COOKIE = "_aff_click";
 
+/**
+ * Decode the `:code` segment of `/c/:code`. Returns null for a malformed percent-escape
+ * (`/c/%E0%A4%A`), so every host answers 400 instead of letting `decodeURIComponent` throw
+ * inside its request listener.
+ */
+export function decodeLinkCode(raw: string): string | null {
+  try {
+    return decodeURIComponent(raw);
+  } catch {
+    return null;
+  }
+}
+
 export function createRedirectHandler(resolver: LinkResolver, sink: ClickSink) {
   return async function handleRedirect(input: RedirectInput): Promise<RedirectDecision> {
     const link = await resolver.resolve(input.code);

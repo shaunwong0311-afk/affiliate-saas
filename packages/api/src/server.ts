@@ -1,10 +1,11 @@
 import { buildApp } from "./app.js";
+import { positiveNumber } from "./config.js";
 import { seedDemo } from "./dev/seed.js";
 import { runScheduler } from "@affiliate/recruitment";
 import { createDatabaseFromEnv } from "@affiliate/db";
 
-const port = Number(process.env.PORT ?? 8787);
-const host = process.env.HOST ?? "0.0.0.0";
+const port = positiveNumber(process.env.PORT, 8787);
+const host = process.env.HOST || "0.0.0.0";
 
 async function start() {
   // Wire the real persistence: Postgres when DATABASE_URL/USE_POSTGRES is set
@@ -12,17 +13,27 @@ async function start() {
   const db = await createDatabaseFromEnv();
   const app = await buildApp({ db });
 
+  const { isProduction, trustProxy } = app.appContext.config;
+  if (isProduction && trustProxy === false) {
+    // eslint-disable-next-line no-console
+    console.warn(
+      "[boot] TRUST_PROXY is not set: the client address is the socket peer and X-Forwarded-For is ignored. " +
+        "Behind a reverse proxy or CDN that makes every request look like the proxy — all clients then share ONE " +
+        "rate-limit bucket. Set TRUST_PROXY to the proxy's address/range in that case.",
+    );
+  }
+
   // Optional: populate a demo tenant so the dashboards are not empty.
   if (process.env.SEED_DEMO === "true") {
     const creds = await seedDemo(app.appContext);
     // eslint-disable-next-line no-console
-    console.log(`seeded demo tenant — login: ${creds.email} / ${creds.password}`);
+    console.log(`${creds.alreadySeeded ? "demo tenant already present" : "seeded demo tenant"} — login: ${creds.email} / ${creds.password}`);
   }
 
   // Optional: run the autonomous recruitment scheduler in-process (dev). In
   // production this runs as a separate worker against Postgres/Redis.
   if (process.env.SCHEDULER === "true") {
-    const intervalMs = Number(process.env.SCHEDULER_INTERVAL_MS ?? 60_000);
+    const intervalMs = positiveNumber(process.env.SCHEDULER_INTERVAL_MS, 60_000);
     runScheduler(app.appContext, intervalMs);
     // eslint-disable-next-line no-console
     console.log(`recruitment scheduler running every ${intervalMs}ms`);

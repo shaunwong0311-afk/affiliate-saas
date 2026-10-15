@@ -99,7 +99,7 @@ export interface ApplyResult {
 export async function applyToJoin(
   deps: RecruitmentDeps,
   merchantId: string,
-  input: { email: string; name: string; socialUrl?: string; source?: string },
+  input: { email: string; name: string; socialUrl?: string; source?: string; prospectId?: string },
 ): Promise<ApplyResult | null> {
   const merchant = await deps.db.merchants.get(merchantId);
   if (!merchant) return null;
@@ -124,6 +124,11 @@ export async function applyToJoin(
     created = true;
   }
 
+  // The signup link we hand a prospect carries its id (`?p=`). Trust it only when it names a
+  // prospect of THIS merchant — it arrives from a public form.
+  const prospect = input.prospectId ? await deps.db.prospects.get(input.prospectId) : null;
+  const prospectId = prospect && prospect.merchantId === merchantId ? prospect.id : null;
+
   let rel = await deps.db.relationships.findOne((r) => r.affiliateId === affiliate!.id && r.merchantId === merchantId);
   if (!rel) {
     const status: "active" | "pending" = program.approvalMode === "auto" ? "active" : "pending";
@@ -136,11 +141,11 @@ export async function applyToJoin(
       joinedAt: now,
       role: "seller",
       commissionTerms: null,
-      source: input.source ?? "inbound_apply",
+      source: input.source ?? (prospect && prospectId ? prospect.source : "inbound_apply"),
       ownerUserId: null,
       tags: ["inbound"],
       sponsorAffiliateId: null,
-      prospectId: null,
+      prospectId,
     });
   }
   return { affiliateId: affiliate.id, relationshipId: rel.id, status: rel.status as "active" | "pending", created };

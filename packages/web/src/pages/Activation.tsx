@@ -1,5 +1,5 @@
 import { api, pct, num } from "../api";
-import { useApi, Card, Stat, Badge, PageHeader, EmptyState } from "../ui";
+import { useApi, Card, Stat, Badge, PageHeader, EmptyState, humanize } from "../ui";
 
 interface Recruit {
   affiliateId: string;
@@ -45,11 +45,12 @@ export function Activation() {
   const m = useApi<ActivationMetrics>(() => api.get("/recruitment/activation"));
   const campaigns = useApi<Campaign[]>(() => api.get("/recruitment/campaigns"));
   const active = (campaigns.data ?? []).find((c) => c.status === "active") ?? (campaigns.data ?? [])[0] ?? null;
-  const ab = useApi<AbRow[]>(() => (active ? api.get(`/recruitment/campaigns/${active.id}/ab`) : Promise.resolve([])), [active?.id]);
+  const ab = useApi<AbRow[]>(() => (active?.id ? api.get(`/recruitment/campaigns/${active.id}/ab`) : Promise.resolve([])), [active?.id]);
 
   if (m.loading) return null;
   if (m.error) return <div className="err-banner">{m.error}</div>;
   const d = m.data;
+  const recruits = d?.recruits ?? [];
   const bestAb = (ab.data ?? []).slice().sort((a, b) => b.replyRate - a.replyRate)[0];
 
   return (
@@ -103,17 +104,17 @@ export function Activation() {
 
       <div className="mt-24">
         <Card flush title="Recruits" sub="every affiliate traced back to the recruitment funnel">
-          {!d || d.recruits.length === 0 ? (
+          {recruits.length === 0 ? (
             <div style={{ padding: 20 }}><EmptyState title="No recruits yet" /></div>
           ) : (
             <table className="table">
               <thead><tr><th>Affiliate</th><th>Status</th><th>Fast-start</th><th className="num">Days → click</th><th className="num">Days → sale</th></tr></thead>
               <tbody>
-                {d.recruits.map((r) => (
-                  <tr key={r.relationshipId}>
-                    <td className="mono" style={{ fontSize: 12 }}>{r.affiliateId.slice(-8)}</td>
+                {recruits.map((r, i) => (
+                  <tr key={r.relationshipId ?? i}>
+                    <td className="mono" style={{ fontSize: 12 }}>{r.affiliateId ? r.affiliateId.slice(-8) : "—"}</td>
                     <td><Badge kind={r.status === "producing" ? "pos" : r.status === "activated" ? "info" : ""}>{r.status}</Badge></td>
-                    <td><Badge kind={r.fastStart === "earned" ? "pos" : r.fastStart === "in_window" ? "warn" : ""}>{r.fastStart.replace(/_/g, " ")}</Badge></td>
+                    <td><Badge kind={r.fastStart === "earned" ? "pos" : r.fastStart === "in_window" ? "warn" : ""}>{humanize(r.fastStart)}</Badge></td>
                     <td className="num">{r.daysToFirstClick != null ? r.daysToFirstClick.toFixed(1) : "—"}</td>
                     <td className="num">{r.daysToFirstSale != null ? r.daysToFirstSale.toFixed(1) : "—"}</td>
                   </tr>

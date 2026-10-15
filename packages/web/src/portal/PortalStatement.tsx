@@ -1,15 +1,22 @@
-import { useApi, Card, Stat, Spinner, ErrorBanner, PageHeader, Badge, EmptyState, statusKind } from "../ui";
+import { useApi, Card, Stat, Spinner, ErrorBanner, PageHeader, Badge, EmptyState, statusKind, humanize } from "../ui";
 import { api, money, num, shortDate } from "../api";
 import { navigate } from "../router";
 
+/** A ledger entry as the API returns it: the date is `ts`, and any human note lives in
+ *  `metadata.reason` (set on manual adjustments). There is no `createdAt`/`description`. */
 interface LedgerEntry {
   id: string;
   type: string;
   status: string;
   amountCents: number;
   currency: string;
-  description?: string | null;
-  createdAt: string | null;
+  ts?: string | null;
+  metadata?: Record<string, unknown> | null;
+}
+
+function entryDetail(e: LedgerEntry): string {
+  const reason = e.metadata?.["reason"];
+  return typeof reason === "string" && reason ? reason : "—";
 }
 
 interface Balance {
@@ -136,16 +143,16 @@ export function PortalStatement() {
                   return (
                     <tr key={e.id}>
                       <td>
-                        <Badge kind={statusKind(e.type)}>{e.type.replace(/_/g, " ")}</Badge>
+                        <Badge kind={statusKind(e.type)}>{humanize(e.type)}</Badge>
                       </td>
-                      <td className="muted" style={{ fontSize: 12.5 }}>{e.description ?? "—"}</td>
+                      <td className="muted" style={{ fontSize: 12.5 }}>{entryDetail(e)}</td>
                       <td>
-                        <Badge kind={statusKind(e.status)}>{e.status}</Badge>
+                        <Badge kind={statusKind(e.status)}>{humanize(e.status)}</Badge>
                       </td>
                       <td className={`num mono${negative ? " neg" : ""}`} style={{ fontWeight: 600 }}>
                         {money(e.amountCents, e.currency)}
                       </td>
-                      <td className="num muted" style={{ fontSize: 12 }}>{shortDate(e.createdAt)}</td>
+                      <td className="num muted" style={{ fontSize: 12 }}>{shortDate(e.ts)}</td>
                     </tr>
                   );
                 })}

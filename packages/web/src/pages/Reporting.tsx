@@ -1,5 +1,5 @@
 import { api, money, pct, num } from "../api";
-import { useApi, Card, Stat, Spinner, ErrorBanner, PageHeader, Badge, EmptyState } from "../ui";
+import { useApi, Card, Stat, Spinner, ErrorBanner, PageHeader, Badge, EmptyState, humanize } from "../ui";
 
 interface ProgramHealth {
   activeAffiliates: number;
@@ -147,7 +147,7 @@ export function Reporting() {
                         <div className="faint mono" style={{ fontSize: 11 }}>{r.status}</div>
                       </td>
                       <td>
-                        <Badge kind="info">{r.role.replace(/_/g, " ")}</Badge>
+                        <Badge kind="info">{humanize(r.role)}</Badge>
                       </td>
                       <td className="num">{num(r.clicks)}</td>
                       <td className="num">{num(r.conversions)}</td>

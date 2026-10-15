@@ -33,8 +33,13 @@ describe("LlmRelevanceScorer", () => {
     expect(await new LlmRelevanceScorer(fakeLlm("Score: 92")).score({ prospect: "p", merchant: "m" })).toBeCloseTo(0.92);
     expect(await new LlmRelevanceScorer(fakeLlm("1.5")).score({ prospect: "p", merchant: "m" })).toBe(1);
   });
-  it("returns 0 (no invented credit) when the model returns nothing parseable", async () => {
-    expect(await new LlmRelevanceScorer(fakeLlm("no idea")).score({ prospect: "p", merchant: "m" })).toBe(0);
+  it("returns null — UNKNOWN, not zero — when the model returns nothing parseable (D8)", async () => {
+    // It used to return 0, which scoring read as "this creator is irrelevant" (−20 points)
+    // when the truth was "we did not get an answer".
+    expect(await new LlmRelevanceScorer(fakeLlm("no idea")).score({ prospect: "p", merchant: "m" })).toBeNull();
+  });
+  it("still returns a real 0 when the model actually SAYS zero", async () => {
+    expect(await new LlmRelevanceScorer(fakeLlm("0.00")).score({ prospect: "p", merchant: "m" })).toBe(0);
   });
   it("caches per (prospect, merchant) so it doesn't re-pay", async () => {
     const llm = fakeLlm("0.5");
@@ -42,6 +47,16 @@ describe("LlmRelevanceScorer", () => {
     await s.score({ prospect: "p", merchant: "m" });
     await s.score({ prospect: "p", merchant: "m" });
     expect(llm.calls()).toBe(1);
+  });
+
+  it("keys the cache on the PAIR — two pairs whose texts merely concatenate the same never share an entry", async () => {
+    let n = 0;
+    const llm: LlmClient = { model: "counting", async complete() { return ++n === 1 ? "0.9" : "0.1"; } };
+    const s = new LlmRelevanceScorer(llm);
+    expect(await s.score({ merchant: "skincare brand", prospect: "review site" })).toBeCloseTo(0.9);
+    // Same words, split differently between merchant and prospect: a different question.
+    expect(await s.score({ merchant: "skincare", prospect: "brand review site" })).toBeCloseTo(0.1);
+    expect(n).toBe(2);
   });
 
   it("does NOT cache a transport failure — the next call re-attempts (and can succeed)", async () => {
@@ -55,7 +70,7 @@ describe("LlmRelevanceScorer", () => {
       },
     };
     const s = new LlmRelevanceScorer(llm);
-    expect(await s.score({ prospect: "p", merchant: "m" })).toBe(0); // outage → no credit, uncached
+    expect(await s.score({ prospect: "p", merchant: "m" })).toBeNull(); // outage → unknown (not 0), uncached
     expect(await s.score({ prospect: "p", merchant: "m" })).toBeCloseTo(0.7); // retried → real score
     expect(calls).toBe(2);
   });

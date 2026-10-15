@@ -121,7 +121,10 @@ describe("discovery honesty (pipeline)", () => {
   it("extracts a REAL contact email from page HTML and verifies it", async () => {
     const verifier: EmailVerifier = { kind: "mock", async verify() { return { deliverable: true, reason: "ok" }; } };
     const html = `<p>reach the editor at <a href="mailto:editor@realblog.com">email</a></p>`;
-    await runSourcing(deps([new StaticSource([cand({ identity: "Editor", pageHtml: html })])], { emailVerifier: verifier }), "m1", { limit: 5 });
+    // The prospect IS realblog.com. (The fixture used to leave the site at the default
+    // prospect.com, i.e. it asserted that an address at ANOTHER company's domain found on
+    // a page becomes the prospect's contact — the third-party adoption D2 forbids.)
+    await runSourcing(deps([new StaticSource([cand({ identity: "Editor", siteUrl: "https://realblog.com", evidenceUrl: "https://realblog.com/best", pageHtml: html })])], { emailVerifier: verifier }), "m1", { limit: 5 });
     const p = (await db.prospects.find((x) => x.merchantId === "m1"))[0]!;
     expect(p.email).toBe("editor@realblog.com");
     expect(p.evidence?.contactSource).toBe("page:mailto");
@@ -154,7 +157,10 @@ describe("discovery honesty (pipeline)", () => {
 
   it("builds a cross-platform identity graph from a linked Linktree", async () => {
     const homepage = `<html><body><a href="https://linktr.ee/creator">all my links</a></body></html>`;
-    const linktree = `<a href="https://youtube.com/@creator">yt</a><a href="https://x.com/creator">x</a><a href="https://creator.substack.com">news</a>`.padEnd(
+    // The Linktree lists the creator's site — the back-link that shows it is THEIR bio page
+    // (a bio page that is merely linked from somewhere is not trusted; see
+    // audit-2026-10-contact.test.ts).
+    const linktree = `<a href="https://creator.com">site</a><a href="https://youtube.com/@creator">yt</a><a href="https://x.com/creator">x</a><a href="https://creator.substack.com">news</a>`.padEnd(
       300,
       " ",
     );

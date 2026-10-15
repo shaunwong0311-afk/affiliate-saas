@@ -1,5 +1,6 @@
 import type { AccountEnricher, AccountMetrics } from "./ports.js";
-import type { HttpFetcher } from "./http.js";
+import { assertProviderOk, type HttpFetcher } from "./http.js";
+import { assertYouTubeOk } from "./discovery-real.js";
 
 /**
  * Per-platform account enrichers (profile-graph Phase 2). Each fills reach +
@@ -7,15 +8,33 @@ import type { HttpFetcher } from "./http.js";
  * on-page fetch (Substack), or a scraping-API actor (Instagram/TikTok/X). Public
  * counts only; audience demographics are a later, paid add. Real adapters are
  * key-gated; with no key/HTTP they return null (unknown), never invented numbers.
+ *
+ * Two rules every adapter here follows:
+ *  - a value the provider did not report stays `null`. It is never coerced to 0 — a
+ *    missing follower count is "unknown", and 0 would score as "nobody follows them".
+ *  - a provider that answers with an ERROR (bad key, quota, outage) makes the adapter
+ *    THROW. Returning null there would be cached as "this account has no data" for a day.
  */
 
 interface JsonHttp {
   get(url: string): Promise<{ status: number; json: any }>;
 }
 
+/**
+ * A finite number from a provider field, else null. `Number(null)` and `Number("")` are
+ * both 0, so absent/blank values are rejected explicitly rather than converted.
+ */
 function numOrNull(v: unknown): number | null {
-  const n = Number(v);
+  if (typeof v === "number") return Number.isFinite(v) ? v : null;
+  if (typeof v !== "string" || v.trim() === "") return null;
+  const n = Number(v.replace(/,/g, ""));
   return Number.isFinite(n) ? n : null;
+}
+
+/** A count: a non-negative number, else null. */
+function countOrNull(v: unknown): number | null {
+  const n = numOrNull(v);
+  return n != null && n >= 0 ? n : null;
 }
 
 // Scrape actors report geo/language inconsistently ("United States", "English", or an
@@ -73,11 +92,20 @@ export class YouTubeEnricher implements AccountEnricher {
     if (!sel) return null;
     const base = "https://www.googleapis.com/youtube/v3";
     const ch = await this.opts.http.get(`${base}/channels?part=snippet,statistics,contentDetails&${sel}&key=${this.opts.apiKey}`);
+    // A 403 quotaExceeded / invalid key has no `items` either — it must not be mistaken
+    // for "no such channel" (which would then be cached for a day).
+    assertYouTubeOk(ch);
     const item = ch.json?.items?.[0];
     if (!item) return null;
-    const reach = numOrNull(item.statistics?.subscriberCount);
+    // A channel can hide its subscriber count; the API then reports a meaningless figure.
+    const reach = item.statistics?.hiddenSubscriberCount === true ? null : countOrNull(item.statistics?.subscriberCount);
     const primaryGeo = item.snippet?.country ?? null;
     const language = item.snippet?.defaultLanguage ?? null;
+    // The same channel is addressable by id and by handle; report both so a back-link
+    // written either way is recognized. (`customUrl` is the handle, e.g. "@creator".)
+    const aliases: string[] = [];
+    if (typeof item.id === "string" && item.id) aliases.push(`https://www.youtube.com/channel/${item.id}`);
+    if (typeof item.snippet?.customUrl === "string" && item.snippet.customUrl.startsWith("@")) aliases.push(`https://www.youtube.com/${item.snippet.customUrl}`);
     // The channel DESCRIPTION is where creators put "Business: x@y.com" + their website.
     // YouTube's About-page email is captcha-gated, but the description comes free in this
     // same API call — the key to making website-less YouTube creators contactable.
@@ -90,23 +118,40 @@ export class YouTubeEnricher implements AccountEnricher {
     const uploads = item.contentDetails?.relatedPlaylists?.uploads;
     if (uploads) {
       const pl = await this.opts.http.get(`${base}/playlistItems?part=contentDetails&playlistId=${uploads}&maxResults=10&key=${this.opts.apiKey}`);
+      assertYouTubeOk(pl);
       // contentDetails carries videoPublishedAt — the most recent upload = the channel's freshness.
       const dates: number[] = (pl.json?.items ?? []).map((i: any) => new Date(i.contentDetails?.videoPublishedAt ?? "").getTime()).filter((t: number) => !Number.isNaN(t));
       if (dates.length) lastContentAt = new Date(Math.max(...dates)).toISOString();
       const ids: string[] = (pl.json?.items ?? []).map((i: any) => i.contentDetails?.videoId).filter(Boolean);
       if (ids.length) {
         const vs = await this.opts.http.get(`${base}/videos?part=statistics&id=${ids.join(",")}&key=${this.opts.apiKey}`);
+        assertYouTubeOk(vs);
         const rates: number[] = (vs.json?.items ?? [])
           .map((v: any) => {
-            const views = Number(v.statistics?.viewCount ?? 0);
-            const eng = Number(v.statistics?.likeCount ?? 0) + Number(v.statistics?.commentCount ?? 0);
-            return views > 0 ? eng / views : null;
+            // Views and likes must both be REPORTED. A creator can hide like counts (the
+            // field is then absent); treating that as 0 likes would understate engagement,
+            // so such a video is left out of the average instead. Comments switched off is
+            // genuinely zero comments.
+            const views = countOrNull(v.statistics?.viewCount);
+            const likes = countOrNull(v.statistics?.likeCount);
+            if (views == null || views === 0 || likes == null) return null;
+            return (likes + (countOrNull(v.statistics?.commentCount) ?? 0)) / views;
           })
           .filter((x: number | null): x is number => x != null);
         if (rates.length) engagementRate = rates.reduce((a: number, b: number) => a + b, 0) / rates.length;
       }
     }
-    return { reach, engagementRate, primaryGeo, language, source: "api", lastContentAt, emails: emails.length ? [...new Set(emails)] : undefined, links: links.length ? [...new Set(links)] : undefined };
+    return {
+      reach,
+      engagementRate,
+      primaryGeo,
+      language,
+      source: "api",
+      lastContentAt,
+      emails: emails.length ? [...new Set(emails)] : undefined,
+      links: links.length ? [...new Set(links)] : undefined,
+      aliases: aliases.length ? aliases : undefined,
+    };
   }
 }
 
@@ -115,6 +160,16 @@ export class YouTubeEnricher implements AccountEnricher {
  * scraping-API actor (Apify/ScrapingBee-style). Real-shaped skeleton: it calls a
  * configurable actor endpoint and normalizes the result. No demographics. Without an
  * endpoint/key wired it returns null (honest) rather than inventing numbers.
+ *
+ * UNVALIDATED request contract (AUDIT-2026-10 D16). No vendor is pinned: the call —
+ * `GET <endpoint>?platform=…&handle=…&url=…&token=…` answered with `{data: {followers,
+ * engagementRate, country, language}}` — is this codebase's OWN convention. Every real
+ * vendor differs in path, auth header and field names, so expect a thin adapter (or a
+ * proxy endpoint that speaks this shape) before the first real run. What is handled
+ * blind: a non-2xx answer throws; an absent field stays null; and an `engagementRate`
+ * outside 0..1 is treated as UNKNOWN — it is probably a percentage (3.2 meaning 3.2%),
+ * but dividing by 100 on a hunch would be inventing a number, so it is dropped until
+ * the vendor's unit is known.
  */
 export class ScrapeMetricsEnricher implements AccountEnricher {
   readonly kind = "scrape-api";
@@ -127,11 +182,13 @@ export class ScrapeMetricsEnricher implements AccountEnricher {
     const res = await this.opts.http.get(
       `${this.opts.endpoint}?platform=${account.platform}&handle=${encodeURIComponent(account.handle ?? "")}&url=${encodeURIComponent(account.url)}${this.opts.apiKey ? `&token=${this.opts.apiKey}` : ""}`,
     );
+    assertProviderOk("scrape-api", res, (j) => j?.error?.message ?? j?.error ?? j?.message);
     const d = res.json?.data ?? res.json;
-    if (!d) return null;
+    if (!d || typeof d !== "object") return null;
     // Normalize common actor field names.
-    const reach = numOrNull(d.followers ?? d.followerCount ?? d.subscribers);
-    const engagementRate = numOrNull(d.engagementRate ?? d.engagement_rate);
+    const reach = countOrNull(d.followers ?? d.followerCount ?? d.subscribers);
+    const rawRate = numOrNull(d.engagementRate ?? d.engagement_rate);
+    const engagementRate = rawRate != null && rawRate >= 0 && rawRate <= 1 ? rawRate : null;
     if (reach == null && engagementRate == null) return null;
     // Normalize geo/language to ISO so audienceOverlapScore compares like-for-like — an
     // un-mappable value stays null (honest unknown) rather than scoring as a fake mismatch.
@@ -197,11 +254,33 @@ export class CachingEnricher implements AccountEnricher {
     let metrics: AccountMetrics | null;
     try {
       metrics = await this.inner.enrich(account);
-    } catch {
-      return null; // transport error → don't poison the cache; the next call retries
+    } catch (err) {
+      // Transport OR provider error (bad key, quota, outage) → don't poison the cache; the
+      // next call retries. The reason is logged (rate-limited) because the caller only
+      // sees "unknown": a dead API key would otherwise be invisible.
+      this.warn(err);
+      return null;
+    }
+    // Bounded: drop what has expired, then the oldest, before the map can grow for ever.
+    if (this.cache.size >= CachingEnricher.MAX_ENTRIES) {
+      for (const [k, v] of this.cache) if (v.expiresAt <= now) this.cache.delete(k);
+      for (const k of this.cache.keys()) {
+        if (this.cache.size < CachingEnricher.MAX_ENTRIES) break;
+        this.cache.delete(k);
+      }
     }
     this.cache.set(key, { metrics, expiresAt: now + this.ttlMs });
     return metrics;
+  }
+
+  private static readonly MAX_ENTRIES = 20_000;
+  private lastWarnAt = 0;
+  private warn(err: unknown): void {
+    const now = Date.now();
+    if (now - this.lastWarnAt < 60_000) return;
+    this.lastWarnAt = now;
+    // eslint-disable-next-line no-console
+    console.warn(`[enrichment] audience lookup failed — the signal stays unknown: ${err instanceof Error ? err.message : String(err)}`);
   }
 }
 

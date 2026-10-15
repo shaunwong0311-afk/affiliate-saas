@@ -11,14 +11,14 @@ const email: OutboundEmail = {
 };
 
 /** A fake nodemailer transport that records calls and returns a scripted result. */
-function fakeTransport(opts: { rejected?: string[]; throwMsg?: string; verifyOk?: boolean } = {}) {
+function fakeTransport(opts: { rejected?: string[]; rejectedErrors?: Array<{ recipient?: string; responseCode?: number; response?: string }>; throwMsg?: string; verifyOk?: boolean } = {}) {
   const sent: any[] = [];
   const t: SmtpTransport & { sent: () => any[] } = {
     sent: () => sent,
     async sendMail(msg) {
       if (opts.throwMsg) throw new Error(opts.throwMsg);
       sent.push(msg);
-      return { messageId: "<abc@lumen.com>", accepted: ["creator@example.com"], rejected: opts.rejected ?? [] };
+      return { messageId: "<abc@lumen.com>", accepted: ["creator@example.com"], rejected: opts.rejected ?? [], ...(opts.rejectedErrors ? { rejectedErrors: opts.rejectedErrors } : {}) };
     },
     async verify() {
       if (opts.verifyOk === false) throw new Error("535 auth failed");
@@ -52,17 +52,38 @@ describe("SmtpSender", () => {
     expect(t.sent()[0]).toMatchObject({ inReplyTo: "<prev@x.com>", references: "<prev@x.com>" });
   });
 
-  it("returns bounced when the recipient is rejected by the server", async () => {
-    const sender = new SmtpSender({ host: "h", port: 587, user: "u", pass: "p" }, () => fakeTransport({ rejected: ["creator@example.com"] }));
-    const r = await sender.send(email);
-    expect(r.status).toBe("bounced");
+  // CHANGED by AUDIT-2026-10 O2. This test used to assert that ANY recipient the server refused
+  // at RCPT is a hard bounce. A refusal is a bounce only when the server says the ADDRESS is
+  // permanently bad; a greylist (4xx), a relay/policy refusal or a refusal with no stated
+  // reason is a failure to retry — the prospect must not be burned for it.
+  it("a recipient the server refused is a bounce only when the address itself is permanently bad", async () => {
+    const send = (rejectedErrors?: Array<{ recipient?: string; responseCode?: number; response?: string }>) =>
+      new SmtpSender({ host: "h", port: 587, user: "u", pass: "p" }, () => fakeTransport({ rejected: ["creator@example.com"], rejectedErrors })).send(email);
+
+    const unknown = await send([{ recipient: "creator@example.com", responseCode: 550, response: "550 5.1.1 <creator@example.com>: Recipient address rejected: User unknown in virtual mailbox table" }]);
+    expect(unknown.status).toBe("bounced");
+
+    const greylisted = await send([{ recipient: "creator@example.com", responseCode: 450, response: "450 4.7.1 <creator@example.com>: Recipient address rejected: Greylisted, try again later" }]);
+    expect(greylisted).toMatchObject({ status: "failed", failure: "recipient" });
+
+    const relayDenied = await send([{ recipient: "creator@example.com", responseCode: 554, response: "554 5.7.1 <creator@example.com>: Relay access denied" }]);
+    expect(relayDenied.status).toBe("failed");
+
+    const noReason = await send(undefined);
+    expect(noReason.status).toBe("failed");
   });
 
-  it("classifies a 5xx error as a hard bounce, other errors as transient failure", async () => {
-    const bounce = await new SmtpSender({ host: "h", port: 587, user: "u", pass: "p" }, () => fakeTransport({ throwMsg: "550 user unknown" })).send(email);
-    expect(bounce.status).toBe("bounced");
-    const fail = await new SmtpSender({ host: "h", port: 587, user: "u", pass: "p" }, () => fakeTransport({ throwMsg: "ETIMEDOUT connection" })).send(email);
-    expect(fail.status).toBe("failed");
+  // CHANGED by AUDIT-2026-10 O2. This test was titled "classifies a 5xx error as a hard bounce"
+  // — the defect itself: 553 sender-rejected, a 550 quota and a host limit all burned the
+  // prospect. Only a recipient-level permanent failure is a bounce (full table in
+  // send-classification.test.ts).
+  it("a 5xx is a hard bounce ONLY when it names the recipient's address; anything else is a failure", async () => {
+    const send = (throwMsg: string) => new SmtpSender({ host: "h", port: 587, user: "u", pass: "p" }, () => fakeTransport({ throwMsg })).send(email);
+    expect((await send("550 user unknown")).status).toBe("bounced");
+    expect((await send("ETIMEDOUT connection")).status).toBe("failed");
+    expect((await send("553 sender rejected")).status).toBe("failed");
+    expect((await send("550 5.4.5 Daily user sending quota exceeded")).status).toBe("failed");
+    expect((await send('550 "Domain lumen.com has exceeded the max emails per hour (25/25 (100%)) allowed.  Message discarded."')).status).toBe("failed");
   });
 
   it("never mistakes the SMTP port in a connection error for a 5xx bounce code", async () => {
@@ -80,9 +101,19 @@ describe("SmtpSender", () => {
         return true;
       },
     });
-    // Recipient-level 550 with a responseCode → hard bounce.
-    const rej = Object.assign(new Error("Recipient address rejected"), { responseCode: 550 });
+    // Recipient-level 550 with a responseCode → hard bounce. (CHANGED by AUDIT-2026-10 O2: the
+    // fixture used to be a bare "Recipient address rejected" + 550, which is also how Postfix
+    // prefixes its POLICY rejections — the reply now says what a real unknown-user reply says.)
+    const rej = Object.assign(new Error("Can't send mail - all recipients were rejected: 550 5.1.1 <creator@example.com>: Recipient address rejected: User unknown"), {
+      code: "EENVELOPE",
+      command: "RCPT TO",
+      responseCode: 550,
+      response: "550 5.1.1 <creator@example.com>: Recipient address rejected: User unknown",
+    });
     expect((await new SmtpSender({ host: "h", port: 587, user: "u", pass: "p" }, () => throwing(rej)).send(email)).status).toBe("bounced");
+    // The same prefix with a POLICY reason is not a bounce.
+    const policy = Object.assign(new Error("Recipient address rejected: Access denied"), { code: "EENVELOPE", command: "RCPT TO", responseCode: 554, response: "554 5.7.1 <creator@example.com>: Recipient address rejected: Access denied" });
+    expect((await new SmtpSender({ host: "h", port: 587, user: "u", pass: "p" }, () => throwing(policy)).send(email)).status).toBe("failed");
     // EAUTH carries a 535 responseCode but is a MAILBOX problem, not a recipient bounce.
     const auth = Object.assign(new Error("Invalid login: 535-5.7.8 Username and Password not accepted"), { code: "EAUTH", responseCode: 535 });
     expect((await new SmtpSender({ host: "h", port: 587, user: "u", pass: "p" }, () => throwing(auth)).send(email)).status).toBe("failed");
@@ -157,8 +188,18 @@ describe("buildMailboxSender", () => {
     expect(buildMailboxSender({ kind: "microsoft", accessToken: "t" }).provider).toBe("microsoft");
     expect(buildMailboxSender({ kind: "gmail_oauth", accessToken: "t" }).provider).toBe("gmail");
   });
-  it("falls back to the mock when credentials are incomplete", () => {
-    expect(buildMailboxSender({ kind: "smtp", host: "h" }).provider).toBe("mock"); // missing port/user/pass
-    expect(buildMailboxSender({ kind: "microsoft" }).provider).toBe("mock"); // no access token
+  // CHANGED by AUDIT-2026-10 O4. This test used to assert a fallback to the MOCK sender, which
+  // answers `sent` for mail that never leaves. Credentials that cannot build their rail now
+  // yield a sender that fails with the reason.
+  it("fails closed — never the mock — when credentials are incomplete", async () => {
+    const smtp = buildMailboxSender({ kind: "smtp", host: "h" }); // missing port/user/pass
+    const graph = buildMailboxSender({ kind: "microsoft" }); // no access token
+    for (const sender of [smtp, graph]) {
+      expect(sender.provider).not.toBe("mock");
+      const r = await sender.send(email);
+      expect(r.status).toBe("failed");
+      expect(r.messageId).toBe("");
+      expect(r.reason).toBeTruthy();
+    }
   });
 });

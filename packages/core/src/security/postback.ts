@@ -1,5 +1,9 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
 
+// Secret resolution / strength helpers live next door; re-exported here so they reach the
+// package entry point through the existing `./security/postback.js` export.
+export * from "./secrets.js";
+
 /**
  * Signed server-to-server postback (Section 6). The robust conversion path: the
  * merchant's server HMAC-signs the conversion payload with a per-merchant secret.

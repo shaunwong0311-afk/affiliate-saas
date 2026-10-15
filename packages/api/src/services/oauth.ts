@@ -1,4 +1,4 @@
-import { createHmac } from "node:crypto";
+import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { microsoftOAuth, googleOAuth, type OAuthProviderConfig } from "@affiliate/integrations";
 import type { AppConfig } from "../config.js";
 
@@ -18,10 +18,21 @@ interface StatePayload {
   merchantId: string;
   provider: OAuthProviderName;
   exp: number;
+  /**
+   * Single-use nonce. The connect request stores it on the mailbox (`oauthNonce`); the
+   * callback accepts a state only while it matches, and clears it. A signature and an expiry
+   * alone left the state replayable for its whole lifetime.
+   */
+  nonce: string;
 }
 
-export function signOAuthState(payload: Omit<StatePayload, "exp">, secret: string, ttlSeconds = 600): string {
-  const body = Buffer.from(JSON.stringify({ ...payload, exp: Math.floor(Date.now() / 1000) + ttlSeconds })).toString("base64url");
+/** A fresh nonce for one connect request. */
+export function newOAuthNonce(): string {
+  return randomBytes(18).toString("base64url");
+}
+
+export function signOAuthState(payload: Omit<StatePayload, "exp" | "nonce"> & { nonce?: string }, secret: string, ttlSeconds = 600): string {
+  const body = Buffer.from(JSON.stringify({ ...payload, nonce: payload.nonce ?? newOAuthNonce(), exp: Math.floor(Date.now() / 1000) + ttlSeconds })).toString("base64url");
   const sig = createHmac("sha256", secret).update(body).digest("base64url");
   return `${body}.${sig}`;
 }
@@ -29,11 +40,13 @@ export function signOAuthState(payload: Omit<StatePayload, "exp">, secret: strin
 export function verifyOAuthState(state: string, secret: string): StatePayload | null {
   const [body, sig] = state.split(".");
   if (!body || !sig) return null;
-  const expected = createHmac("sha256", secret).update(body).digest("base64url");
-  if (sig.length !== expected.length || sig !== expected) return null;
+  const expected = Buffer.from(createHmac("sha256", secret).update(body).digest("base64url"));
+  const given = Buffer.from(sig);
+  if (given.length !== expected.length || !timingSafeEqual(given, expected)) return null;
   try {
     const payload = JSON.parse(Buffer.from(body, "base64url").toString()) as StatePayload;
     if (payload.exp < Math.floor(Date.now() / 1000)) return null;
+    if (typeof payload.nonce !== "string" || !payload.nonce) return null;
     return payload;
   } catch {
     return null;

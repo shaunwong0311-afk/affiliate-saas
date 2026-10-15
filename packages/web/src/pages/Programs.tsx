@@ -1,34 +1,66 @@
 import { useState } from "react";
-import { api, money, pct, num } from "../api";
-import { useApi, Card, Spinner, ErrorBanner, PageHeader, Badge, EmptyState, Field, Modal, statusKind } from "../ui";
+import { api, errorMessage, money, pct, num } from "../api";
+import { parseAmountToCents } from "../amounts";
+import { useApi, Card, Spinner, ErrorBanner, PageHeader, Badge, EmptyState, Field, Modal, statusKind, humanize } from "../ui";
 
 interface Program {
   id: string;
   name: string;
   status: string;
-  approvalMode: string;
-  defaultCurrency: string;
-  attributionPriority: string;
-  holdDays: number;
+  approvalMode?: string | null;
+  defaultCurrency?: string | null;
+  attributionPriority?: string | null;
+  holdDays?: number | null;
 }
 
 interface Offer {
   id: string;
   name: string;
   payoutType: "percentage" | "flat";
+  /** A decimal rate for percentage offers (0.2 = 20%); integer cents for flat offers. */
   payoutValue: number;
   currency: string;
-  windowDays: number;
-  engine: string;
+  windowDays?: number | null;
+  engine?: string | null;
   status: string;
 }
 
 interface ProgramDetail extends Program {
-  offers: Offer[];
+  offers?: Offer[] | null;
 }
 
-const APPROVAL_MODES = ["auto", "manual"];
-const ATTRIBUTION = ["last_click", "first_click"];
+type PayoutType = "percentage" | "flat";
+
+/**
+ * The offer form takes what a person would type — "20" for 20%, "10.00" for a flat $10 —
+ * and converts to what the API stores: a decimal rate in (0, 1], or integer cents.
+ * Returns null while the text is not a usable value.
+ */
+function payoutValueFrom(type: PayoutType, text: string): number | null {
+  if (type === "flat") {
+    const cents = parseAmountToCents(text);
+    return cents !== null && cents > 0 ? cents : null;
+  }
+  const percent = Number(text.trim().replace(/%$/, "").replace(",", "."));
+  if (!text.trim() || !Number.isFinite(percent) || percent <= 0 || percent > 100) return null;
+  // Round at four decimals of rate (0.01%) to keep float noise out of the stored value.
+  return Math.round(percent * 100) / 10000;
+}
+
+const BLANK_OFFER = { name: "", payoutType: "percentage" as PayoutType, payoutText: "20", currency: "USD", windowDays: 30 };
+
+// The enums the programs route accepts (`routes/programs.ts`). The attribution values used
+// to be "last_click" / "first_click", which the API rejects — creating a program always failed.
+const APPROVAL_MODES: { value: string; label: string }[] = [
+  { value: "manual", label: "manual — you approve each applicant" },
+  { value: "auto", label: "auto — applicants are approved instantly" },
+  { value: "invite_only", label: "invite only — no public applications" },
+];
+const ATTRIBUTION: { value: string; label: string }[] = [
+  { value: "last_touch", label: "last touch — the most recent link or code wins" },
+  { value: "link_first", label: "link first — a tracked click beats a code" },
+  { value: "code_first", label: "code first — a code beats a tracked click" },
+];
 
 function payoutDisplay(o: Offer): string {
   return o.payoutType === "percentage" ? pct(o.payoutValue) : money(o.payoutValue, o.currency);
@@ -48,36 +80,33 @@ export function Programs() {
     name: "",
     approvalMode: "manual",
     defaultCurrency: "USD",
-    attributionPriority: "last_click",
+    attributionPriority: "last_touch",
     holdDays: 30,
   });
 
-  const [offerForm, setOfferForm] = useState({
-    name: "",
-    payoutType: "percentage" as "percentage" | "flat",
-    payoutValue: 0.2,
-    currency: "USD",
-    windowDays: 30,
-  });
+  const [offerForm, setOfferForm] = useState(BLANK_OFFER);
+  // Shown inside the open modal — an error on the page behind the overlay is invisible.
+  const [formErr, setFormErr] = useState<string | null>(null);
+  const offerPayout = payoutValueFrom(offerForm.payoutType, offerForm.payoutText);
 
   async function createProgram(e: React.FormEvent) {
     e.preventDefault();
     setBusy(true);
-    setErr(null);
+    setFormErr(null);
     try {
-      const created = await api.post<Program>("/programs", {
-        name: progForm.name,
+      const created = await api.post<Program | null>("/programs", {
+        name: progForm.name.trim(),
         approvalMode: progForm.approvalMode,
         defaultCurrency: progForm.defaultCurrency,
         attributionPriority: progForm.attributionPriority,
-        holdDays: Number(progForm.holdDays),
+        holdDays: Math.round(Number(progForm.holdDays)) || 0,
       });
       setShowNewProgram(false);
-      setProgForm({ name: "", approvalMode: "manual", defaultCurrency: "USD", attributionPriority: "last_click", holdDays: 30 });
+      setProgForm({ name: "", approvalMode: "manual", defaultCurrency: "USD", attributionPriority: "last_touch", holdDays: 30 });
       programs.reload();
       if (created?.id) setSelectedId(created.id);
-    } catch (e: any) {
-      setErr(e?.message ?? "Failed to create program");
+    } catch (e) {
+      setFormErr(errorMessage(e, "Failed to create program"));
     } finally {
       setBusy(false);
     }
@@ -85,27 +114,27 @@ export function Programs() {
 
   async function createOffer(e: React.FormEvent) {
     e.preventDefault();
-    if (!selectedId) return;
+    if (!selectedId || offerPayout === null) return;
     setBusy(true);
-    setErr(null);
+    setFormErr(null);
     try {
       await api.post(`/programs/${selectedId}/offers`, {
-        name: offerForm.name,
+        name: offerForm.name.trim(),
         engine: "affiliate",
         payoutType: offerForm.payoutType,
-        payoutValue: Number(offerForm.payoutValue),
+        payoutValue: offerPayout,
         currency: offerForm.currency,
-        windowDays: Number(offerForm.windowDays),
+        windowDays: Math.round(Number(offerForm.windowDays)) || 30,
         rules: [],
         tiers: [],
         bonuses: [],
         overridePolicy: null,
       });
       setShowNewOffer(false);
-      setOfferForm({ name: "", payoutType: "percentage", payoutValue: 0.2, currency: "USD", windowDays: 30 });
+      setOfferForm(BLANK_OFFER);
       detail.reload();
-    } catch (e: any) {
-      setErr(e?.message ?? "Failed to create offer");
+    } catch (e) {
+      setFormErr(errorMessage(e, "Failed to create offer"));
     } finally {
       setBusy(false);
     }
@@ -117,8 +146,8 @@ export function Programs() {
       await api.patch(`/programs/${p.id}`, { status });
       programs.reload();
       if (selectedId === p.id) detail.reload();
-    } catch (e: any) {
-      setErr(e?.message ?? "Failed to update status");
+    } catch (e) {
+      setErr(errorMessage(e, "Failed to update status"));
     }
   }
 
@@ -127,6 +156,18 @@ export function Programs() {
   const items = programs.data ?? [];
   const active = items.filter((p) => p.status === "active").length;
   const selected = detail.data;
+  const offers = selected?.offers ?? [];
+
+  function openNewProgram() {
+    setFormErr(null);
+    setShowNewProgram(true);
+  }
+  function openNewOffer() {
+    setFormErr(null);
+    // A new offer starts in the program's currency rather than a hard-coded one.
+    setOfferForm({ ...BLANK_OFFER, currency: selected?.defaultCurrency ?? BLANK_OFFER.currency });
+    setShowNewOffer(true);
+  }
 
   return (
     <>
@@ -135,7 +176,7 @@ export function Programs() {
         crumb="PROGRAM DESIGN"
         subtitle="A program is the contract: approval rules, currency, attribution, and hold. Offers are the levers — what you pay, how, and for how long the attribution window stays open."
         actions={
-          <button className="btn primary" onClick={() => setShowNewProgram(true)}>
+          <button className="btn primary" onClick={openNewProgram}>
             ＋ New program
           </button>
         }
@@ -165,7 +206,7 @@ export function Programs() {
         <EmptyState
           title="No programs yet"
           hint="Create your first program to define approval mode, default currency, attribution priority, and the hold window before commissions clear."
-          action={<button className="btn primary" onClick={() => setShowNewProgram(true)}>New program</button>}
+          action={<button className="btn primary" onClick={openNewProgram}>New program</button>}
         />
       ) : (
         <div className="grid grid-2">
@@ -190,12 +231,12 @@ export function Programs() {
                       <td>
                         <div style={{ fontWeight: 600 }}>{p.name}</div>
                         <div className="faint mono" style={{ fontSize: 11 }}>
-                          {p.defaultCurrency} · {p.attributionPriority.replace(/_/g, " ")}
+                          {p.defaultCurrency ?? "—"} · {humanize(p.attributionPriority)}
                         </div>
                       </td>
-                      <td className="muted" style={{ fontSize: 12 }}>{p.approvalMode}</td>
+                      <td className="muted" style={{ fontSize: 12 }}>{humanize(p.approvalMode)}</td>
                       <td><Badge kind={statusKind(p.status)}>{p.status}</Badge></td>
-                      <td className="num">{num(p.holdDays)}d</td>
+                      <td className="num">{p.holdDays != null ? `${num(p.holdDays)}d` : "—"}</td>
                     </tr>
                   ))}
                 </tbody>
@@ -226,22 +267,22 @@ export function Programs() {
               <div>
                 <div className="row gap-8" style={{ marginBottom: 16 }}>
                   <Badge kind={statusKind(selected.status)}>{selected.status}</Badge>
-                  <Badge kind="info">{selected.approvalMode} approval</Badge>
-                  <Badge>{selected.defaultCurrency}</Badge>
-                  <Badge>{selected.attributionPriority.replace(/_/g, " ")}</Badge>
-                  <Badge kind="warn">{selected.holdDays}d hold</Badge>
+                  <Badge kind="info">{humanize(selected.approvalMode)} approval</Badge>
+                  {selected.defaultCurrency && <Badge>{selected.defaultCurrency}</Badge>}
+                  <Badge>{humanize(selected.attributionPriority)}</Badge>
+                  {selected.holdDays != null && <Badge kind="warn">{selected.holdDays}d hold</Badge>}
                 </div>
 
                 <div className="row between" style={{ marginBottom: 8 }}>
-                  <div className="card-title" style={{ fontSize: 14 }}>Offers · {selected.offers.length}</div>
-                  <button className="btn sm" onClick={() => setShowNewOffer(true)}>＋ Add offer</button>
+                  <div className="card-title" style={{ fontSize: 14 }}>Offers · {offers.length}</div>
+                  <button className="btn sm" onClick={openNewOffer}>＋ Add offer</button>
                 </div>
 
-                {selected.offers.length === 0 ? (
+                {offers.length === 0 ? (
                   <EmptyState
                     title="No offers"
                     hint="Add an offer to define the payout — a percentage of order value or a flat amount per conversion — and the attribution window."
-                    action={<button className="btn primary sm" onClick={() => setShowNewOffer(true)}>Add offer</button>}
+                    action={<button className="btn primary sm" onClick={openNewOffer}>Add offer</button>}
                   />
                 ) : (
                   <table className="table">
@@ -255,7 +296,7 @@ export function Programs() {
                       </tr>
                     </thead>
                     <tbody>
-                      {selected.offers.map((o) => (
+                      {offers.map((o) => (
                         <tr key={o.id}>
                           <td>
                             <div style={{ fontWeight: 600 }}>{o.name}</div>
@@ -263,7 +304,7 @@ export function Programs() {
                           </td>
                           <td className="muted" style={{ fontSize: 12 }}>{o.payoutType}</td>
                           <td className="num mono">{payoutDisplay(o)}</td>
-                          <td className="num">{num(o.windowDays)}d</td>
+                          <td className="num">{o.windowDays != null ? `${num(o.windowDays)}d` : "—"}</td>
                           <td><Badge kind={statusKind(o.status)}>{o.status}</Badge></td>
                         </tr>
                       ))}
@@ -278,6 +319,7 @@ export function Programs() {
 
       <Modal open={showNewProgram} onClose={() => setShowNewProgram(false)} title="New program">
         <form onSubmit={createProgram}>
+          {formErr && <ErrorBanner message={formErr} />}
           <Field label="Name">
             <input
               className="input"
@@ -291,7 +333,7 @@ export function Programs() {
           <div className="grid grid-2">
             <Field label="Approval mode">
               <select className="select" value={progForm.approvalMode} onChange={(e) => setProgForm({ ...progForm, approvalMode: e.target.value })}>
-                {APPROVAL_MODES.map((m) => <option key={m} value={m}>{m}</option>)}
+                {APPROVAL_MODES.map((m) => <option key={m.value} value={m.value}>{m.label}</option>)}
               </select>
             </Field>
             <Field label="Default currency">
@@ -301,11 +343,11 @@ export function Programs() {
           <div className="grid grid-2">
             <Field label="Attribution priority">
               <select className="select" value={progForm.attributionPriority} onChange={(e) => setProgForm({ ...progForm, attributionPriority: e.target.value })}>
-                {ATTRIBUTION.map((a) => <option key={a} value={a}>{a.replace(/_/g, " ")}</option>)}
+                {ATTRIBUTION.map((a) => <option key={a.value} value={a.value}>{a.label}</option>)}
               </select>
             </Field>
-            <Field label="Hold days">
-              <input className="input" type="number" min={0} value={progForm.holdDays} onChange={(e) => setProgForm({ ...progForm, holdDays: Number(e.target.value) })} required />
+            <Field label="Hold days (0–180)">
+              <input className="input" type="number" min={0} max={180} step={1} value={progForm.holdDays} onChange={(e) => setProgForm({ ...progForm, holdDays: Number(e.target.value) })} required />
             </Field>
           </div>
           <div className="row gap-8 mt-16">
@@ -319,6 +361,7 @@ export function Programs() {
 
       <Modal open={showNewOffer} onClose={() => setShowNewOffer(false)} title="Add offer">
         <form onSubmit={createOffer}>
+          {formErr && <ErrorBanner message={formErr} />}
           <Field label="Name">
             <input
               className="input"
@@ -335,39 +378,50 @@ export function Programs() {
                 className="select"
                 value={offerForm.payoutType}
                 onChange={(e) => {
-                  const payoutType = e.target.value as "percentage" | "flat";
-                  setOfferForm({ ...offerForm, payoutType, payoutValue: payoutType === "percentage" ? 0.2 : 1000 });
+                  const payoutType = e.target.value as PayoutType;
+                  setOfferForm({ ...offerForm, payoutType, payoutText: payoutType === "percentage" ? "20" : "10.00" });
                 }}
               >
-                <option value="percentage">percentage</option>
-                <option value="flat">flat</option>
+                <option value="percentage">percentage of the order</option>
+                <option value="flat">flat amount per conversion</option>
               </select>
             </Field>
-            <Field label={offerForm.payoutType === "percentage" ? "Payout value (decimal, 0.2 = 20%)" : "Payout value (cents)"}>
+            {/* Typed in human units; converted to the API's decimal rate / integer cents on submit. */}
+            <Field label={offerForm.payoutType === "percentage" ? "Commission (%)" : `Amount per conversion (${offerForm.currency || "currency"})`}>
               <input
-                className="input"
-                type="number"
-                step={offerForm.payoutType === "percentage" ? "0.01" : "1"}
-                min={0}
-                value={offerForm.payoutValue}
-                onChange={(e) => setOfferForm({ ...offerForm, payoutValue: Number(e.target.value) })}
+                className="input mono"
+                inputMode="decimal"
+                value={offerForm.payoutText}
+                onChange={(e) => setOfferForm({ ...offerForm, payoutText: e.target.value })}
+                placeholder={offerForm.payoutType === "percentage" ? "20" : "10.00"}
+                aria-invalid={offerPayout === null}
+                style={{ borderColor: offerPayout === null ? "var(--neg)" : undefined }}
                 required
               />
             </Field>
           </div>
           <div className="grid grid-2">
             <Field label="Currency">
-              <input className="input" value={offerForm.currency} onChange={(e) => setOfferForm({ ...offerForm, currency: e.target.value.toUpperCase() })} maxLength={3} required />
+              <input className="input" value={offerForm.currency} onChange={(e) => setOfferForm({ ...offerForm, currency: e.target.value.toUpperCase() })} maxLength={3} minLength={3} required />
             </Field>
-            <Field label="Window days">
-              <input className="input" type="number" min={0} value={offerForm.windowDays} onChange={(e) => setOfferForm({ ...offerForm, windowDays: Number(e.target.value) })} required />
+            <Field label="Attribution window (days, 1–365)">
+              <input className="input" type="number" min={1} max={365} step={1} value={offerForm.windowDays} onChange={(e) => setOfferForm({ ...offerForm, windowDays: Number(e.target.value) })} required />
             </Field>
           </div>
           <div className="faint" style={{ fontSize: 11, marginTop: 4 }}>
-            Engine: affiliate · {offerForm.payoutType === "percentage" ? `pays ${pct(offerForm.payoutValue || 0)} of order value` : `pays ${money(offerForm.payoutValue || 0, offerForm.currency)} per conversion`}
+            {offerPayout === null ? (
+              <span className="neg">
+                {offerForm.payoutType === "percentage" ? "Enter a percentage above 0 and up to 100, e.g. 20." : "Enter an amount above zero, e.g. 10.00."}
+              </span>
+            ) : (
+              <>
+                Engine: affiliate ·{" "}
+                {offerForm.payoutType === "percentage" ? `pays ${pct(offerPayout)} of order value` : `pays ${money(offerPayout, offerForm.currency)} per conversion`}
+              </>
+            )}
           </div>
           <div className="row gap-8 mt-16">
-            <button type="submit" className="btn primary" disabled={busy || !offerForm.name.trim()}>
+            <button type="submit" className="btn primary" disabled={busy || !offerForm.name.trim() || offerPayout === null}>
               {busy ? "Adding…" : "Add offer"}
             </button>
             <button type="button" className="btn ghost" onClick={() => setShowNewOffer(false)}>Cancel</button>

@@ -3,15 +3,25 @@ import { createHmac, timingSafeEqual, randomBytes, scryptSync } from "node:crypt
 /**
  * Minimal HS256 JWT + password hashing using only node:crypto — no external auth
  * dependency. Two principal kinds share the mechanism: merchant `user` tokens and
- * `affiliate` portal tokens, discriminated by the `kind` claim.
+ * `affiliate` portal tokens, discriminated by the `kind` claim. (`affiliate_magic` and
+ * `user_invite` are emailed single-use link tokens — never a session.)
  */
 
-export type PrincipalKind = "user" | "affiliate" | "affiliate_magic";
+export type PrincipalKind = "user" | "affiliate" | "affiliate_magic" | "user_invite";
 
 export interface JwtClaims {
   sub: string; // user id or affiliate id
   kind: PrincipalKind;
   email?: string;
+  /** Single-use nonce of an emailed link token (`affiliate_magic`, `user_invite`) — see auth/single-use.ts. */
+  jti?: string;
+  /** The merchant a team-invite token (`user_invite`) invites its subject to. */
+  mid?: string;
+  /**
+   * Support session: the merchant and the user who are viewing the portal as affiliate `sub`
+   * (POST /admin/impersonate). Its presence makes the session read-only and merchant-scoped.
+   */
+  imp?: { merchantId: string; userId: string };
   iat: number;
   exp: number;
 }
@@ -64,15 +74,35 @@ export function verifyPassword(password: string, stored: string): boolean {
   return safeEqual(hash.toString("hex"), hashHex);
 }
 
+/** scrypt hash of a random password that was thrown away — only its cost matters. */
+const DUMMY_PASSWORD_HASH =
+  "scrypt$83dd8bc7145c05f6d9b60590251fd5ce$0d2238ac755ac6e3076aa0160701157d6598adae1b936cc62c23d9e55a63a96cf270d1ee361ce29bbf4a02f2e8def08a99423158561d9d62ae4284c8d3b1f9fe";
+
+/**
+ * Check a login password in the same time whether or not there is anything to check it
+ * against. For an unknown email (or an invitee with no password yet) the same scrypt work is
+ * spent on a dummy hash and the answer is always false — otherwise the response time tells
+ * a caller which addresses are registered.
+ */
+export function verifyPasswordOrDummy(password: string, stored: string | null | undefined): boolean {
+  if (!stored || !stored.startsWith("scrypt$")) {
+    verifyPassword(password, DUMMY_PASSWORD_HASH);
+    return false;
+  }
+  return verifyPassword(password, stored);
+}
+
 // ---- API key hashing --------------------------------------------------------
-export function generateApiKey(): { plaintext: string; prefix: string; hashed: string } {
+// The stored value is an HMAC of the key under `pepper` (config: API_KEY_PEPPER, else derived
+// from JWT_SECRET) — a database dump alone is not enough to test candidate keys offline.
+export function generateApiKey(pepper: string): { plaintext: string; prefix: string; hashed: string } {
   const raw = randomBytes(24).toString("base64url");
   const prefix = `ak_${raw.slice(0, 6)}`;
   const plaintext = `${prefix}.${raw}`;
-  const hashed = createHmac("sha256", "apikey-pepper").update(plaintext).digest("hex");
-  return { plaintext, prefix, hashed };
+  return { plaintext, prefix, hashed: hashApiKey(plaintext, pepper) };
 }
 
-export function hashApiKey(plaintext: string): string {
-  return createHmac("sha256", "apikey-pepper").update(plaintext).digest("hex");
+export function hashApiKey(plaintext: string, pepper: string): string {
+  if (!pepper) throw new Error("API-key hashing needs a configured pepper");
+  return createHmac("sha256", pepper).update(plaintext).digest("hex");
 }

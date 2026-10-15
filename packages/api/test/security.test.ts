@@ -32,12 +32,16 @@ beforeAll(async () => {
   app = await buildApp();
   ownerA = await signup("owner-a@test.dev", "Merchant A");
   userB = await signup("user-b@test.dev", "Merchant B"); // owner of B, will be admin of A
-  // Owner of A adds userB to merchant A as an admin.
-  await call("POST", `/merchants/${ownerA.merchantId}/users`, {
+  // Owner of A invites userB to merchant A as an admin. An existing account is no longer
+  // added on the spot (whoever registered the address first would get the role): userB
+  // accepts with the emailed single-use token + their own session. Outside production the
+  // token is also in the response.
+  const invited = await call("POST", `/merchants/${ownerA.merchantId}/users`, {
     token: ownerA.token,
     merchantId: ownerA.merchantId,
     body: { email: "user-b@test.dev", name: "User B", role: "admin" },
   });
+  await call("POST", "/auth/accept-invite", { token: userB.token, body: { token: invited.data.devInviteToken } });
   const login = await call("POST", "/auth/login", { body: { email: "user-b@test.dev", password: "supersecret" } });
   adminToken = login.data.token;
 });
@@ -84,13 +88,23 @@ describe("cross-tenant isolation", () => {
   });
 });
 
-describe("global suppression requires elevated capability", () => {
-  it("an admin can create a global suppression but a manager cannot", async () => {
+describe("global suppression is not available to tenants", () => {
+  // Was: "an admin can create a global suppression" (expected 200/201). That WAS the defect
+  // (AUDIT-2026-10 S2): every signed-up account is an admin of its own merchant, so any
+  // account could silence a domain for every tenant. Details: suppression-scope.test.ts.
+  it("no tenant role — not even an admin — can create a global suppression", async () => {
     const asAdmin = await call("POST", "/recruitment/suppressions", {
       token: adminToken,
       merchantId: ownerA.merchantId,
       body: { domain: "spam.example", scope: "global" },
     });
-    expect([200, 201]).toContain(asAdmin.status);
+    expect(asAdmin.status).toBe(403);
+    const merchantScoped = await call("POST", "/recruitment/suppressions", {
+      token: adminToken,
+      merchantId: ownerA.merchantId,
+      body: { domain: "spam.example" },
+    });
+    expect(merchantScoped.status).toBe(201);
+    expect(merchantScoped.data.scope).toBe("merchant");
   });
 });

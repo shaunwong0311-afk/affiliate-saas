@@ -144,12 +144,33 @@ export interface Mailbox {
   dailyCap: number;
   warmupStatus: "not_started" | "warming" | "ready";
   credentialsRef: string;
-  /** IMAP reply-poll cursor: replies are fetched with received-time > this. Advanced each poll. */
+  /** When the inbox was last read SUCCESSFULLY (the time cursor of the reply poll). */
   lastPolledAt?: Timestamp | null;
   /** When warmup started — the clock the warming→ready schedule (~21 days) counts from. */
   warmupStartedAt?: Timestamp | null;
   /** Set when the deliverability monitor auto-paused this mailbox (bounce breach). Cleared on resume. */
   autoPausedReason?: string | null;
+  // ---- AUDIT-2026-10 (outreach stream). All optional: rows written before it read as "unknown".
+  /**
+   * Health of this mailbox's INBOUND path, written by every reply poll (O5). "ok" = the last
+   * poll read the inbox · "error" = the last poll failed · "unavailable" = this rail cannot
+   * read replies at all (Gmail OAuth, SMTP without IMAP). Unset = never polled. Automated
+   * follow-ups go out only while it is "ok": a mailbox that cannot see replies or STOP
+   * requests must not keep emailing.
+   */
+  inboundStatus?: "ok" | "error" | "unavailable";
+  /** Why the inbound path is not working — shown to the operator. */
+  inboundError?: string | null;
+  /** Rail-specific resume position of the reply poll (IMAP UID position / Graph timestamp). */
+  inboundCursor?: string | null;
+  /** Consecutive transport failures on this mailbox; a successful send resets it (O2/O10). */
+  sendFailures?: number;
+  /** Sending through this mailbox is held until this time (exponential backoff on failures). */
+  sendBackoffUntil?: Timestamp | null;
+  /** The last transport failure, for the operator ("reconnect", "host limit reached"). */
+  lastSendError?: string | null;
+  /** Nonce of the OAuth connect request in flight; the callback consumes it (single use, O15). */
+  oauthNonce?: string | null;
 }
 
 export interface SendingDomain {
@@ -185,26 +206,58 @@ export interface Customer {
 }
 
 // ---- Payouts ----------------------------------------------------------------
+/**
+ * A batch's status is derived from its payouts: `draft` until approved, `processing`
+ * while any payout is still outstanding, then `paid`, `failed` (at least one payout
+ * failed) or `cancelled` (nothing left in it).
+ */
 export interface PayoutBatch {
   id: Id;
   merchantId: Id;
   rail: string;
   currency: CurrencyCode;
-  status: "draft" | "approved" | "processing" | "paid" | "failed";
+  status: "draft" | "approved" | "processing" | "paid" | "failed" | "cancelled";
   approvedBy: Id | null;
+  approvedAt?: Timestamp | null;
   ts: Timestamp;
 }
 
+/**
+ * One affiliate's payment in a batch. Money never passes through the platform:
+ *
+ *  - `pending`          in a draft batch — ledger entries reserved, nothing sent;
+ *  - `awaiting_payment` approved, MANUAL: the merchant pays from their own account, then
+ *                       marks it paid (or failed). Entries stay reserved meanwhile;
+ *  - `processing`       approved, handed to a rail the MERCHANT connected; outcome not yet
+ *                       known (asynchronous rail, or an error that may or may not have paid);
+ *  - `paid`             reservation settled;
+ *  - `failed`           definitely not paid — reservation released, may be retried;
+ *  - `cancelled`        withdrawn before approval — reservation released.
+ */
 export interface Payout {
   id: Id;
   batchId: Id | null;
   merchantId: Id;
   affiliateId: Id;
+  /**
+   * While the payout is open: the sum of the ledger entries it has reserved, re-derived
+   * whenever that set changes — never typed in. Once closed: what was paid, or was to be.
+   */
   amountCents: number;
   currency: CurrencyCode;
+  /** The affiliate's payout method — the rail named on their payout account ("paypal", "wise", …). */
   method: string;
-  status: "pending" | "processing" | "paid" | "failed" | "held";
+  status: "pending" | "awaiting_payment" | "processing" | "paid" | "failed" | "held" | "cancelled";
   failureReason: string | null;
+  /** How it leaves, decided at approval. */
+  mode?: "manual" | "automated" | null;
+  /** The account the payout was approved for (what the export file carries / the rail was given). */
+  accountRef?: string | null;
+  /** The merchant's own payment reference (mark-paid), or the rail's transfer id. */
+  reference?: string | null;
+  /** Disbursement attempt, part of the rail idempotency key. A new attempt starts only after a DEFINITE failure. */
+  attempt?: number;
+  paidAt?: Timestamp | null;
   ts: Timestamp;
 }
 
@@ -315,9 +368,28 @@ export interface Prospect {
   evidence: {
     affiliateLinks?: { url: string; network: string; confidence: string; verified?: boolean }[];
     competitorPromoted?: string | null;
-    /** How the email was obtained: "page:mailto" | "bio_aggregator:mailto" | "pattern-guess" | null. */
+    /**
+     * How the email was obtained: "page:mailto" | "bio_aggregator:mailto" |
+     * "youtube_api:description" | "feed_owner" | "import" | "hunter" | null — or
+     * "pattern-guess", which only ever appears on a SYNTHETIC (demo) prospect.
+     */
     contactSource?: string | null;
-    /** Contact emails extracted from the real fetched page (unverified candidates). */
+    /**
+     * Whether a real deliverability check confirmed the email. False for a merchant-
+     * imported address (taken on trust) and for a demo pattern-guess (never verifiable).
+     */
+    contactVerified?: boolean;
+    /** Addresses found for this prospect and REFUSED as its contact, with the reason. */
+    contactRejected?: { email: string; reason: string }[];
+    /**
+     * Why this prospect was retired before enrichment: it turned out to be on a competitor's
+     * own domain or the merchant's own (learned after it was discovered).
+     */
+    excludedReason?: string;
+    /**
+     * Candidate contact emails, best first (unverified): addresses the discovery source
+     * vouched for, then addresses printed on the prospect's own page that could be theirs.
+     */
     contactEmails?: { email: string; source: string }[];
     /** Contact-bearing pages the creator linked (Linktree, /contact, YouTube About). */
     contactUrls?: { url: string; kind: string }[];
@@ -359,15 +431,21 @@ export interface ProspectSource {
 export interface ProspectSignal {
   id: Id;
   prospectId: Id;
-  /** Topical relevance 0..1 (embedding similarity). Real-ish. */
-  relevance: number;
+  /**
+   * Topical relevance 0..1. null = UNKNOWN: not scored yet, or the relevance scorer was
+   * unavailable. Never a placeholder 0 — that would read as "irrelevant".
+   */
+  relevance: number | null;
   /** Has a HIGH-confidence (named-network) affiliate link. */
   isAffiliate: boolean;
   /** Promotes a competitor with a TRUSTWORTHY (verified/high-confidence) link. */
   promotesCompetitor: boolean;
   /** Commercial-intent score 0..1 from real page text. */
   intent: number;
-  /** Verified deliverable email on file. */
+  /**
+   * An email is on file AND a real deliverability check confirmed it. Never true for a
+   * pattern-guessed address or one accepted on the merchant's word.
+   */
   verifiedEmail: boolean;
   // ---- Provider-required signals. null = UNKNOWN (no provider wired). Never
   // invented; excluded from scoring and lowering confidence when null. ----------
@@ -415,8 +493,21 @@ export interface OutreachMessage {
   status: "queued" | "sent" | "bounced" | "replied" | "failed";
   /** Why this message failed to send (content gate, transport failure, paused mailbox, …). */
   blockedReason?: string;
-  /** Provider Message-Id from the actual send — threads follow-ups + correlates replies. */
+  /** The RFC 5322 Message-Id WE stamped on this message (never a provider API id). Assigned
+   *  before the first transmission attempt and reused by a retry; threads follow-ups and
+   *  correlates replies and bounce notifications on every rail. */
   providerMessageId?: string;
+  // ---- AUDIT-2026-10 (outreach stream), all optional.
+  /** Transmission attempts made for this row. A retry re-sends the SAME row — it never
+   *  inserts (or re-personalizes, or re-bills) a new one. */
+  attempts?: number;
+  /** A failed transmission is not retried before this time (doubling delay per attempt). */
+  nextAttemptAt?: Timestamp | null;
+  /** Fingerprint of the campaign step copy this message was rendered from. A content-gate
+   *  block is held only while the copy is unchanged; edit the step and it is re-rendered. */
+  stepFingerprint?: string;
+  /** What a later delivery-status notification said about this message. */
+  deliveryError?: string;
 }
 
 export interface Reply {
@@ -428,6 +519,9 @@ export interface Reply {
   ts: Timestamp;
   /** Provider Message-Id of the inbound email (IMAP/webhook), for cross-tick dedup. */
   inboundMessageId?: string;
+  /** The address the reply came FROM when it is not the address we wrote to (an alias reply,
+   *  matched by its In-Reply-To/References). AUDIT-2026-10 O5. */
+  fromEmail?: string;
 }
 
 export interface Suppression {
@@ -437,6 +531,13 @@ export interface Suppression {
   domain: string | null;
   reason: string;
   scope: "global" | "merchant";
+  /**
+   * Who created the row. Only a `system` row (signed unsubscribe link, STOP reply, bounce or
+   * complaint handling) may apply across tenants; a `merchant` row — one a tenant added
+   * through the API — never reaches beyond its own merchant, whatever `scope` says. Absent
+   * on rows written before this field existed: those are read by `reason` ("manual" = merchant).
+   */
+  origin?: "system" | "merchant";
   ts: Timestamp;
 }
 
@@ -499,6 +600,18 @@ export interface AutomationState {
    * safe to auto-send. Topic-gated/ungrounded replies ALWAYS go to a human regardless.
    */
   aiSdrMode?: "hitl" | "autopilot";
+  // ---- AUDIT-2026-10 (outreach stream), all optional.
+  /**
+   * Hours between SOURCING runs (default 24). The scheduler ticks every minute: sends,
+   * follow-ups and reply ingestion run on every tick, but the discovery query set is paid
+   * for per run, so it runs only when this interval has elapsed since `lastSourcedAt`.
+   */
+  sourcingIntervalHours?: number;
+  /** When sourcing last ran for this merchant (the cadence clock). */
+  lastSourcedAt?: Timestamp | null;
+  /** The last cycle error for this merchant, if its cycle threw (cleared by a clean cycle). */
+  lastError?: string | null;
+  lastErrorAt?: Timestamp | null;
 }
 
 /**

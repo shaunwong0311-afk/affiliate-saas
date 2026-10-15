@@ -16,6 +16,33 @@ import type {
   CalendarBooking,
 } from "@affiliate/integrations";
 
+/** What one inbound read of a mailbox produced. */
+export type ReplyPollOutcome =
+  /** Read the inbox; these are the new messages (possibly none). */
+  | InboundReply[]
+  /** The same, plus the rail's resume position to store on the mailbox (`inboundCursor`). */
+  | { replies: InboundReply[]; cursor?: string | null }
+  /** This mailbox has no way to read replies, and why (shown to the operator). */
+  | { unavailable: string };
+
+/** Minimal structured logger: failures are reported here instead of being swallowed. */
+export interface RecruitmentLogger {
+  warn(message: string, meta?: Record<string, unknown>): void;
+  error(message: string, meta?: Record<string, unknown>): void;
+}
+
+const consoleLogger: RecruitmentLogger = {
+  // eslint-disable-next-line no-console
+  warn: (message, meta) => console.warn(`[recruitment] ${message}`, meta ?? ""),
+  // eslint-disable-next-line no-console
+  error: (message, meta) => console.error(`[recruitment] ${message}`, meta ?? ""),
+};
+
+/** The logger to report through (the injected one, else the console). */
+export function loggerOf(deps: { logger?: RecruitmentLogger }): RecruitmentLogger {
+  return deps.logger ?? consoleLogger;
+}
+
 /**
  * The recruitment engine's dependency surface. Deliberately a structural subset
  * of the API's AppContext so the API can pass its context directly, while the
@@ -68,17 +95,23 @@ export interface RecruitmentDeps {
   /**
    * Resolves the send-as-the-merchant mailbox sender for a campaign's mailbox (loads the
    * encrypted credentials, refreshes OAuth tokens, builds the right SMTP/Graph/Gmail
-   * adapter). Optional — absent → the default `mailer` is used (the dev/test mock).
+   * adapter). Optional — absent → the default `mailer` is used (the dev/test mock). When it
+   * IS wired and throws, the send FAILS with the reason: it never falls back to `mailer`.
    */
   mailboxResolver?: (mailboxId: string | null) => Promise<MailboxSender>;
   /**
-   * Pulls new inbound replies for a mailbox (the SMTP-rail IMAP poll — loads the mailbox's
-   * encrypted IMAP creds, fetches mail newer than its cursor WITHOUT touching flags). Optional
-   * — absent → reply ingestion only happens via the inbound-parse webhook. The scheduler dedups
-   * by Message-Id and routes each through `processInboundReply`. Returns [] for mailboxes it
-   * can't poll (OAuth rails, missing IMAP config).
+   * Reads new inbound mail for a mailbox (IMAP for the SMTP rail, Microsoft Graph for the
+   * Microsoft OAuth rail) from its stored cursor, WITHOUT touching read flags. Optional —
+   * absent → replies arrive only through the inbound webhooks. The scheduler dedups by
+   * Message-Id and routes each through `processInboundReply`.
+   *
+   * It must say so when a mailbox has NO inbound path (`{ unavailable: reason }`) and throw
+   * when the path exists but the read failed — an empty array means "read the inbox, nothing
+   * new". The engine holds a mailbox's follow-ups unless its last read succeeded.
    */
-  replyPoller?: (mailbox: Mailbox) => Promise<InboundReply[]>;
+  replyPoller?: (mailbox: Mailbox) => Promise<ReplyPollOutcome>;
+  /** Where scheduler and ingestion failures are reported. Defaults to the console. */
+  logger?: RecruitmentLogger;
   /** Meeting booking for the managed (A-tier) track. Optional. */
   calendar?: CalendarBooking;
   /**

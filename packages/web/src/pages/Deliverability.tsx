@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { api, pct, num } from "../api";
-import { useApi, Card, Stat, Badge, PageHeader, EmptyState } from "../ui";
+import { useApi, Card, Stat, Badge, PageHeader, EmptyState, humanize } from "../ui";
 
 interface MailboxHealth {
   mailboxId: string;
@@ -45,15 +45,18 @@ export function Deliverability() {
   async function runMonitor() {
     setBusy(true); setMsg(null);
     try {
-      const r = await api.post<{ paused: string[]; warmed: string[] }>("/recruitment/deliverability/monitor", {});
-      setMsg(`Monitor ran — ${r.paused.length} paused, ${r.warmed.length} graduated.`);
+      const r = await api.post<{ paused?: string[]; warmed?: string[] } | null>("/recruitment/deliverability/monitor", {});
+      setMsg(`Monitor ran — ${r?.paused?.length ?? 0} paused, ${r?.warmed?.length ?? 0} graduated.`);
       mailboxes.reload(); health.reload();
     } catch (e: any) { setMsg(e?.message ?? "failed"); }
     finally { setBusy(false); }
   }
   async function resume(id: string) {
-    setBusy(true);
+    setBusy(true); setMsg(null);
+    // Resuming is admin-only; without a catch a refusal was an unhandled rejection and the
+    // button simply appeared to do nothing.
     try { await api.post(`/mailboxes/${id}/resume`, {}); mailboxes.reload(); }
+    catch (e: any) { setMsg(e?.status === 403 ? "Only admins and owners can resume a mailbox." : e?.message ?? "could not resume the mailbox"); }
     finally { setBusy(false); }
   }
 
@@ -90,7 +93,7 @@ export function Deliverability() {
                 <div className="row wrap gap-8" style={{ justifyContent: "space-between", alignItems: "center" }}>
                   <strong className="mono" style={{ fontSize: 13 }}>{m.email}</strong>
                   <div className="row gap-8">
-                    <Badge kind={m.warmupStatus === "ready" ? "pos" : m.warmupStatus === "warming" ? "warn" : ""}>{m.warmupStatus.replace(/_/g, " ")}</Badge>
+                    <Badge kind={m.warmupStatus === "ready" ? "pos" : m.warmupStatus === "warming" ? "warn" : ""}>{humanize(m.warmupStatus, "warmup unknown")}</Badge>
                     <Badge kind={m.status === "connected" ? "pos" : m.status === "error" ? "neg" : "warn"}>{m.status === "error" ? "paused" : m.status}</Badge>
                   </div>
                 </div>

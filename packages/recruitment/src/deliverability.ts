@@ -32,10 +32,76 @@ export function mailboxAgeDays(mailbox: Mailbox, now: Date): number {
   return mailbox.warmupStatus === "ready" ? 21 : 0;
 }
 
+// ---- Transport-failure backoff (AUDIT-2026-10 O2/O10) --------------------------------------
+/** First hold after a failed send; doubles per consecutive failure. */
+const BACKOFF_BASE_MS = 5 * 60_000;
+/** Longest hold. A mailbox that needs a human (revoked grant, wrong password) is retried at
+ *  most this often while `lastSendError` tells the operator what to fix. */
+const BACKOFF_MAX_MS = 6 * 3_600_000;
+
+/** How long to hold a mailbox after its Nth consecutive transport failure. */
+export function sendBackoffMs(consecutiveFailures: number): number {
+  return Math.min(BACKOFF_MAX_MS, BACKOFF_BASE_MS * 2 ** Math.max(0, consecutiveFailures - 1));
+}
+
+/** True while a mailbox is being held back after transport failures. */
+export function mailboxBackingOff(mailbox: Mailbox, now: Date): boolean {
+  return !!mailbox.sendBackoffUntil && new Date(mailbox.sendBackoffUntil).getTime() > now.getTime();
+}
+
+/**
+ * A send through this mailbox failed for a reason that is not the recipient's (connection,
+ * auth, quota, sender or policy rejection). Count it and hold the mailbox: the next attempt
+ * waits out an exponentially growing interval, so an outage or a host limit costs one failed
+ * send per interval instead of one per prospect per tick.
+ */
+export async function recordSendFailure(deps: RecruitmentDeps, mailboxId: string, reason: string, now: Date): Promise<void> {
+  const mailbox = await deps.db.mailboxes.get(mailboxId);
+  if (!mailbox) return;
+  const failures = (mailbox.sendFailures ?? 0) + 1;
+  await deps.db.mailboxes.update(mailboxId, {
+    sendFailures: failures,
+    sendBackoffUntil: new Date(now.getTime() + sendBackoffMs(failures)).toISOString(),
+    lastSendError: reason.slice(0, 300),
+  });
+}
+
+/** A send went out: the mailbox is healthy again — clear the failure count and the hold. */
+export async function recordSendSuccess(deps: RecruitmentDeps, mailboxId: string): Promise<void> {
+  const mailbox = await deps.db.mailboxes.get(mailboxId);
+  if (!mailbox || (!mailbox.sendFailures && !mailbox.sendBackoffUntil && !mailbox.lastSendError)) return;
+  await deps.db.mailboxes.update(mailboxId, { sendFailures: 0, sendBackoffUntil: null, lastSendError: null });
+}
+
+// ---- Inbound path (AUDIT-2026-10 O5) --------------------------------------------------------
+export interface InboundState {
+  /** True when replies to this mailbox are being read (or nothing real can be sent from it). */
+  working: boolean;
+  /** Why not, in words for the operator. Null when working. */
+  reason: string | null;
+}
+
+/**
+ * Whether the engine can currently SEE replies to a mailbox. A follow-up to someone whose
+ * "STOP" or "yes" we cannot read is the worst thing this system can send, so automated
+ * follow-ups require a mailbox whose LAST inbox read succeeded (`inboundStatus: "ok"`, written
+ * by `ingestReplies`). A mailbox with no credentials can only ever reach the dev/test mock —
+ * nothing real leaves, so there is nothing to protect.
+ */
+export function inboundState(mailbox: Mailbox | null | undefined): InboundState {
+  if (!mailbox || !mailbox.credentialsRef) return { working: true, reason: null };
+  if (mailbox.inboundStatus === "ok") return { working: true, reason: null };
+  if (mailbox.inboundStatus === "unavailable") return { working: false, reason: mailbox.inboundError ?? "this mailbox has no way to read replies" };
+  if (mailbox.inboundStatus === "error") return { working: false, reason: `reading replies is failing: ${mailbox.inboundError ?? "unknown error"}` };
+  return { working: false, reason: "reading replies has not been verified for this mailbox yet" };
+}
+
 /** Remaining send capacity today for ONE mailbox (the one a campaign actually sends through).
- * Applies the real warmup ramp and refuses paused/disconnected mailboxes. */
+ * Applies the real warmup ramp and refuses paused/disconnected mailboxes and mailboxes held
+ * back after transport failures. */
 export async function mailboxRemainingToday(deps: RecruitmentDeps, mailbox: Mailbox, now: Date): Promise<number> {
   if (mailbox.status !== "connected" && mailbox.status !== "warming") return 0;
+  if (mailboxBackingOff(mailbox, now)) return 0;
   const cap = effectiveDailyCap(mailbox, mailboxAgeDays(mailbox, now));
   const sent = await sentTodayForMailbox(deps, mailbox.id, now);
   return Math.max(0, cap - sent);
@@ -57,13 +123,22 @@ export async function capacityAvailable(deps: RecruitmentDeps, merchantId: strin
   return (await mailboxRemainingToday(deps, mailbox, now)) > 0;
 }
 
-/** How many messages this mailbox sent today (via its campaigns). */
+/**
+ * How many messages this mailbox TRANSMITTED in the last 24 hours (via its campaigns) — the
+ * number its daily cap is spent against.
+ *
+ * Bounces count: a bounced message was sent, and it is the most expensive kind of send. (They
+ * used to be free, so a list of bad addresses was mailed in full through a 5/day mailbox.)
+ * The window is a rolling 24 hours, not the UTC calendar day: provider limits roll, and a send
+ * window that straddles UTC midnight (any Americas business day) would otherwise get two
+ * daily caps back to back.
+ */
 export async function sentTodayForMailbox(deps: RecruitmentDeps, mailboxId: string, now: Date): Promise<number> {
   const campaigns = await deps.db.campaigns.find((c) => c.mailboxId === mailboxId);
   const ids = new Set(campaigns.map((c) => c.id));
-  const day = now.toISOString().slice(0, 10);
+  const since = new Date(now.getTime() - 86_400_000).toISOString();
   const sent = await deps.db.outreachMessages.find(
-    (m) => ids.has(m.campaignId) && m.status === "sent" && (m.sentAt ?? "").slice(0, 10) === day,
+    (m) => ids.has(m.campaignId) && (m.status === "sent" || m.status === "bounced" || m.status === "replied") && (m.sentAt ?? "") > since,
   );
   return sent.length;
 }
@@ -88,9 +163,16 @@ export interface DeliverabilityHealth {
   sent: number;
   bounced: number;
   bounceRate: number;
-  /** Real spam complaints (reason "complaint" — FBL/ESP events), NOT unsubscribes. */
-  complaints: number;
-  complaintRate: number;
+  /**
+   * Spam complaints in the window (suppressions with reason "complaint"), NOT unsubscribes.
+   * NULL = NOT AVAILABLE: no complaint feed is wired (no FBL / ESP complaint ingestion exists
+   * for merchant mailboxes), so there is nothing to count. A zero here would claim "nobody
+   * complained" when the truth is "we cannot know" — see `complaintsAvailable`.
+   */
+  complaints: number | null;
+  complaintRate: number | null;
+  /** False while no complaint event has ever been recorded for this merchant (no feed). */
+  complaintsAvailable: boolean;
   /** Unsubscribes in the window — a compliant, invited action; reported, never a breaker input. */
   unsubscribes: number;
   unsubscribeRate: number;
@@ -112,7 +194,13 @@ const HEALTH_WINDOW_DAYS = 30;
  * is normal, invited behavior (the one-click header exists precisely so recipients unsub
  * instead of hitting Report Spam) — counting it against the 0.3% FBL threshold would trip
  * the breaker for essentially every merchant. Complaints count only `reason: "complaint"`
- * suppressions (fed by FBL/ESP complaint events when that ingestion is wired).
+ * suppressions.
+ *
+ * HONESTY (AUDIT-2026-10 O6): nothing in this codebase writes a "complaint" — there is no
+ * feedback loop for a merchant's own mailbox. So the complaint figures are reported as NOT
+ * AVAILABLE (null) until a complaint has actually been recorded for the merchant, instead of
+ * a reassuring zero; the breaker then runs on bounces alone, and says so. Bounces DO include
+ * the ones reported later by delivery-status notifications (`processInboundReply`).
  */
 export async function deliverabilityHealth(deps: RecruitmentDeps, merchantId: string): Promise<DeliverabilityHealth> {
   const now = deps.clock.now();
@@ -125,13 +213,15 @@ export async function deliverabilityHealth(deps: RecruitmentDeps, merchantId: st
   const sent = messages.length;
   const bounced = messages.filter((m) => m.status === "bounced").length;
   const inWindow = (ts: string) => ts >= since;
-  const complaints = (await deps.db.suppressions.find((s) => s.merchantId === merchantId && s.reason === "complaint" && inWindow(s.ts))).length;
+  const complaintRows = await deps.db.suppressions.find((s) => s.merchantId === merchantId && s.reason === "complaint");
+  const complaintsAvailable = complaintRows.length > 0;
+  const complaints = complaintsAvailable ? complaintRows.filter((s) => inWindow(s.ts)).length : null;
   const unsubscribes = (await deps.db.suppressions.find((s) => s.merchantId === merchantId && s.reason === "unsubscribe" && inWindow(s.ts))).length;
   const bounceRate = sent ? bounced / sent : 0;
-  const complaintRate = sent ? complaints / sent : 0;
+  const complaintRate = complaints == null ? null : sent ? complaints / sent : 0;
   const unsubscribeRate = sent ? unsubscribes / sent : 0;
-  const circuitOpen = sent >= 20 && (bounceRate > 0.02 || complaintRate > 0.003);
-  return { sent, bounced, bounceRate, complaints, complaintRate, unsubscribes, unsubscribeRate, circuitOpen };
+  const circuitOpen = sent >= 20 && (bounceRate > 0.02 || (complaintRate ?? 0) > 0.003);
+  return { sent, bounced, bounceRate, complaints, complaintRate, complaintsAvailable, unsubscribes, unsubscribeRate, circuitOpen };
 }
 
 /** Minimum sends before a bounce rate is statistically meaningful enough to auto-pause. */
@@ -154,6 +244,14 @@ export interface MailboxHealth {
   /** True when the mailbox breaches the bounce ceiling with enough volume → pause. */
   circuitOpen: boolean;
   autoPausedReason: string | null;
+  /** Whether replies to this mailbox are being read; when false, its automated follow-ups are
+   *  held and `inboundReason` says why (the UI must warn — STOP replies cannot be seen). */
+  inboundWorking: boolean;
+  inboundReason: string | null;
+  /** Consecutive transport failures, the hold they caused, and the last error. */
+  sendFailures: number;
+  sendBackoffUntil: string | null;
+  lastSendError: string | null;
 }
 
 /**
@@ -173,6 +271,7 @@ export async function mailboxHealth(deps: RecruitmentDeps, mailbox: Mailbox, now
   const bounced = messages.filter((m) => m.status === "bounced").length;
   const bounceRate = sent ? bounced / sent : 0;
   const ageDays = mailboxAgeDays(mailbox, now);
+  const inbound = inboundState(mailbox);
   return {
     mailboxId: mailbox.id,
     email: mailbox.email,
@@ -185,6 +284,11 @@ export async function mailboxHealth(deps: RecruitmentDeps, mailbox: Mailbox, now
     bounceRate,
     circuitOpen: sent >= MIN_SENDS_FOR_PAUSE && bounceRate > BOUNCE_PAUSE_THRESHOLD,
     autoPausedReason: mailbox.autoPausedReason ?? null,
+    inboundWorking: inbound.working,
+    inboundReason: inbound.reason,
+    sendFailures: mailbox.sendFailures ?? 0,
+    sendBackoffUntil: mailboxBackingOff(mailbox, now) ? (mailbox.sendBackoffUntil ?? null) : null,
+    lastSendError: mailbox.lastSendError ?? null,
   };
 }
 

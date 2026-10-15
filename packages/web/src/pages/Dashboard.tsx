@@ -13,6 +13,8 @@ export function Dashboard() {
   if (loading) return <Spinner />;
   if (error) return <ErrorBanner message={error} />;
   if (!data) return null;
+  // The landing page: a partial overview must show a message, not throw on a missing section.
+  if (!data.health || !data.money || !data.funnel) return <ErrorBanner message="The overview came back incomplete. Reload to try again." />;
   const { health, money: m, funnel } = data;
 
   const funnelSteps = [
@@ -59,7 +61,7 @@ export function Dashboard() {
           <div className="row gap-8 mt-16">
             <Badge kind="info">reply {pct(funnel.replyRate)}</Badge>
             <Badge kind="pos">convert {pct(funnel.conversionRate)}</Badge>
-            {Object.entries(funnel.byTier).map(([t, c]) => (
+            {Object.entries(funnel.byTier ?? {}).map(([t, c]) => (
               <Badge key={t} kind={`tier-${t}`}>
                 {t}: {c}
               </Badge>

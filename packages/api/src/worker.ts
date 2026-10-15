@@ -15,8 +15,20 @@ async function main(): Promise<void> {
   const ctx = createContext({ db });
   const queue = buildQueue();
   registerWorkers(queue, ctx);
-  const handle = runScheduler(ctx, Number(process.env.SCHEDULER_INTERVAL_MS ?? 60_000));
-  const drain = setInterval(() => void queue.drain().catch(() => {}), 5_000);
+  // Each tick reads every mailbox for replies/bounces and then sends for each merchant
+  // (isolated per merchant; failures are logged and recorded, never swallowed). Sourcing runs
+  // on its own per-merchant interval (default daily), not on this one.
+  // A blank or non-numeric value must not become a 0 ms loop.
+  const rawInterval = Number(process.env.SCHEDULER_INTERVAL_MS);
+  const handle = runScheduler(ctx, Number.isFinite(rawInterval) && rawInterval > 0 ? rawInterval : 60_000);
+  const drain = setInterval(
+    () =>
+      void queue.drain().catch((err) => {
+        // eslint-disable-next-line no-console
+        console.error("[worker] stage queue drain failed:", err);
+      }),
+    5_000,
+  );
   // eslint-disable-next-line no-console
   console.log("recruitment worker running (scheduler + stage queue, full app wiring)");
   const shutdown = () => {

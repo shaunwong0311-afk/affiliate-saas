@@ -13,7 +13,7 @@ import type { CommissionEvent, ReversalEvent } from "../engine/types.js";
  *  - Balances are ALWAYS derived by summing entries — never stored and mutated.
  *  - A clawback appends a NEW negative `reversal` entry; it never deletes history.
  *
- * Two reversal cases, handled explicitly:
+ * Reversal cases, handled explicitly:
  *  1. Reversing an un-paid entry → mark the original `reversed` (drops out of
  *     sums) and record the reversal entry as `reversed` too (pure audit, not
  *     summed) so there is no double subtraction.
@@ -21,6 +21,13 @@ import type { CommissionEvent, ReversalEvent } from "../engine/types.js";
  *     un-pay), and the reversal entry is `approved` with a negative amount, which
  *     nets against the affiliate's balance — the documented negative-balance
  *     exposure after refunds (Section 9).
+ *  3. Reversing an entry a payout has RESERVED (`processing`):
+ *     - the payout has been handed over (approved for manual payment, or sent to a
+ *       rail): the money may already have moved, so this is case 2 — the original keeps
+ *       its place in the payout and a negative `approved` entry claws it back. If the
+ *       payout later fails, the original returns to `approved` and the two cancel out;
+ *     - the payout is still a draft: nothing was sent, so this is case 1 — and the
+ *       caller must take the entry out of the payout and recompute its amount.
  */
 
 export interface ToEntryOptions {
@@ -59,11 +66,22 @@ export interface ReversalResult {
 export function applyReversal(
   original: LedgerEntry,
   event: ReversalEvent,
-  opts: { merchantId: Id; now: Date },
+  opts: {
+    merchantId: Id;
+    now: Date;
+    /**
+     * For a `processing` (reserved) original: has its payout been handed over — approved
+     * for manual payment or sent to a rail? Pass `false` ONLY for a payout that is still a
+     * draft. Left out, the answer is assumed to be yes: treating money as possibly moved is
+     * the mistake that costs nothing.
+     */
+    disbursementStarted?: boolean;
+  },
 ): ReversalResult {
-  const wasPaid = original.status === "paid";
-  const reversalStatus: LedgerStatus = wasPaid ? "approved" : "reversed";
-  const originalNewStatus: LedgerStatus = wasPaid ? "paid" : "reversed";
+  const moneyMayHaveMoved =
+    original.status === "paid" || (original.status === "processing" && opts.disbursementStarted !== false);
+  const reversalStatus: LedgerStatus = moneyMayHaveMoved ? "approved" : "reversed";
+  const originalNewStatus: LedgerStatus = moneyMayHaveMoved ? original.status : "reversed";
 
   const reversalEntry: LedgerEntry = {
     id: newId("led"),
@@ -88,6 +106,8 @@ export interface Balance {
   pendingCents: number; // awaiting approval / in hold as pending
   availableCents: number; // approved AND available now → payable (net of negative reversals)
   onHoldCents: number; // approved but still inside the hold window
+  /** Reserved by a payout that is not settled yet (draft, awaiting payment, or with a rail). Still owed. */
+  processingCents: number;
   paidCents: number;
   reversedCents: number; // absolute value of fully-reversed (un-paid) entries
 }
@@ -109,6 +129,7 @@ export function computeBalances(entries: readonly LedgerEntry[], now: Date): Map
         pendingCents: 0,
         availableCents: 0,
         onHoldCents: 0,
+        processingCents: 0,
         paidCents: 0,
         reversedCents: 0,
       };
@@ -129,6 +150,10 @@ export function computeBalances(entries: readonly LedgerEntry[], now: Date): Map
         else b.onHoldCents += e.amountCents;
         break;
       }
+      case "processing":
+        // Without this bucket, money reserved by an open payout vanished from every total.
+        b.processingCents += e.amountCents;
+        break;
       case "paid":
         b.paidCents += e.amountCents;
         break;

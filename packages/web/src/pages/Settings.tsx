@@ -1,37 +1,49 @@
 import { useState } from "react";
-import { api, getMerchant, shortDate } from "../api";
-import { useApi, Card, Spinner, ErrorBanner, PageHeader, Badge, EmptyState, Field, Modal, statusKind } from "../ui";
+import { api, errorMessage, errorStatus, getMerchant, shortDate } from "../api";
+import { useAuth, roleAtLeast } from "../auth";
+import { useApi, Card, Spinner, ErrorBanner, Notice, PageHeader, Badge, EmptyState, Field, Modal, statusKind } from "../ui";
 
+/**
+ * `GET /merchants/:id` — the PUBLIC merchant. The API strips `postbackSecret` from every
+ * general read (`sanitize.ts`); it is only available from the admin-gated
+ * `GET /merchants/:id/postback-secret` and in the response to a rotation. Declaring it
+ * here is what crashed this screen, so it is deliberately absent. Fields the API can omit
+ * (older rows, optional columns) are optional and read through a fallback.
+ */
 interface Merchant {
   id: string;
   name: string;
-  niche: string | null;
-  competitors: string[];
-  physicalAddress: string | null;
+  niche?: string | null;
+  competitors?: string[] | null;
+  physicalAddress?: string | null;
   bookingUrl?: string | null;
-  defaultCurrency: string;
-  postbackSecret: string;
+  defaultCurrency?: string | null;
 }
 
 type Role = "owner" | "admin" | "manager" | "analyst" | "viewer";
 
+/** A membership row (`MerchantUser` entity). `id` is the MEMBERSHIP id; the member routes
+ *  are keyed by `userId`. */
 interface MerchantUser {
   id: string;
+  userId: string;
   email: string;
-  name: string | null;
+  name?: string | null;
   role: Role;
-  status: string;
-  lastActiveAt: string | null;
+  status: "active" | "invited" | "disabled" | (string & {});
 }
 
 interface AuditLog {
   id: string;
   action: string;
   subjectType: string;
-  subjectId: string | null;
-  actorEmail: string | null;
+  subjectId?: string | null;
+  /** The acting user's id. Most routes do not record one yet, so it is usually null. */
+  actorId?: string | null;
   ts: string;
 }
+
+const SECRET_MASK = "•".repeat(28);
 
 const ROLES: Role[] = ["owner", "admin", "manager", "analyst", "viewer"];
 const TABS = ["General", "Team", "Audit log"] as const;
@@ -68,12 +80,16 @@ export function Settings() {
 
 // ---- General ----------------------------------------------------------------
 
+/** "cal.com/you" → "https://cal.com/you" — the API validates the booking link as a full URL. */
+function withScheme(url: string): string {
+  return /^[a-z][a-z0-9+.-]*:\/\//i.test(url) ? url : `https://${url}`;
+}
+
 function GeneralTab({ mid }: { mid: string }) {
+  const { activeRole } = useAuth();
   const { data, loading, error, reload } = useApi<Merchant>(() => api.get(`/merchants/${mid}`), [mid]);
   const [form, setForm] = useState<{ name: string; niche: string; competitors: string; physicalAddress: string; bookingUrl: string } | null>(null);
   const [saving, setSaving] = useState(false);
-  const [rotating, setRotating] = useState(false);
-  const [revealed, setRevealed] = useState(false);
   const [msg, setMsg] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
 
@@ -81,11 +97,15 @@ function GeneralTab({ mid }: { mid: string }) {
   if (error) return <ErrorBanner message={error} />;
   if (!data) return null;
 
+  const competitors = data.competitors ?? [];
+  // An unknown role (should not happen) is left for the server to judge.
+  const canEdit = activeRole == null || roleAtLeast(activeRole, "admin");
+
   const f =
     form ?? {
-      name: data.name,
+      name: data.name ?? "",
       niche: data.niche ?? "",
-      competitors: data.competitors.join(", "),
+      competitors: competitors.join(", "),
       physicalAddress: data.physicalAddress ?? "",
       bookingUrl: data.bookingUrl ?? "",
     };
@@ -95,37 +115,21 @@ function GeneralTab({ mid }: { mid: string }) {
     setErr(null);
     setMsg(null);
     try {
+      const bookingUrl = f.bookingUrl.trim();
       await api.patch(`/merchants/${mid}`, {
         name: f.name.trim(),
         niche: f.niche.trim() || null,
         competitors: f.competitors.split(",").map((c) => c.trim()).filter(Boolean),
         physicalAddress: f.physicalAddress.trim() || null,
-        bookingUrl: f.bookingUrl.trim() || null,
+        bookingUrl: bookingUrl ? withScheme(bookingUrl) : null,
       });
       setMsg("Workspace updated.");
       setForm(null);
       reload();
-    } catch (e: any) {
-      setErr(e?.message ?? "save failed");
+    } catch (e) {
+      setErr(errorStatus(e) === 403 ? "Only workspace admins and owners can change these settings." : errorMessage(e, "save failed"));
     } finally {
       setSaving(false);
-    }
-  }
-
-  async function rotate() {
-    if (!confirm("Rotate the postback secret? Existing integrations using the old secret will stop validating.")) return;
-    setRotating(true);
-    setErr(null);
-    setMsg(null);
-    try {
-      await api.post<{ postbackSecret: string }>(`/merchants/${mid}/rotate-postback-secret`, {});
-      setMsg("Postback secret rotated — update your integrations.");
-      setRevealed(true);
-      reload();
-    } catch (e: any) {
-      setErr(e?.message ?? "rotate failed");
-    } finally {
-      setRotating(false);
     }
   }
 
@@ -135,10 +139,11 @@ function GeneralTab({ mid }: { mid: string }) {
     <div className="grid grid-2">
       <Card title="Workspace identity" sub="niche + competitors feed the recruitment sourcing engine">
         {err && <ErrorBanner message={err} />}
-        {msg && (
-          <div className="err-banner" style={{ background: "var(--acc-glow)", borderColor: "var(--acc-dim)", color: "var(--acc)" }}>
-            {msg}
-          </div>
+        {msg && <Notice kind="ok">{msg}</Notice>}
+        {!canEdit && (
+          <Notice kind="info">
+            Your role ({activeRole}) can view these settings. Only admins and owners can change them.
+          </Notice>
         )}
 
         <div className="mt-16">
@@ -195,32 +200,12 @@ function GeneralTab({ mid }: { mid: string }) {
       </Card>
 
       <div>
-        <Card title="Postback secret" sub="signs server-to-server conversion postbacks">
-          <div className="mt-16">
-            <div
-              className="card"
-              style={{ background: "var(--ink-850)", padding: 14, display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}
-            >
-              <span className="mono" style={{ fontSize: 13, wordBreak: "break-all" }}>
-                {revealed ? data.postbackSecret : data.postbackSecret.replace(/./g, "•").slice(0, 28)}
-              </span>
-              <button className="btn sm ghost" onClick={() => setRevealed((v) => !v)}>
-                {revealed ? "Hide" : "Reveal"}
-              </button>
-            </div>
-            <div className="faint" style={{ fontSize: 11.5, margin: "12px 0" }}>
-              Treat this like a password. Rotating it invalidates the previous secret immediately.
-            </div>
-            <button className="btn danger sm" onClick={rotate} disabled={rotating}>
-              {rotating ? "rotating…" : "Rotate secret"}
-            </button>
-          </div>
-        </Card>
+        <PostbackSecretCard mid={mid} />
 
         <div className="grid grid-2 mt-24">
           <Card title="Default currency">
             <div className="mono" style={{ fontSize: 22, fontWeight: 700, marginTop: 8 }}>
-              {data.defaultCurrency}
+              {data.defaultCurrency ?? "—"}
             </div>
             <div className="faint" style={{ fontSize: 11.5, marginTop: 6 }}>
               Commissions and payouts are denominated here.
@@ -228,8 +213,8 @@ function GeneralTab({ mid }: { mid: string }) {
           </Card>
           <Card title="Competitor set">
             <div className="row gap-8" style={{ flexWrap: "wrap", marginTop: 8 }}>
-              {data.competitors.length ? (
-                data.competitors.map((c) => (
+              {competitors.length ? (
+                competitors.map((c) => (
                   <Badge key={c} kind="info">
                     {c}
                   </Badge>
@@ -245,7 +230,142 @@ function GeneralTab({ mid }: { mid: string }) {
   );
 }
 
+/**
+ * The postback secret is never part of the merchant payload. It is fetched on demand from
+ * the admin-gated route when someone presses Reveal, held only while it is on screen, and
+ * dropped again on Hide. Rotation (owner-only) answers with the new secret directly.
+ */
+function PostbackSecretCard({ mid }: { mid: string }) {
+  const { activeRole } = useAuth();
+  const [secret, setSecret] = useState<string | null>(null);
+  const [busy, setBusy] = useState<"reveal" | "rotate" | null>(null);
+  const [note, setNote] = useState<string | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+  const [copied, setCopied] = useState(false);
+
+  // Up-front explanation only — the server decides, and its 403 is handled below either way.
+  const mayReveal = activeRole == null || roleAtLeast(activeRole, "admin");
+  const mayRotate = activeRole == null || roleAtLeast(activeRole, "owner");
+
+  async function reveal() {
+    setBusy("reveal");
+    setErr(null);
+    setNote(null);
+    try {
+      const res = await api.get<{ postbackSecret?: unknown } | null>(`/merchants/${mid}/postback-secret`);
+      const value = res?.postbackSecret;
+      if (typeof value !== "string" || !value) throw new Error("The server did not return a secret.");
+      setSecret(value);
+    } catch (e) {
+      setErr(
+        errorStatus(e) === 403
+          ? "Only workspace admins and owners can reveal the postback secret. Ask one of them to share it with you securely."
+          : errorMessage(e, "Could not load the secret."),
+      );
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  function hide() {
+    setSecret(null);
+    setCopied(false);
+  }
+
+  async function copy() {
+    if (!secret) return;
+    try {
+      await navigator.clipboard.writeText(secret);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1800);
+    } catch {
+      setErr("Could not copy automatically — select the secret and copy it by hand.");
+    }
+  }
+
+  async function rotate() {
+    if (!confirm("Rotate the postback secret? Existing integrations using the old secret will stop validating.")) return;
+    setBusy("rotate");
+    setErr(null);
+    setNote(null);
+    try {
+      const res = await api.post<{ postbackSecret?: unknown } | null>(`/merchants/${mid}/rotate-postback-secret`, {});
+      const value = res?.postbackSecret;
+      if (typeof value === "string" && value) {
+        setSecret(value);
+        setCopied(false);
+        setNote("Secret rotated — the new value is shown below. Update your integrations now; the old secret no longer validates.");
+      } else {
+        setSecret(null);
+        setNote("Secret rotated. Press Reveal to see the new value, then update your integrations.");
+      }
+    } catch (e) {
+      setErr(errorStatus(e) === 403 ? "Only the workspace owner can rotate the postback secret." : errorMessage(e, "Rotation failed."));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  return (
+    <Card title="Postback secret" sub="signs server-to-server conversion postbacks">
+      <div className="mt-16">
+        {err && <ErrorBanner message={err} />}
+        {note && <Notice kind="ok">{note}</Notice>}
+        <div
+          className="card"
+          style={{ background: "var(--ink-850)", padding: 14, display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}
+        >
+          <span className="mono" style={{ fontSize: 13, wordBreak: "break-all" }} aria-label={secret ? "postback secret" : "postback secret (hidden)"}>
+            {secret ?? SECRET_MASK}
+          </span>
+          <div className="row gap-8" style={{ flex: "0 0 auto" }}>
+            {secret && (
+              <button className="btn sm ghost" onClick={copy}>
+                {copied ? "✓ copied" : "Copy"}
+              </button>
+            )}
+            {secret ? (
+              <button className="btn sm ghost" onClick={hide}>
+                Hide
+              </button>
+            ) : (
+              <button
+                className="btn sm ghost"
+                onClick={reveal}
+                disabled={busy !== null || !mayReveal}
+                title={mayReveal ? undefined : "Admins and owners only"}
+              >
+                {busy === "reveal" ? "loading…" : "Reveal"}
+              </button>
+            )}
+          </div>
+        </div>
+        <div className="faint" style={{ fontSize: 11.5, margin: "12px 0" }}>
+          Treat this like a password. Rotating it invalidates the previous secret immediately.
+          {!mayReveal && <> Your role ({activeRole}) cannot reveal it — admins and owners can.</>}
+          {mayReveal && !mayRotate && <> Only the workspace owner can rotate it.</>}
+        </div>
+        <button className="btn danger sm" onClick={rotate} disabled={busy !== null || !mayRotate} title={mayRotate ? undefined : "Owner only"}>
+          {busy === "rotate" ? "rotating…" : "Rotate secret"}
+        </button>
+      </div>
+    </Card>
+  );
+}
+
 // ---- Team -------------------------------------------------------------------
+
+/** What to tell the admin after an invite: emailed, a dev link to hand over, or not sent. */
+function inviteNote(email: string, role: string, member: { status?: string; inviteSent?: boolean; devInviteToken?: string } | null): string {
+  if (member?.status !== "invited") return `${email} now has ${role} access.`;
+  if (member.devInviteToken) {
+    // Outside production the API returns the one-time token so the flow can be finished without an inbox.
+    return `${email} was invited. Dev link (single-use): ${window.location.origin}${window.location.pathname}#/accept-invite?token=${member.devInviteToken}`;
+  }
+  return member.inviteSent
+    ? `Invitation emailed to ${email}. The link is single-use and lasts 7 days.`
+    : `${email} was added as "invited", but the invitation email could not be sent — check that a transactional email provider is configured, then re-invite.`;
+}
 
 function TeamTab({ mid }: { mid: string }) {
   const { data, loading, error, reload } = useApi<MerchantUser[]>(() => api.get(`/merchants/${mid}/users`), [mid]);
@@ -253,32 +373,63 @@ function TeamTab({ mid }: { mid: string }) {
   const [invite, setInvite] = useState<{ email: string; name: string; role: Role }>({ email: "", name: "", role: "viewer" });
   const [saving, setSaving] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  const [inviteErr, setInviteErr] = useState<string | null>(null);
+  const [note, setNote] = useState<string | null>(null);
 
-  async function sendInvite() {
+  // Errors here show the API's own text: its 403s are specific ("cannot grant the higher
+  // role…", "cannot modify a higher-ranked member") and say more than a generic message.
+  async function addMember() {
+    const email = invite.email.trim();
     setSaving(true);
-    setErr(null);
+    setInviteErr(null);
+    setNote(null);
     try {
-      await api.post(`/merchants/${mid}/users`, {
-        email: invite.email.trim(),
-        name: invite.name.trim() || null,
+      const member = await api.post<(MerchantUser & { inviteSent?: boolean; devInviteToken?: string }) | null>(`/merchants/${mid}/users`, {
+        email,
+        // The API requires a name; fall back to the mailbox name rather than failing the add.
+        name: invite.name.trim() || email.split("@")[0] || email,
         role: invite.role,
       });
       setOpen(false);
       setInvite({ email: "", name: "", role: "viewer" });
+      setNote(
+        inviteNote(email, invite.role, member),
+      );
       reload();
-    } catch (e: any) {
-      setErr(e?.message ?? "invite failed");
+    } catch (e) {
+      setInviteErr(errorMessage(e, "Could not add the member."));
     } finally {
       setSaving(false);
     }
   }
 
-  async function updateUser(u: MerchantUser, patch: { role?: Role; status?: string }) {
+  // A suspended member is brought back by a fresh invitation (the API no longer lets an admin
+  // flip a seat straight to "active" — the member accepts it themselves).
+  async function reinvite(u: MerchantUser) {
+    setErr(null);
+    setNote(null);
     try {
-      await api.patch(`/merchants/${mid}/users/${u.id}`, patch);
+      const member = await api.post<(MerchantUser & { inviteSent?: boolean; devInviteToken?: string }) | null>(`/merchants/${mid}/users`, {
+        email: u.email,
+        name: u.name?.trim() || u.email.split("@")[0] || u.email,
+        role: u.role,
+      });
+      setNote(inviteNote(u.email, u.role, member));
       reload();
-    } catch (e: any) {
-      setErr(e?.message ?? "update failed");
+    } catch (e) {
+      setErr(errorMessage(e, "Could not send the invitation."));
+    }
+  }
+
+  async function updateUser(u: MerchantUser, patch: { role?: Role; status?: "active" | "disabled" }) {
+    setErr(null);
+    setNote(null);
+    try {
+      // Keyed by the USER id — the membership id (`u.id`) is not what the route looks up.
+      await api.patch(`/merchants/${mid}/users/${encodeURIComponent(u.userId)}`, patch);
+      reload();
+    } catch (e) {
+      setErr(errorMessage(e, "Update failed."));
     }
   }
 
@@ -293,20 +444,25 @@ function TeamTab({ mid }: { mid: string }) {
         title={`Team · ${users.length}`}
         sub="roles gate access — owners and admins govern, analysts and viewers observe"
         actions={
-          <button className="btn primary sm" onClick={() => setOpen(true)}>
-            + Invite member
+          <button className="btn primary sm" onClick={() => { setInviteErr(null); setOpen(true); }}>
+            + Add member
           </button>
         }
       >
-        {err && <ErrorBanner message={err} />}
+        {(err || note) && (
+          <div style={{ padding: "0 20px" }}>
+            {err && <ErrorBanner message={err} />}
+            {note && <Notice kind="ok">{note}</Notice>}
+          </div>
+        )}
         {users.length === 0 ? (
           <div style={{ padding: 20 }}>
             <EmptyState
               title="No team members yet"
-              hint="Invite teammates and assign roles to delegate recruitment, payouts, and reporting."
+              hint="Add teammates and assign roles to delegate recruitment, payouts, and reporting."
               action={
                 <button className="btn primary" onClick={() => setOpen(true)}>
-                  Invite member
+                  Add member
                 </button>
               }
             />
@@ -319,7 +475,6 @@ function TeamTab({ mid }: { mid: string }) {
                   <th>Member</th>
                   <th>Role</th>
                   <th>Status</th>
-                  <th className="num">Last active</th>
                   <th />
                 </tr>
               </thead>
@@ -327,7 +482,7 @@ function TeamTab({ mid }: { mid: string }) {
                 {users.map((u) => (
                   <tr key={u.id}>
                     <td>
-                      <div style={{ fontWeight: 600 }}>{u.name ?? "—"}</div>
+                      <div style={{ fontWeight: 600 }}>{u.name || "—"}</div>
                       <div className="faint mono" style={{ fontSize: 11 }}>
                         {u.email}
                       </div>
@@ -349,17 +504,14 @@ function TeamTab({ mid }: { mid: string }) {
                     <td>
                       <Badge kind={statusKind(u.status)}>{u.status}</Badge>
                     </td>
-                    <td className="num muted" style={{ fontSize: 12 }}>
-                      {shortDate(u.lastActiveAt)}
-                    </td>
                     <td className="num">
-                      {u.status === "active" ? (
-                        <button className="btn sm ghost" onClick={() => updateUser(u, { status: "paused" })}>
-                          Suspend
+                      {u.status === "disabled" ? (
+                        <button className="btn sm" onClick={() => reinvite(u)}>
+                          Re-invite
                         </button>
                       ) : (
-                        <button className="btn sm" onClick={() => updateUser(u, { status: "active" })}>
-                          Reactivate
+                        <button className="btn sm ghost" onClick={() => updateUser(u, { status: "disabled" })}>
+                          {u.status === "invited" ? "Revoke" : "Suspend"}
                         </button>
                       )}
                     </td>
@@ -371,8 +523,8 @@ function TeamTab({ mid }: { mid: string }) {
         )}
       </Card>
 
-      <Modal open={open} onClose={() => setOpen(false)} title="Invite team member">
-        {err && <ErrorBanner message={err} />}
+      <Modal open={open} onClose={() => setOpen(false)} title="Add team member">
+        {inviteErr && <ErrorBanner message={inviteErr} />}
         <div style={{ padding: "4px 0" }}>
           <Field label="Email">
             <input
@@ -400,9 +552,13 @@ function TeamTab({ mid }: { mid: string }) {
               ))}
             </select>
           </Field>
+          <div className="faint" style={{ fontSize: 11.5 }}>
+            Someone who already has a Vantage login gets access straight away. A new address is added as "invited" —
+            invitation emails aren't available yet, so they can't sign in until then.
+          </div>
           <div className="row gap-8 mt-16">
-            <button className="btn primary" onClick={sendInvite} disabled={saving || !invite.email.trim()}>
-              {saving ? "sending…" : "Send invite"}
+            <button className="btn primary" onClick={addMember} disabled={saving || !invite.email.trim()}>
+              {saving ? "adding…" : "Add member"}
             </button>
             <button className="btn ghost" onClick={() => setOpen(false)} disabled={saving}>
               Cancel
@@ -417,14 +573,20 @@ function TeamTab({ mid }: { mid: string }) {
 // ---- Audit log --------------------------------------------------------------
 
 function AuditTab() {
-  const { data, loading, error } = useApi<{ items: AuditLog[] }>(() => api.get("/admin/audit-logs?limit=50"), []);
+  const { data, loading, error, errorStatus: status } = useApi<{ items?: AuditLog[] } | null>(() => api.get("/admin/audit-logs?limit=50"), []);
 
   if (loading) return <Spinner />;
-  if (error) return <ErrorBanner message={error} />;
+  if (error) {
+    return status === 403 ? (
+      <EmptyState title="The audit log is for admins and owners" hint="Your role can't view governance events. Ask a workspace admin if you need something checked." />
+    ) : (
+      <ErrorBanner message={error} />
+    );
+  }
   const items = data?.items ?? [];
 
   return (
-    <Card flush title="Audit log" sub="last 50 governance events — who changed what, and when">
+    <Card flush title="Audit log" sub="last 50 governance events — what changed, and when">
       {items.length === 0 ? (
         <div style={{ padding: 20 }}>
           <EmptyState title="No audit events yet" hint="Member changes, secret rotations, and payout approvals will appear here." />
@@ -456,8 +618,8 @@ function AuditTab() {
                       </span>
                     )}
                   </td>
-                  <td className="muted" style={{ fontSize: 12 }}>
-                    {l.actorEmail ?? "system"}
+                  <td className="muted mono" style={{ fontSize: 12 }}>
+                    {l.actorId ? l.actorId : <span className="faint">not recorded</span>}
                   </td>
                   <td className="num muted" style={{ fontSize: 12 }}>
                     {shortDate(l.ts)}

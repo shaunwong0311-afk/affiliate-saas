@@ -1,85 +1,91 @@
 import { useState } from "react";
-import { api, shortDate } from "../api";
+import { api, errorMessage, shortDate } from "../api";
 import { useApi, Card, Spinner, ErrorBanner, PageHeader, Badge, EmptyState, Field, statusKind } from "../ui";
 import { navigate } from "../router";
 
+// Shapes as the API returns them (`routes/affiliates.ts`, `routes/crm.ts`, the entities).
+// The previous interfaces named fields that do not exist (`email`, `createdAt`, `author`),
+// so the email line always read "no email on file" and every date rendered as a dash.
+
 interface Affiliate {
   id: string;
-  name: string | null;
-  email: string | null;
-  handle: string | null;
+  name?: string | null;
+  primaryEmail?: string | null;
+  country?: string | null;
 }
 
+/** `GET /affiliates/:relationshipId` — the relationship, flat, with `affiliate` joined in. */
 interface Relationship {
   id: string;
   affiliateId: string;
   programId: string;
   status: string;
+  /** seller | recruiter | both */
   role: string;
-  tags: string[] | null;
-  tier?: "A" | "B" | "C" | null;
-  createdAt?: string | null;
-}
-
-interface RelationshipDetail {
-  relationship: Relationship;
-  affiliate: Affiliate | null;
+  tags?: string[] | null;
+  joinedAt?: string | null;
+  source?: string | null;
+  affiliate?: Affiliate | null;
 }
 
 interface Note {
   id: string;
   body: string;
-  author?: string | null;
-  createdAt: string | null;
+  authorId?: string | null;
+  ts?: string | null;
 }
 
 interface Task {
   id: string;
   title: string;
   status: string;
-  dueAt: string | null;
-  createdAt: string | null;
+  dueAt?: string | null;
 }
 
 interface Message {
   id: string;
   direction: string;
   channel: string;
-  subject: string | null;
-  bodyRef: string | null;
-  createdAt: string | null;
+  subject?: string | null;
+  bodyRef?: string | null;
+  ts?: string | null;
 }
 
 type Tab = "notes" | "tasks" | "messages";
 
-const ROLES = ["recruit", "affiliate", "partner", "ambassador"];
+// The enums the relationship PATCH accepts.
+const ROLES = ["seller", "recruiter", "both"];
 const STATUSES = ["pending", "active", "paused", "rejected", "banned"];
 
 export function AffiliateDetail({ relationshipId }: { relationshipId: string }) {
   const [tab, setTab] = useState<Tab>("notes");
   const [err, setErr] = useState<string | null>(null);
 
-  const detail = useApi<RelationshipDetail>(() => api.get(`/affiliates/${relationshipId}`), [relationshipId]);
+  const detail = useApi<Relationship | { relationship?: Relationship; affiliate?: Affiliate | null } | null>(
+    () => api.get(`/affiliates/${encodeURIComponent(relationshipId)}`),
+    [relationshipId],
+  );
 
-  if (detail.loading) return <Spinner />;
+  if (detail.loading && !detail.data) return <Spinner />;
   if (detail.error) return <ErrorBanner message={detail.error} />;
   if (!detail.data) return null;
 
-  // Defensive: tolerate either { relationship, affiliate } or a flat shape.
-  const raw = detail.data as any;
-  const rel: Relationship = raw.relationship ?? raw;
-  const aff: Affiliate | null = raw.affiliate ?? raw.affiliate ?? null;
+  // The route answers a flat relationship with `affiliate` joined in; a nested
+  // { relationship, affiliate } envelope is tolerated too.
+  const raw = detail.data as { relationship?: Relationship; affiliate?: Affiliate | null } & Partial<Relationship>;
+  const rel = (raw.relationship ?? raw) as Relationship;
+  const aff: Affiliate | null = raw.affiliate ?? rel.affiliate ?? null;
 
-  const name = aff?.name ?? aff?.handle ?? aff?.email ?? "Affiliate";
+  const name = aff?.name ?? aff?.primaryEmail ?? "Affiliate";
   const tags = rel.tags ?? [];
 
   async function patchRel(body: Partial<Pick<Relationship, "status" | "role" | "tags">>) {
     setErr(null);
     try {
-      await api.patch(`/affiliates/${relationshipId}`, body);
+      await api.patch(`/affiliates/${encodeURIComponent(relationshipId)}`, body);
       detail.reload();
-    } catch (e: any) {
-      setErr(e?.message ?? "update failed");
+    } catch (e) {
+      setErr(errorMessage(e, "update failed"));
     }
   }
 
@@ -88,7 +94,7 @@ export function AffiliateDetail({ relationshipId }: { relationshipId: string }) 
       <PageHeader
         title={name}
         crumb="CRM · RELATIONSHIP"
-        subtitle={aff?.email ?? "No email on file — enrichment incomplete."}
+        subtitle={aff?.primaryEmail ?? "No email on file."}
         actions={
           <button className="btn ghost" onClick={() => navigate("/affiliates")}>
             ← Back to roster
@@ -103,7 +109,6 @@ export function AffiliateDetail({ relationshipId }: { relationshipId: string }) 
           <div className="row gap-8 wrap" style={{ marginTop: 4 }}>
             <Badge kind={statusKind(rel.status)}>{rel.status}</Badge>
             <Badge kind="info">{rel.role}</Badge>
-            {rel.tier && <Badge kind={`tier-${rel.tier}`}>tier {rel.tier}</Badge>}
             {tags.map((t) => (
               <Badge key={t}>{t}</Badge>
             ))}
@@ -138,10 +143,16 @@ export function AffiliateDetail({ relationshipId }: { relationshipId: string }) 
               <span className="muted">Program ID</span>
               <span className="mono faint">{rel.programId}</span>
             </div>
-            {rel.createdAt && (
+            {rel.joinedAt && (
               <div className="row between" style={{ fontSize: 12.5, marginTop: 6 }}>
                 <span className="muted">Joined</span>
-                <span className="mono faint">{shortDate(rel.createdAt)}</span>
+                <span className="mono faint">{shortDate(rel.joinedAt)}</span>
+              </div>
+            )}
+            {rel.source && (
+              <div className="row between" style={{ fontSize: 12.5, marginTop: 6 }}>
+                <span className="muted">Source</span>
+                <span className="mono faint">{rel.source}</span>
               </div>
             )}
           </div>
@@ -239,7 +250,7 @@ function NotesTab({ relationshipId }: { relationshipId: string }) {
             <div className="card" key={n.id} style={{ background: "var(--ink-850)", padding: 14, marginBottom: 10 }}>
               <div style={{ fontSize: 13.5, whiteSpace: "pre-wrap" }}>{n.body}</div>
               <div className="faint mono" style={{ fontSize: 11, marginTop: 8 }}>
-                {n.author ? `${n.author} · ` : ""}{shortDate(n.createdAt)}
+                {shortDate(n.ts)}
               </div>
             </div>
           ))
@@ -339,7 +350,7 @@ function MessagesTab({ relationshipId }: { relationshipId: string }) {
   const items = Array.isArray(messages.data) ? messages.data : messages.data?.items ?? [];
 
   async function add() {
-    if (!subject.trim()) return;
+    if (!subject.trim() || !bodyRef.trim()) return;
     setBusy(true);
     setErr(null);
     try {
@@ -347,13 +358,15 @@ function MessagesTab({ relationshipId }: { relationshipId: string }) {
         direction: "outbound",
         channel: "email",
         subject: subject.trim(),
-        bodyRef: bodyRef.trim() || null,
+        // Required by the API (a non-empty string) — it used to be sent as null when
+        // left blank, which the route rejects.
+        bodyRef: bodyRef.trim(),
       });
       setSubject("");
       setBodyRef("");
       messages.reload();
-    } catch (e: any) {
-      setErr(e?.message ?? "could not log message");
+    } catch (e) {
+      setErr(errorMessage(e, "could not log message"));
     } finally {
       setBusy(false);
     }
@@ -364,11 +377,11 @@ function MessagesTab({ relationshipId }: { relationshipId: string }) {
       <Field label="Subject">
         <input className="input" placeholder="Re: partnership terms" value={subject} onChange={(e) => setSubject(e.target.value)} />
       </Field>
-      <Field label="Body reference">
-        <input className="input" placeholder="template id or thread ref (optional)" value={bodyRef} onChange={(e) => setBodyRef(e.target.value)} />
+      <Field label="Reference">
+        <input className="input" placeholder="where the message lives — a thread link, template id, or a one-line summary" value={bodyRef} onChange={(e) => setBodyRef(e.target.value)} />
       </Field>
       <div className="row gap-8" style={{ marginTop: 8 }}>
-        <button className="btn primary sm" onClick={add} disabled={busy || !subject.trim()}>
+        <button className="btn primary sm" onClick={add} disabled={busy || !subject.trim() || !bodyRef.trim()}>
           {busy ? "logging…" : "Log outbound email"}
         </button>
       </div>
@@ -387,7 +400,7 @@ function MessagesTab({ relationshipId }: { relationshipId: string }) {
                   <Badge kind={m.direction === "outbound" ? "info" : "pos"}>{m.direction}</Badge>
                   <Badge>{m.channel}</Badge>
                 </div>
-                <span className="faint mono" style={{ fontSize: 11 }}>{shortDate(m.createdAt)}</span>
+                <span className="faint mono" style={{ fontSize: 11 }}>{shortDate(m.ts)}</span>
               </div>
               <div style={{ fontSize: 13.5, fontWeight: 600, marginTop: 8 }}>{m.subject ?? "(no subject)"}</div>
               {m.bodyRef && <div className="faint mono" style={{ fontSize: 11, marginTop: 4 }}>ref: {m.bodyRef}</div>}

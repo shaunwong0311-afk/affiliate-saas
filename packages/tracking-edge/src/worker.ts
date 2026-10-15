@@ -1,4 +1,4 @@
-import { createRedirectHandler, type ClickRecord, type ClickSink, type LinkResolver, type ResolvedLink } from "./handler.js";
+import { createRedirectHandler, decodeLinkCode, type ClickRecord, type ClickSink, type LinkResolver, type ResolvedLink } from "./handler.js";
 
 /**
  * Cloudflare Workers entry for the redirect (Section 11 deployment topology).
@@ -43,10 +43,12 @@ export default {
     const url = new URL(request.url);
     const match = url.pathname.match(/^\/c\/([^/]+)$/);
     if (!match) return new Response("not found", { status: 404 });
+    const code = decodeLinkCode(match[1]!);
+    if (code === null) return new Response("malformed tracking link", { status: 400 });
 
     const handler = createRedirectHandler(new KvLinkResolver(env.LINKS), new QueueClickSink(env.CLICKS));
     const decision = await handler({
-      code: decodeURIComponent(match[1]!),
+      code,
       url,
       ip: request.headers.get("cf-connecting-ip"),
       ua: request.headers.get("user-agent"),

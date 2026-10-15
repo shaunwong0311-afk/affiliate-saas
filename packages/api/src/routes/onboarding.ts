@@ -21,7 +21,9 @@ export const onboardingRoutes: RouteModule = (app, ctx) => {
     const storeConnected = integrations.some((i) => storeKinds.includes(i.kind));
 
     const hasStripeIntegration = integrations.some((i) => i.kind === "stripe");
-    const payoutAccount = await ctx.db.payoutAccounts.findOne((a) => affiliateIds.has(a.affiliateId));
+    const payoutAccount = await ctx.db.payoutAccounts.findOne(
+      (a) => affiliateIds.has(a.affiliateId) && (a.merchantId == null || a.merchantId === merchantId),
+    );
     const payoutConfigured = payoutAccount !== null || hasStripeIntegration;
 
     const mailbox = await ctx.db.mailboxes.findOne((m) => m.merchantId === merchantId);

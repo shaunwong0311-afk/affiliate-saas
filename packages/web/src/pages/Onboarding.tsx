@@ -1,4 +1,4 @@
-import { api, pct, num } from "../api";
+import { api, num } from "../api";
 import { useApi, Card, Stat, Spinner, ErrorBanner, PageHeader, EmptyState } from "../ui";
 import { navigate } from "../router";
 
@@ -10,40 +10,47 @@ interface ChecklistItem {
 }
 
 interface Checklist {
-  items: ChecklistItem[];
-  completed: number;
-  total: number;
-  percentComplete: number;
+  items?: ChecklistItem[];
+  completed?: number;
+  total?: number;
+  /** Sent by the API as a whole number 0–100. Not used: progress is derived from the items. */
+  percentComplete?: number;
 }
 
-/** Route an incomplete item to the page where it gets resolved. */
+/**
+ * Where each incomplete step gets resolved — keyed by the exact keys the checklist route
+ * emits (`routes/onboarding.ts`). A step whose screen does not exist yet (agreements,
+ * creatives) has no entry and shows as "pending" rather than linking somewhere unrelated.
+ */
 const DESTINATIONS: Record<string, { to: string; cta: string }> = {
-  program: { to: "/programs", cta: "Set up program →" },
-  programs: { to: "/programs", cta: "Set up program →" },
-  integration: { to: "/integrations", cta: "Connect →" },
-  integrations: { to: "/integrations", cta: "Connect →" },
-  tracking: { to: "/integrations", cta: "Connect →" },
-  affiliate: { to: "/affiliates", cta: "Add affiliates →" },
-  affiliates: { to: "/affiliates", cta: "Add affiliates →" },
-  recruitment: { to: "/recruitment", cta: "Find affiliates →" },
-  recruit: { to: "/recruitment", cta: "Find affiliates →" },
-  prospects: { to: "/recruitment", cta: "Find affiliates →" },
+  storeConnected: { to: "/integrations", cta: "Connect a store →" },
+  payoutConfigured: { to: "/payouts", cta: "Open payouts →" },
+  mailboxConnected: { to: "/integrations", cta: "Connect a mailbox →" },
+  programCreated: { to: "/programs", cta: "Set up program →" },
+  offerCreated: { to: "/programs", cta: "Add an offer →" },
+  testConversionRun: { to: "/settings", cta: "Postback secret →" },
+  firstAffiliate: { to: "/affiliates", cta: "Add affiliates →" },
+  campaignReady: { to: "/campaigns", cta: "Draft a campaign →" },
 };
 
 function destinationFor(key: string): { to: string; cta: string } | null {
-  if (DESTINATIONS[key]) return DESTINATIONS[key];
-  const hit = Object.keys(DESTINATIONS).find((k) => key.toLowerCase().includes(k));
-  return hit ? DESTINATIONS[hit] : null;
+  return Object.prototype.hasOwnProperty.call(DESTINATIONS, key) ? DESTINATIONS[key]! : null;
 }
 
 export function Onboarding() {
-  const { data, loading, error, reload } = useApi<Checklist>(() => api.get("/onboarding/checklist"));
+  const { data, loading, error, reload } = useApi<Checklist | null>(() => api.get("/onboarding/checklist"));
 
   if (loading) return <Spinner />;
   if (error) return <ErrorBanner message={error} />;
   if (!data) return null;
 
-  const { items, completed, total, percentComplete } = data;
+  const items = data.items ?? [];
+  const total = data.total ?? items.length;
+  const completed = data.completed ?? items.filter((i) => i.done).length;
+  // A 0..1 fraction computed here. The API's `percentComplete` is already ×100, and
+  // feeding that to a formatter that multiplies by 100 showed "3000.0%" and a bar thirty
+  // screens wide.
+  const fraction = total > 0 ? Math.min(1, Math.max(0, completed / total)) : 0;
   const allDone = total > 0 && completed >= total;
 
   return (
@@ -62,7 +69,7 @@ export function Onboarding() {
       <div className="grid grid-3">
         <Stat
           label="Setup progress"
-          value={pct(percentComplete)}
+          value={`${Math.round(fraction * 100)}%`}
           foot={`${num(completed)} of ${num(total)} complete`}
           footClass={allDone ? "pos" : "muted"}
         />
@@ -72,8 +79,8 @@ export function Onboarding() {
 
       <div className="funnel-step" style={{ marginTop: 20, marginBottom: 4 }}>
         <span className="muted" style={{ fontSize: 12.5 }}>completion</span>
-        <div className="funnel-bar" style={{ width: `${Math.max(6, Math.round(percentComplete * 100))}%` }}>
-          {pct(percentComplete)}
+        <div className="funnel-bar" style={{ width: `${Math.max(6, Math.round(fraction * 100))}%` }}>
+          {Math.round(fraction * 100)}%
         </div>
         <span />
       </div>

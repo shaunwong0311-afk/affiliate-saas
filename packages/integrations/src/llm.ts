@@ -51,14 +51,50 @@ export class DeterministicLlm implements LlmClient {
   }
 }
 
+/** Words a short "stop" line may be made of — "STOP please", "pls unsubscribe me, thanks". */
+const STOP_LINE_WORDS =
+  "please|pls|plz|kindly|stop|unsubscribe|remove|me|us|from|your|the|this|that|these|list|mailing|e-?mails?|e-?mailing|sending|contacting|messaging|messages?|thanks|thank|you|thx|ty|now|immediately|all|further|any|more|it|opt|out|of|off|take|hi|hello";
+const STOP_LINE = new RegExp(`^[\\W_]*(?:(?:${STOP_LINE_WORDS})\\b[\\W_]*){1,9}$`, "i");
+const STOP_TRIGGER = /\b(stop|unsubscribe|remove me|opt(?: me)? out|take me off)\b/i;
+/**
+ * Sentences in which the WRITER asks to be left alone. Deliberately narrow: a missed opt-out
+ * still reaches a person (anything unrecognized goes to human review, and the sequence stops
+ * on any reply), whereas a false one would suppress a warm lead — so phrases that merely
+ * look alike are excluded ("please stop me if…", "get us off to a good start", "don't message
+ * me on Instagram", "remove me from the cc").
+ */
+const OPT_OUT_REQUESTS: RegExp[] = [
+  /\b(unsubscribe|remove|delete)\s+(me|us|my (e-?mail|address|name)|this (e-?mail|address))\b(?!\s+from\s+(the\s+)?(cc|thread|chain|loop))/i,
+  /\b(take|get)\s+(me|us)\s+off(?=\s+(of\s+)?(your|this|the|that|these|all|any)\b|\s*[.!,;]|\s*$)/im,
+  /\bopt\s+(me|us)\s+out\b/i,
+  /\bstop\s+(e-?mailing|contacting|sending|spamming|bothering)\b/i,
+  /\b(please|pls|kindly)\s+stop(?=\s*[.!,;]|\s*$|\s+(e-?mail|contact|send|this\b|these\b|it\b|now\b|all\b))/im,
+  /\b(do not|don'?t|never)\s+(e-?mail|contact)\s+(me|us)\b(?!\s+(on|by|via|through|at)\b)/i,
+  /\b(i want|i'd like|i would like|i wish|please|pls|kindly)\s+(to\s+)?(unsubscribe|opt[- ]?out|be removed|be taken off)\b(?!\s+(here|at|by|using|via|below|from (this|our|the)|with|through|any ?time|link))/i,
+  /\bno (more|further) (e-?mails?|messages|contact)\b/i,
+  /\bleave (me|us) alone\b/i,
+];
+
+/**
+ * True when the sender's own words ASK to be removed. Honors the footer-advertised opt-out
+ * deterministically — a line that is just a stop phrase ("STOP", "Stop please", "unsubscribe
+ * me, thanks"), anywhere in the reply — plus an explicit request inside a sentence. It does
+ * NOT fire on the mere word "unsubscribe": that is in the footer of every newsletter, and
+ * matching it anywhere used to suppress prospects on their own mailing-list mail.
+ */
+export function isUnsubscribeRequest(text: string): boolean {
+  for (const line of text.split(/\r?\n/)) {
+    const l = line.trim();
+    if (l && l.length <= 80 && STOP_LINE.test(l) && STOP_TRIGGER.test(l)) return true;
+  }
+  return OPT_OUT_REQUESTS.some((re) => re.test(text));
+}
+
 /** Keyword-grounded reply classifier (Section 8.5). */
 export function classifyReply(text: string): string {
   const t = text.toLowerCase();
-  // Honor the footer-advertised opt-out DETERMINISTICALLY: a bare "STOP"/"unsubscribe" (alone
-  // or as the whole first line) always classifies unsubscribe, whatever any LLM would say.
-  const firstLine = text.trim().split(/\r?\n/)[0]?.trim() ?? "";
-  if (/^(stop|unsubscribe)[.!]?$/i.test(firstLine)) return "unsubscribe";
-  if (/\b(unsubscribe|remove me|stop emailing|opt out)\b/.test(t)) return "unsubscribe";
+  // An opt-out request always wins — whatever else the reply says, whatever any LLM would say.
+  if (isUnsubscribeRequest(text)) return "unsubscribe";
   if (/\b(out of office|on vacation|away until|auto[- ]?reply)\b/.test(t)) return "out_of_office";
   if (/\b(not interested|no thanks|not a fit|please stop|already partnered)\b/.test(t)) return "not_interested";
   if (/\b(how much|what.s the rate|commission|tell me more|interested|sounds good|let.s talk|sign me up)\b/.test(t))

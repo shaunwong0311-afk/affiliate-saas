@@ -191,7 +191,7 @@ export function Developer() {
                   <td className="mono faint" style={{ fontSize: 12 }}>{k.prefix}…</td>
                   <td>
                     <div className="row gap-8">
-                      {k.scopes.map((s) => (
+                      {(k.scopes ?? []).map((s) => (
                         <Badge key={s} kind="info">{s}</Badge>
                       ))}
                     </div>
@@ -249,7 +249,7 @@ export function Developer() {
                     <td className="mono" style={{ fontSize: 12, wordBreak: "break-all" }}>{h.url}</td>
                     <td>
                       <div className="row gap-8" style={{ flexWrap: "wrap" }}>
-                        {h.events.map((e) => (
+                        {(h.events ?? []).map((e) => (
                           <Badge key={e}>{e}</Badge>
                         ))}
                       </div>

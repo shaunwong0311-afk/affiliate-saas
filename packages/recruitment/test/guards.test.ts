@@ -8,7 +8,7 @@ import {
   DEFAULT_DISCOVERY_SOURCES,
 } from "@affiliate/integrations";
 import { systemClock, newId } from "@affiliate/core";
-import { isExistingAffiliate, existingAffiliateEmails, queueFirstTouch, type RecruitmentDeps } from "../src/index.js";
+import { isExistingAffiliate, existingAffiliateIndex, queueFirstTouch, type RecruitmentDeps } from "../src/index.js";
 
 let db: Database;
 let deps: RecruitmentDeps;
@@ -61,9 +61,12 @@ describe("isExistingAffiliate", () => {
   });
 
   it("collects existing affiliate emails (lowercased) once per run", async () => {
+    // `existingAffiliateEmails` was folded into `existingAffiliateIndex` (emails + sites +
+    // accounts) — the run-level guard needs more than the addresses.
     await makeAffiliate("A@known.com");
-    const set = await existingAffiliateEmails(deps, "m1");
-    expect(set.has("a@known.com")).toBe(true);
+    const index = await existingAffiliateIndex(deps, "m1");
+    expect(index.emails.has("a@known.com")).toBe(true);
+    expect(index.matches({ email: "A@Known.com" })).toBe(true);
   });
 });
 

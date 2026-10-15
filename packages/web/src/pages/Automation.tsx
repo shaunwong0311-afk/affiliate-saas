@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { api, pct, num } from "../api";
-import { useApi, Card, Stat, Badge, PageHeader, EmptyState, Field } from "../ui";
+import { useApi, Card, Stat, Badge, PageHeader, EmptyState, Field, safeHref, humanize } from "../ui";
 import { navigate } from "../router";
 
 interface AutomationState {
@@ -16,7 +16,7 @@ interface MerchantFaq { id: string; question: string; answer: string; createdAt:
 interface Deliverability { sent: number; bounceRate: number; complaintRate: number; circuitOpen: boolean }
 interface SourceYieldRow { sourceType: string; sourced: number; contacted: number; producing: number; producedRevenueCents: number; yield: number }
 interface Meeting { id: string; prospectId: string; status: string; bookingUrl: string | null; notes: string | null; createdAt: string }
-interface CycleSummary { sourced: number; scored: number; real?: number; synthetic?: number; autoSent: number; followUpsSent: number; heldForReview: number; circuitOpen: boolean; prunedSources: string[] }
+interface CycleSummary { sourced: number; scored: number; real?: number; synthetic?: number; autoSent: number; followUpsSent: number; heldForReview: number; circuitOpen: boolean; prunedSources?: string[] | null }
 
 export function Automation() {
   const auto = useApi<AutomationState>(() => api.get("/recruitment/automation"));
@@ -71,7 +71,9 @@ export function Automation() {
     finally { setBusy(false); }
   }
 
-  if (auto.loading) return null;
+  if (auto.loading && !auto.data) return null;
+  // Without the automation state the controls below would render as "≥ undefined".
+  if (auto.error && !auto.data) return <div className="err-banner">{auto.error}</div>;
   const s = auto.data;
   const running = s?.status === "running";
 
@@ -113,7 +115,7 @@ export function Automation() {
             <Badge kind="info">follow-ups {lastCycle.followUpsSent}</Badge>
             <Badge kind="warn">held for review {lastCycle.heldForReview}</Badge>
             {lastCycle.circuitOpen && <Badge kind="neg">circuit open</Badge>}
-            {lastCycle.prunedSources.map((p) => <Badge key={p}>pruned: {p}</Badge>)}
+            {(lastCycle.prunedSources ?? []).map((p) => <Badge key={p}>pruned: {p}</Badge>)}
           </div>
           {lastCycle.heldForReview > 0 && (
             <div className="mt-16"><button className="btn sm" onClick={() => navigate("/recruitment")}>Review held prospects →</button></div>
@@ -128,14 +130,14 @@ export function Automation() {
               onChange={(e) => patch({ autoSendMinScore: Number(e.target.value) })} />
           </Field>
           <Field label="HITL tier — at/above this tier a human approves before the first send">
-            <select className="select" value={s?.hitlTier} onChange={(e) => patch({ hitlTier: e.target.value as any })}>
+            <select className="select" value={s?.hitlTier ?? "A"} onChange={(e) => patch({ hitlTier: e.target.value as any })}>
               <option value="A">A only (recommended)</option>
               <option value="B">A + B</option>
               <option value="C">All tiers (everything gated)</option>
             </select>
           </Field>
           <Field label="Meeting tier — at/above this tier an interested reply books a call">
-            <select className="select" value={s?.meetingTier} onChange={(e) => patch({ meetingTier: e.target.value as any })}>
+            <select className="select" value={s?.meetingTier ?? "A"} onChange={(e) => patch({ meetingTier: e.target.value as any })}>
               <option value="A">A only (recommended)</option>
               <option value="B">A + B</option>
               <option value="C">All tiers</option>
@@ -157,7 +159,7 @@ export function Automation() {
               <tbody>
                 {yields.data.map((y) => (
                   <tr key={y.sourceType}>
-                    <td>{y.sourceType.replace(/_/g, " ")}</td>
+                    <td>{humanize(y.sourceType, "unknown source")}</td>
                     <td className="num">{y.sourced}</td>
                     <td className="num">{y.producing}</td>
                     <td className="num"><Badge kind={y.yield > 0.05 ? "pos" : y.sourced >= 20 ? "neg" : ""}>{pct(y.yield)}</Badge></td>
@@ -179,9 +181,9 @@ export function Automation() {
               <tbody>
                 {meetings.data.map((m) => (
                   <tr key={m.id}>
-                    <td className="mono" style={{ fontSize: 12 }}>{m.prospectId.slice(-8)}</td>
+                    <td className="mono" style={{ fontSize: 12 }}>{m.prospectId ? m.prospectId.slice(-8) : "—"}</td>
                     <td><Badge kind={m.status === "completed" ? "pos" : m.status === "cancelled" ? "neg" : "warn"}>{m.status}</Badge></td>
-                    <td>{m.bookingUrl ? <a className="acc" href={m.bookingUrl} target="_blank" rel="noreferrer">link</a> : <span className="faint">—</span>}</td>
+                    <td>{safeHref(m.bookingUrl) ? <a className="acc" href={safeHref(m.bookingUrl)} target="_blank" rel="noreferrer">link</a> : <span className="faint">—</span>}</td>
                     <td className="muted" style={{ fontSize: 12 }}>{m.notes}</td>
                   </tr>
                 ))}

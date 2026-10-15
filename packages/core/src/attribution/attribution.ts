@@ -31,7 +31,18 @@ export interface AttributionInputs {
   offersById: Map<Id, Offer>;
   /** Resolve the relationship (role + sponsor) for a click's affiliate+offer. */
   lookupRelationship: (affiliateId: Id, offerId: Id) => AffiliateRelationship | null;
+  /**
+   * The affiliate's own (global) status. A paused or banned affiliate earns nothing, by
+   * link or by code. Left out, every affiliate counts as active.
+   */
+  isAffiliateActive?: (affiliateId: Id) => boolean;
   priority: AttributionPriority;
+  /**
+   * Precedence per program — it is a program setting, and a merchant can run several. When
+   * the link and the code belong to programs that disagree, `last_touch` (the documented
+   * default) decides. Programs missing here fall back to `priority`.
+   */
+  priorityByProgram?: ReadonlyMap<Id, AttributionPriority>;
   now: Date;
 }
 
@@ -51,16 +62,24 @@ interface CodeCandidate {
   ts: number;
 }
 
+/**
+ * Status is enforced here, for both mechanisms: the relationship, the affiliate and the
+ * offer must all be active for a touch to earn. (Before, only codes checked the
+ * relationship — a banned affiliate kept earning through links, and a paused offer kept
+ * paying.)
+ */
 export function resolveAttribution(inputs: AttributionInputs): AttributionResult {
-  const link = resolveLinkCandidate(inputs);
-  const code = resolveCodeCandidate(inputs);
+  const ignored: string[] = [];
+  const link = resolveLinkCandidate(inputs, ignored);
+  const code = resolveCodeCandidate(inputs, ignored);
 
   if (!link && !code) {
-    return { attribution: null, reason: "no link or code attribution found" };
+    const why = ignored.length ? ` (ignored: ${[...new Set(ignored)].join("; ")})` : "";
+    return { attribution: null, reason: `no link or code attribution found${why}` };
   }
 
   let chosen: "link" | "code";
-  switch (inputs.priority) {
+  switch (effectivePriority(inputs, link, code)) {
     case "link_first":
       chosen = link ? "link" : "code";
       break;
@@ -94,7 +113,7 @@ export function resolveAttribution(inputs: AttributionInputs): AttributionResult
     // offer) so multi-program merchants attribute the code to the correct program.
     const offerId = offerInProgram(inputs, rel.programId);
     if (!offerId) {
-      return { attribution: null, reason: "code matched but no offer in its program" };
+      return { attribution: null, reason: "code matched but no active offer in its program" };
     }
     return {
       attribution: {
@@ -113,14 +132,50 @@ export function resolveAttribution(inputs: AttributionInputs): AttributionResult
   return { attribution: null, reason: "no candidate after priority resolution" };
 }
 
-function resolveLinkCandidate(inputs: AttributionInputs): LinkCandidate | null {
+/** The program's precedence — or `last_touch` when two programs are in play and disagree. */
+function effectivePriority(inputs: AttributionInputs, link: LinkCandidate | null, code: CodeCandidate | null): AttributionPriority {
+  const byProgram = inputs.priorityByProgram;
+  if (!byProgram) return inputs.priority;
+  const linkProgram = link ? inputs.offersById.get(link.click.offerId)?.programId : undefined;
+  const codeProgram = code?.match.relationship.programId;
+  const forLink = linkProgram !== undefined ? byProgram.get(linkProgram) : undefined;
+  const forCode = codeProgram !== undefined ? byProgram.get(codeProgram) : undefined;
+  if (forLink && forCode) return forLink === forCode ? forLink : "last_touch";
+  return forLink ?? forCode ?? inputs.priority;
+}
+
+const affiliateIsActive = (inputs: AttributionInputs, affiliateId: Id): boolean =>
+  inputs.isAffiliateActive ? inputs.isAffiliateActive(affiliateId) : true;
+
+/** The relationship a click may earn through, or null (with the reason noted) when it may not. */
+function earningRelationship(inputs: AttributionInputs, click: Click, ignored: string[]): AffiliateRelationship | null {
+  const offer = inputs.offersById.get(click.offerId);
+  if (!offer) return null;
+  if (offer.status !== "active") {
+    ignored.push(`click on ${offer.status} offer`);
+    return null;
+  }
+  if (!affiliateIsActive(inputs, click.affiliateId)) {
+    ignored.push("click from an affiliate who is not active");
+    return null;
+  }
+  const rel = inputs.lookupRelationship(click.affiliateId, click.offerId);
+  if (!rel) return null;
+  if (rel.status !== "active") {
+    ignored.push(`click from a ${rel.status} relationship`);
+    return null;
+  }
+  return rel;
+}
+
+function resolveLinkCandidate(inputs: AttributionInputs, ignored: string[]): LinkCandidate | null {
   const orderTs = new Date(inputs.order.ts).getTime();
 
   // 1) Deterministic: explicit click_id from the postback.
   if (inputs.postbackClick) {
     const c = inputs.postbackClick;
     if (withinWindow(c, orderTs, inputs.offersById)) {
-      const rel = inputs.lookupRelationship(c.affiliateId, c.offerId);
+      const rel = earningRelationship(inputs, c, ignored);
       if (rel) return { click: c, relationship: rel, ts: new Date(c.ts).getTime() };
     }
   }
@@ -131,20 +186,27 @@ function resolveLinkCandidate(inputs: AttributionInputs): LinkCandidate | null {
     .sort((a, b) => new Date(b.ts).getTime() - new Date(a.ts).getTime());
 
   for (const c of eligible) {
-    const rel = inputs.lookupRelationship(c.affiliateId, c.offerId);
+    const rel = earningRelationship(inputs, c, ignored);
     if (rel) return { click: c, relationship: rel, ts: new Date(c.ts).getTime() };
   }
 
   return null;
 }
 
-function resolveCodeCandidate(inputs: AttributionInputs): CodeCandidate | null {
+function resolveCodeCandidate(inputs: AttributionInputs, ignored: string[]): CodeCandidate | null {
   const orderTs = new Date(inputs.order.ts).getTime();
   for (const match of inputs.matchedCodes) {
     const code = match.code;
     if (code.expiresAt && new Date(code.expiresAt).getTime() < orderTs) continue;
     if (code.usageCap != null && code.usageCount >= code.usageCap) continue;
-    if (match.relationship.status !== "active") continue;
+    if (match.relationship.status !== "active") {
+      ignored.push(`code from a ${match.relationship.status} relationship`);
+      continue;
+    }
+    if (!affiliateIsActive(inputs, match.relationship.affiliateId)) {
+      ignored.push("code from an affiliate who is not active");
+      continue;
+    }
     return { match, ts: orderTs }; // a code used at checkout is "touched" at order time
   }
   return null;
@@ -161,13 +223,10 @@ function withinWindow(click: Click, orderTs: number, offersById: Map<Id, Offer>)
   return orderTs - clickTs <= windowMs;
 }
 
-/** Select an active offer belonging to a specific program (for code attribution). */
+/** Select an ACTIVE offer belonging to a specific program (for code attribution). A paused offer pays nothing. */
 function offerInProgram(inputs: AttributionInputs, programId: Id): Id | null {
-  let fallback: Id | null = null;
   for (const offer of inputs.offersById.values()) {
-    if (offer.programId !== programId) continue;
-    if (offer.status === "active") return offer.id;
-    fallback ??= offer.id;
+    if (offer.programId === programId && offer.status === "active") return offer.id;
   }
-  return fallback;
+  return null;
 }

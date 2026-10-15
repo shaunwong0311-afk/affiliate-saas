@@ -35,7 +35,10 @@ const TRANSITIONS: Record<ProspectState, ProspectState[]> = {
   discovered: ["enriched", "dead"],
   enriched: ["scored", "dead"],
   scored: ["queued", "dead"],
-  queued: ["contacted", "dead"],
+  // queued → scored: a first touch that could NOT be sent (transport failure, content gate,
+  // paused mailbox, missing postal address) goes back to scored to be retried — it is never
+  // left stranded in `queued`, and never marked contacted for mail that did not leave.
+  queued: ["contacted", "scored", "dead"],
   contacted: ["in_sequence", "replied", "dead"],
   in_sequence: ["replied", "contacted", "dead"], // contacted = next sequence step sent
   replied: ["converted", "in_sequence", "dead"], // a reply may be re-sequenced or close

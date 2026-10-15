@@ -1,6 +1,7 @@
-import { newId } from "@affiliate/core";
-import type { RawCandidate } from "@affiliate/integrations";
+import { emailDomain, hostIsOrUnder, newId } from "@affiliate/core";
+import { unsafeUrlReason, type RawCandidate } from "@affiliate/integrations";
 import type { RecruitmentDeps } from "./deps.js";
+import { excludedContactDomains, ingestExclusionReason, ingestExclusionsFor } from "./guards.js";
 import { ingestCandidate, buildIdentityIndex } from "./pipeline.js";
 
 /**
@@ -30,6 +31,25 @@ export interface ProspectImportResult {
   imported: number; // net-new prospects created
   merged: number; // rows that matched an existing prospect (deduped)
   skipped: number; // rows with no usable identifier
+  /** Rows refused because they point at a competitor's or the merchant's own domain. */
+  excluded: number;
+  /** URLs dropped from rows because they are not a public http(s) address (the row may still import). */
+  rejectedUrls: number;
+}
+
+/**
+ * An import row's URL is USER INPUT that the engine will later fetch. Accept only what
+ * could be a public web page: http(s), no embedded credentials, not localhost / an
+ * internal name / a private or metadata IP in any spelling. (A hostname that merely
+ * RESOLVES to a private address passes here and is refused at fetch time by the outbound
+ * guard — this is the cheap, synchronous half.) A bare `example.com` gets `https://`.
+ */
+function cleanImportUrl(raw: string | null | undefined): { url: string | null; rejected: boolean } {
+  const text = raw?.trim();
+  if (!text) return { url: null, rejected: false };
+  const withScheme = /^[a-z][a-z0-9+.-]*:/i.test(text) ? text : `https://${text}`;
+  if (unsafeUrlReason(withScheme)) return { url: null, rejected: true };
+  return { url: withScheme, rejected: false };
 }
 
 export async function importProspects(
@@ -42,17 +62,33 @@ export async function importProspects(
   const source = opts.source ?? "import";
   // One identity index for the whole batch (same as the discovery loop) — O(1) merge lookups.
   const identityIndex = await buildIdentityIndex(deps, merchantId);
+  const exclusions = await ingestExclusionsFor(deps, merchant);
+  const noContactAt = excludedContactDomains(exclusions);
   let imported = 0;
   let merged = 0;
   let skipped = 0;
+  let excluded = 0;
+  let rejectedUrls = 0;
 
   for (const row of rows) {
-    const email = row.email?.trim().toLowerCase() || null;
-    const siteUrl = row.siteUrl?.trim() || null;
-    const channelUrl = row.channelUrl?.trim() || null;
     const name = row.name?.trim();
+    const site = cleanImportUrl(row.siteUrl);
+    const channel = cleanImportUrl(row.channelUrl);
+    rejectedUrls += Number(site.rejected) + Number(channel.rejected);
+    const siteUrl = site.url;
+    const channelUrl = channel.url;
+
+    // The address must at least be shaped like one, and — like every other contact the
+    // engine keeps — must not sit at a competitor's or the merchant's own domain.
+    let email = row.email?.trim().toLowerCase() || null;
+    const domain = email ? emailDomain(email) : null;
+    if (email && (!domain || !/^[^@\s]+@[^@\s]+$/.test(email))) email = null;
+    const emailExcluded = !!email && !!domain && noContactAt.some((d) => hostIsOrUnder(domain, d));
+    if (emailExcluded) email = null;
+
     if (!name || (!email && !siteUrl && !channelUrl)) {
-      skipped++;
+      if (name && emailExcluded) excluded++;
+      else skipped++;
       continue;
     }
 
@@ -63,30 +99,44 @@ export async function importProspects(
       sourceType: source,
       evidenceUrl: siteUrl ?? channelUrl,
       evidenceSummary: row.notes?.trim() || `Imported ${email ? `(${email})` : ""}`.trim(),
-      // The email is the merchant's own data — surface it as an outbound link so the identity
-      // graph/merge can key on its domain, then set it on the prospect below.
-      outboundLinks: email ? [`mailto:${email}`] : [],
+      outboundLinks: [],
+      // The address is the merchant's own data: carried as a source-vouched contact.
+      ...(email ? { contactEmails: [{ email, source: "import" }] } : {}),
       synthetic: false,
     };
+    // The merchant chose these rows, so the retailer/platform denylist does not apply —
+    // but a competitor's own domain or the merchant's own is still never a prospect.
+    if (ingestExclusionReason(cand, exclusions, { trusted: true })) {
+      excluded++;
+      continue;
+    }
 
-    const prospect = await ingestCandidate(deps, merchant, cand, { identityIndex });
+    const now = deps.clock.now().toISOString();
+    const prospect = await ingestCandidate(deps, merchant, cand, { identityIndex, exclusions, trusted: true });
     if (prospect) {
-      // ingestCandidate always inserts email:null (RawCandidate has no email field) — stamp
-      // the merchant-provided address so the prospect is immediately contactable.
-      if (email && !prospect.email) await deps.db.prospects.update(prospect.id, { email, updatedAt: deps.clock.now().toISOString() });
+      // ingestCandidate always inserts email:null — stamp the merchant-provided address so
+      // the prospect is immediately contactable, and record WHERE it came from: enrich
+      // keeps an "import" address as given instead of overwriting it with what it finds.
+      if (email) {
+        await deps.db.prospects.update(prospect.id, { email, evidence: { ...(prospect.evidence ?? {}), contactSource: "import", contactVerified: false }, updatedAt: now });
+      }
       imported++;
     } else {
       merged++;
-      // Merged into an existing prospect: fill in the email if that prospect lacks one.
+      // Matched an existing prospect: fill in the email if that prospect lacks one.
       if (email) {
         const existing = await deps.db.prospects.findOne(
-          (p) => p.merchantId === merchantId && ((siteUrl && p.siteUrl === siteUrl) || (channelUrl && p.channelUrl === channelUrl) || p.identity === name),
+          (p) =>
+            p.merchantId === merchantId &&
+            ((!!siteUrl && p.siteUrl === siteUrl) || (!!channelUrl && p.channelUrl === channelUrl) || (!siteUrl && !channelUrl && p.identity === name)),
         );
-        if (existing && !existing.email) await deps.db.prospects.update(existing.id, { email, updatedAt: deps.clock.now().toISOString() });
+        if (existing && !existing.email) {
+          await deps.db.prospects.update(existing.id, { email, evidence: { ...(existing.evidence ?? {}), contactSource: "import", contactVerified: false }, updatedAt: now });
+        }
       }
     }
   }
-  return { imported, merged, skipped };
+  return { imported, merged, skipped, excluded, rejectedUrls };
 }
 
 export interface AffiliateRosterRow {

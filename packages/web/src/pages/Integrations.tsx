@@ -1,12 +1,13 @@
 import { useEffect, useState } from "react";
-import { api, shortDate } from "../api";
-import { useApi, Card, Spinner, ErrorBanner, PageHeader, Badge, EmptyState, Field, statusKind } from "../ui";
+import { api, errorMessage, shortDate } from "../api";
+import { hashParam, navigate } from "../router";
+import { useApi, Card, Spinner, ErrorBanner, PageHeader, Badge, EmptyState, Field, statusKind, humanize } from "../ui";
 
 interface Integration {
   id: string;
   kind: string;
   status: string;
-  lastSyncAt: string | null;
+  lastSyncAt?: string | null;
 }
 
 interface Mailbox {
@@ -15,7 +16,10 @@ interface Mailbox {
   email: string;
   status: string;
   dailyCap: number;
+  /** "not_started" | "warming" | "ready" */
   warmupStatus: string;
+  /** Set when the deliverability monitor paused this mailbox. */
+  autoPausedReason?: string | null;
 }
 
 interface Domain {
@@ -53,17 +57,15 @@ export function Integrations() {
   const [oauthBanner, setOauthBanner] = useState<{ ok: boolean; text: string } | null>(null);
 
   useEffect(() => {
-    const raw = window.location.hash; // e.g. "#/integrations?connected=microsoft"
-    const qi = raw.indexOf("?");
-    if (qi === -1) return;
-    const params = new URLSearchParams(raw.slice(qi + 1));
-    const connected = params.get("connected");
-    const oauthError = params.get("oauth_error");
-    if (connected) setOauthBanner({ ok: true, text: `${connected[0].toUpperCase()}${connected.slice(1)} mailbox connected.` });
+    // e.g. "#/integrations?connected=microsoft"
+    const connected = hashParam("connected");
+    const oauthError = hashParam("oauth_error");
+    if (connected) setOauthBanner({ ok: true, text: `${connected.charAt(0).toUpperCase()}${connected.slice(1)} mailbox connected.` });
     else if (oauthError) setOauthBanner({ ok: false, text: `Connection failed: ${oauthError}` });
     if (connected || oauthError) {
-      // Strip the query so a refresh doesn't re-show the banner; keep the route.
-      window.location.hash = "#/integrations";
+      // Strip the query so a refresh doesn't re-show the banner; keep the route. Replace the
+      // history entry — Back should not return to the one-off callback URL.
+      navigate("/integrations", { replace: true });
       if (connected) mailboxes.reload();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -88,8 +90,8 @@ export function Integrations() {
     try {
       await fn();
       reload();
-    } catch (e: any) {
-      setErr(e?.message ?? "request failed");
+    } catch (e) {
+      setErr(errorMessage(e, "request failed"));
     } finally {
       setBusy(null);
     }
@@ -343,9 +345,9 @@ export function Integrations() {
             {testResult && (
               <div className="mt-16" style={{ fontSize: 12.5 }}>
                 {testResult.ok ? (
-                  <Badge kind="ok">✓ connection verified</Badge>
+                  <Badge kind="pos">✓ connection verified</Badge>
                 ) : (
-                  <span><Badge kind="danger">✕ test failed</Badge> <span className="faint">{testResult.reason}</span></span>
+                  <span><Badge kind="neg">✕ test failed</Badge> <span className="faint">{testResult.reason}</span></span>
                 )}
               </div>
             )}
@@ -376,8 +378,11 @@ export function Integrations() {
                   <tr key={b.id}>
                     <td><span className="mono" style={{ fontSize: 12.5 }}>{b.email}</span></td>
                     <td className="muted" style={{ fontSize: 12, textTransform: "capitalize" }}>{b.provider}</td>
-                    <td><Badge kind={statusKind(b.status)}>{b.status}</Badge></td>
-                    <td><Badge kind={statusKind(b.warmupStatus)}>{b.warmupStatus}</Badge></td>
+                    <td>
+                      <Badge kind={statusKind(b.status)}>{b.status}</Badge>
+                      {b.autoPausedReason && <div className="neg" style={{ fontSize: 11, marginTop: 4 }}>{b.autoPausedReason}</div>}
+                    </td>
+                    <td><Badge kind={statusKind(b.warmupStatus)}>{humanize(b.warmupStatus)}</Badge></td>
                     <td className="num mono">{b.dailyCap}</td>
                     <td className="num">
                       <div className="row gap-8" style={{ justifyContent: "flex-end" }}>
@@ -397,11 +402,14 @@ export function Integrations() {
                         >
                           Test
                         </button>
+                        {/* warmupStatus is "not_started" | "warming" | "ready" (mailbox PATCH schema).
+                            "Mark warmed" used to send "active", which the API rejects. */}
                         {b.warmupStatus === "warming" ? (
                           <button
                             className="btn sm ghost"
-                            onClick={() => run(`mb-warm-${b.id}`, () => api.patch(`/mailboxes/${b.id}`, { warmupStatus: "active" }), mailboxes.reload)}
+                            onClick={() => run(`mb-warm-${b.id}`, () => api.patch(`/mailboxes/${b.id}`, { warmupStatus: "ready" }), mailboxes.reload)}
                             disabled={busy === `mb-warm-${b.id}`}
+                            title="Skip the rest of the warmup ramp and send at the full daily cap"
                           >
                             Mark warmed
                           </button>
@@ -411,7 +419,7 @@ export function Integrations() {
                             onClick={() => run(`mb-warm-${b.id}`, () => api.patch(`/mailboxes/${b.id}`, { warmupStatus: "warming" }), mailboxes.reload)}
                             disabled={busy === `mb-warm-${b.id}`}
                           >
-                            Restart warmup
+                            {b.warmupStatus === "ready" ? "Restart warmup" : "Start warmup"}
                           </button>
                         )}
                         <button
@@ -478,7 +486,7 @@ export function Integrations() {
                     <td><Badge kind={statusKind(d.spfStatus)}>{d.spfStatus}</Badge></td>
                     <td><Badge kind={statusKind(d.dkimStatus)}>{d.dkimStatus}</Badge></td>
                     <td><Badge kind={statusKind(d.dmarcStatus)}>{d.dmarcStatus}</Badge></td>
-                    <td><Badge kind={statusKind(d.warmupStatus)}>{d.warmupStatus}</Badge></td>
+                    <td><Badge kind={statusKind(d.warmupStatus)}>{humanize(d.warmupStatus)}</Badge></td>
                     <td className="num">
                       <button
                         className="btn sm"

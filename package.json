@@ -12,7 +12,7 @@
   },
   "scripts": {
     "build": "tsc -b",
-    "typecheck": "tsc -b --noEmit || tsc -b",
+    "typecheck": "tsc -b && npm run typecheck -w @affiliate/web",
     "test": "vitest run",
     "test:watch": "vitest",
     "api": "node --import tsx packages/api/src/server.ts",
@@ -20,7 +20,7 @@
     "worker": "node --import tsx packages/api/src/worker.ts",
     "demo": "node --import tsx packages/api/src/dev/demo.ts",
     "web:dev": "npm run dev -w @affiliate/web",
-    "lint": "tsc -b --noEmit"
+    "lint": "npm run typecheck"
   },
   "dependencies": {
     "tsx": "^4.19.2"

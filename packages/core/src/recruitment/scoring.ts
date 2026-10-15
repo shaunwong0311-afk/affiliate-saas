@@ -12,16 +12,26 @@ import { audienceQualityFlag } from "./audience-quality.js";
 export type Tier = "A" | "B" | "C";
 
 export interface ScoringSignals {
-  /** Topical match between prospect content and the merchant's product (0..1). */
-  relevance: number;
+  /**
+   * Topical match between prospect content and the merchant's product (0..1). `null` =
+   * unknown — the relevance scorer was unavailable (model/transport failure). Excluded
+   * from the score like any other unknown; never scored as "irrelevant".
+   */
+  relevance: number | null;
   /** Already runs affiliate links anywhere — proven monetizer. */
   runsAffiliateLinks: boolean;
   /** Already promotes a DIRECT competitor — the strongest predictor. */
   promotesCompetitor: boolean;
   /** Produces reviews / comparisons / "best of" — high commercial intent (0..1). */
   commercialIntent: number;
-  /** Verified email or a clear contact path. */
+  /** A contact path is on file (an email we can write to). */
   contactable: boolean;
+  /**
+   * Whether that contact was confirmed by a real deliverability check. `false` = on file
+   * but unverified (merchant-imported, or a demo pattern-guess) — the score note says so
+   * instead of claiming "verified". Omitted = verified (the pre-existing meaning).
+   */
+  contactVerified?: boolean;
   // ---- Signals that REQUIRE a real data provider. `null` = unknown (a provider
   // isn't wired). Unknown signals are EXCLUDED from the score and lower confidence
   // — they are never invented. ----------------------------------------------
@@ -29,10 +39,18 @@ export interface ScoringSignals {
   reach: number | null;
   /** Domain authority 0..100. null if no SEO provider (Ahrefs/Similarweb) is wired. */
   domainAuthority: number | null;
-  /** Engagement rate 0..1. null if no creator-analytics provider is wired. */
+  /**
+   * Engagement rate as a FRACTION (0.03 = 3%), normalized on {@link ENGAGEMENT_SCALE}.
+   * null if no creator-analytics provider is wired.
+   */
   engagementRate: number | null;
   /** Geo / language / demographic alignment 0..1. null if no audience data. */
   audienceOverlap: number | null;
+  /**
+   * Content freshness 0..1 from the most recent content date (see `activityRecency`).
+   * null/omitted when no provider exposed a date — unknown never penalizes.
+   */
+  activityRecency?: number | null;
 }
 
 export interface ScoringWeights {
@@ -43,9 +61,15 @@ export interface ScoringWeights {
   commercialIntent: number;
   contactability: number;
   audienceOverlap: number;
+  /** Content freshness — a dead property is worth less than an active one. */
+  activity: number;
 }
 
-/** Heuristic starting weights (sum ≈ 1). Affiliate-propensity is weighted heaviest. */
+/**
+ * Heuristic starting weights. They are RELATIVE: the score renormalizes over whichever
+ * factors are known, so the sum need not be 1 (it is 1.05). Affiliate-propensity is
+ * weighted heaviest.
+ */
 export const defaultWeights: ScoringWeights = {
   relevance: 0.2,
   affiliatePropensity: 0.3,
@@ -54,6 +78,7 @@ export const defaultWeights: ScoringWeights = {
   commercialIntent: 0.1,
   contactability: 0.1,
   audienceOverlap: 0.05,
+  activity: 0.05,
 };
 
 export interface ScoreContribution {
@@ -99,6 +124,38 @@ function normalizeReach(reach: number): number {
   return clamp01(Math.log10(reach) / 7); // 10^7 = 10M → 1.0
 }
 
+/**
+ * The engagement scale: `[rate, score]` anchors, linear in between. A rate is a FRACTION
+ * of the audience (or of views) that engaged — 0.03 means 3%.
+ *
+ *     0%  → 0.00
+ *     1%  → 0.50   the credibility floor (below it a large audience looks inorganic)
+ *     3%  → 0.85   solid for a creator of any size
+ *     5%+ → 1.00   strong — saturates
+ *
+ * Raw rates live in a narrow band near zero (a superb creator measures 0.06), so using
+ * the rate itself as a 0..1 score made a MEASURED strong rate drag the score down while
+ * "unknown" left it alone. On this scale a strong rate scores high and only a genuinely
+ * weak one scores low.
+ */
+export const ENGAGEMENT_SCALE: ReadonlyArray<readonly [rate: number, score: number]> = [
+  [0, 0],
+  [0.01, 0.5],
+  [0.03, 0.85],
+  [0.05, 1],
+];
+
+/** Normalize an engagement rate (fraction) to 0..1 on {@link ENGAGEMENT_SCALE}. */
+export function normalizeEngagementRate(rate: number): number {
+  if (!Number.isFinite(rate) || rate <= 0) return 0;
+  for (let i = 1; i < ENGAGEMENT_SCALE.length; i++) {
+    const [r0, s0] = ENGAGEMENT_SCALE[i - 1]!;
+    const [r1, s1] = ENGAGEMENT_SCALE[i]!;
+    if (rate <= r1) return s0 + ((rate - r0) / (r1 - r0)) * (s1 - s0);
+  }
+  return 1;
+}
+
 function affiliatePropensity(s: ScoringSignals): { value: number; note: string } {
   if (s.promotesCompetitor) return { value: 1, note: "promotes a direct competitor (strongest signal)" };
   if (s.runsAffiliateLinks) return { value: 0.6, note: "runs affiliate links (proven monetizer)" };
@@ -117,10 +174,13 @@ export function scoreProspect(
   // known — the score is never inflated by invented data.
   const da = signals.domainAuthority;
   const eng = signals.engagementRate;
-  const quality =
-    da == null && eng == null
-      ? null
-      : clamp01(((da != null ? clamp01(da / 100) : 0) + (eng != null ? clamp01(eng) : 0)) / ((da != null ? 1 : 0) + (eng != null ? 1 : 0)));
+  // Quality = the mean of whichever of its two measurements are KNOWN, each on its own
+  // 0..1 scale (DA/100; engagement on ENGAGEMENT_SCALE). Unknown halves are left out,
+  // not averaged in as zero.
+  const qualityParts: number[] = [];
+  if (da != null) qualityParts.push(clamp01(da / 100));
+  if (eng != null) qualityParts.push(normalizeEngagementRate(eng));
+  const quality = qualityParts.length ? qualityParts.reduce((a, b) => a + b, 0) / qualityParts.length : null;
 
   // Audience-quality discount: a bought/inactive audience shouldn't earn full reach credit.
   // Derived from the reach + engagement we already measure; null (no adjustment) when unknown.
@@ -128,14 +188,23 @@ export function scoreProspect(
   const reachDiscount = qualityFlag?.suspicious ? 1 - 0.6 * qualityFlag.severity : 1; // up to −60%
   const reachNormalized = signals.reach == null ? null : normalizeReach(signals.reach) * reachDiscount;
 
+  const relevance = signals.relevance == null || !Number.isFinite(signals.relevance) ? null : clamp01(signals.relevance);
+  const activity = signals.activityRecency == null || !Number.isFinite(signals.activityRecency) ? null : clamp01(signals.activityRecency);
+  const contactNote = !signals.contactable
+    ? "no verified contact"
+    : signals.contactVerified === false
+      ? "contact path on file — NOT verified"
+      : "verified contact path";
+
   const factors: Array<{ factor: string; weight: number; normalized: number | null; note: string }> = [
-    { factor: "relevance", weight: weights.relevance, normalized: clamp01(signals.relevance), note: "topical match (embedding similarity)" },
+    { factor: "relevance", weight: weights.relevance, normalized: relevance, note: relevance == null ? "relevance unknown (scorer unavailable)" : "topical match with the merchant's niche" },
     { factor: "affiliatePropensity", weight: weights.affiliatePropensity, normalized: propensity.value, note: propensity.note },
     { factor: "reach", weight: weights.reach, normalized: reachNormalized, note: signals.reach == null ? "reach unknown (no provider)" : qualityFlag?.suspicious ? `audience ≈ ${signals.reach.toLocaleString()} — DISCOUNTED (${qualityFlag.reason})` : `audience ≈ ${signals.reach.toLocaleString()}` },
-    { factor: "quality", weight: weights.quality, normalized: quality, note: quality == null ? "DA/engagement unknown (no provider)" : `DA ${da ?? "?"}, engagement ${eng != null ? (eng * 100).toFixed(0) + "%" : "?"}` },
+    { factor: "quality", weight: weights.quality, normalized: quality, note: quality == null ? "DA/engagement unknown (no provider)" : `DA ${da ?? "?"}, engagement ${eng != null ? (eng * 100).toFixed(1) + "%" : "?"}` },
     { factor: "commercialIntent", weight: weights.commercialIntent, normalized: clamp01(signals.commercialIntent), note: "produces reviews/comparisons/best-of" },
-    { factor: "contactability", weight: weights.contactability, normalized: signals.contactable ? 1 : 0, note: signals.contactable ? "verified contact path" : "no verified contact" },
+    { factor: "contactability", weight: weights.contactability, normalized: signals.contactable ? 1 : 0, note: contactNote },
     { factor: "audienceOverlap", weight: weights.audienceOverlap, normalized: signals.audienceOverlap == null ? null : clamp01(signals.audienceOverlap), note: signals.audienceOverlap == null ? "audience overlap unknown (no provider)" : "geo/language/demographic alignment" },
+    { factor: "activity", weight: weights.activity, normalized: activity, note: activity == null ? "content freshness unknown (no provider)" : activity >= 0.75 ? "recently active" : activity >= 0.2 ? "posting has slowed" : "likely dormant — little or no recent content" },
   ];
 
   const known = factors.filter((f) => f.normalized != null);
@@ -185,5 +254,6 @@ export function blendWeights(heuristic: ScoringWeights, learned: Partial<Scoring
     commercialIntent: blend(heuristic.commercialIntent, learned.commercialIntent),
     contactability: blend(heuristic.contactability, learned.contactability),
     audienceOverlap: blend(heuristic.audienceOverlap, learned.audienceOverlap),
+    activity: blend(heuristic.activity, learned.activity),
   };
 }

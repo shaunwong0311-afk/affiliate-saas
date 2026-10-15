@@ -6,6 +6,11 @@
  * same `JobQueue` interface.
  */
 
+// The per-merchant send lock (shared contract 3) lives in merchant-lock.ts. It is re-exported
+// here because the package barrel star-exports this module and `index.ts` is outside the
+// outreach fix stream's ownership — coordinator: this line can move to `index.ts`.
+export { withMerchantLock, withSourcingLock, withKeyLock } from "./merchant-lock.js";
+
 export interface Job<T> {
   id: string;
   name: string;

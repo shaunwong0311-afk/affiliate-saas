@@ -12,6 +12,14 @@ import { badRequest, notFound } from "../errors.js";
 import { writeAudit } from "../services/audit.js";
 import { assertWithinEntitlement, recordUsage } from "../services/entitlements.js";
 import { sendActivationEmail } from "../services/activation-email.js";
+// Campaign handlers (outreach fix stream) — a separate import so it does not collide with other
+// streams' edits to the import block above.
+import { isValidTimeZone } from "@affiliate/recruitment";
+import { constantTimeEqual } from "@affiliate/core";
+import { suppressionsAffecting, MANUAL_SUPPRESSION_REASON } from "@affiliate/recruitment";
+import { forbidden, unauthorized, serviceUnavailable } from "../errors.js";
+import { actorIdOf } from "../services/audit.js";
+import { enforcePublicFormEmailLimit } from "../auth/rate-limit.js";
 
 const outcomeLabel = z.enum([
   "bad_fit",
@@ -23,10 +31,13 @@ const outcomeLabel = z.enum([
   "produced_sales",
 ]);
 
+// The window is measured in `timezone` (an IANA zone) — it is what the scheduler compares the
+// clock against, so an unknown zone is rejected here instead of silently meaning UTC.
+// `endHour` is exclusive; 24 means "until midnight" (0–24 = all day).
 const sendWindowSchema = z.object({
   startHour: z.number().int().min(0).max(23),
-  endHour: z.number().int().min(0).max(23),
-  timezone: z.string(),
+  endHour: z.number().int().min(0).max(24),
+  timezone: z.string().refine(isValidTimeZone, "must be an IANA time zone, e.g. America/Los_Angeles"),
 });
 
 const campaignSchema = z.object({
@@ -230,9 +241,18 @@ export const recruitmentRoutes: RouteModule = (app, ctx) => {
     return ok(reply, campaigns);
   });
 
+  /** A campaign may only send through a mailbox of ITS OWN merchant. (The id used to be
+   *  stored unchecked — a campaign could name another tenant's mailbox and send as them.) */
+  const assertOwnMailbox = async (merchantId: string, mailboxId: string | null | undefined): Promise<void> => {
+    if (!mailboxId) return;
+    const mailbox = await ctx.db.mailboxes.get(mailboxId);
+    if (!mailbox || mailbox.merchantId !== merchantId) throw badRequest("mailboxId does not name one of your mailboxes");
+  };
+
   app.post("/recruitment/campaigns", async (request, reply) => {
     const { merchantId } = await requireMerchant(ctx, request, "write");
     const body = parseBody(campaignSchema, request);
+    await assertOwnMailbox(merchantId, body.mailboxId);
     const campaign: OutreachCampaign = {
       id: newId("camp"),
       merchantId,
@@ -262,12 +282,18 @@ export const recruitmentRoutes: RouteModule = (app, ctx) => {
     if (!campaign || campaign.merchantId !== merchantId) throw notFound("campaign");
     const body = parseBody(
       z.object({
+        name: z.string().min(1).optional(),
         status: z.enum(["draft", "active", "paused", "archived"]).optional(),
         sequence: z.array(z.any()).optional(),
         dailyCap: z.number().int().min(1).max(10000).optional(),
+        // The window (with its time zone) and the mailbox are editable, not create-only: a
+        // campaign made before the zone was honored needs its zone corrected in place.
+        sendWindow: sendWindowSchema.optional(),
+        mailboxId: z.string().nullish(),
       }),
       request,
     );
+    await assertOwnMailbox(merchantId, body.mailboxId);
     const updated = await ctx.db.campaigns.update(id, body as Partial<OutreachCampaign>);
     return ok(reply, updated);
   });
@@ -302,38 +328,46 @@ export const recruitmentRoutes: RouteModule = (app, ctx) => {
   // ---- Suppressions ---------------------------------------------------------
   app.get("/recruitment/suppressions", async (request, reply) => {
     const { merchantId } = await requireMerchant(ctx, request, "read");
-    // Only this merchant's own suppressions — global rows (other tenants' emails /
-    // domains) are NOT enumerable here. They still apply via isSuppressed.
-    const suppressions = await ctx.db.suppressions.find((s) => s.merchantId === merchantId);
-    return ok(reply, suppressions);
+    // Everything that blocks THIS merchant's sends: its own rows, plus platform-wide rows
+    // (someone unsubscribed through another merchant) that hit one of its prospects — those
+    // come back with `merchantId: null`. Unrelated platform rows are other tenants'
+    // unsubscribers and stay non-enumerable.
+    return ok(reply, await suppressionsAffecting(ctx, merchantId));
   });
 
   app.post("/recruitment/suppressions", async (request, reply) => {
     const { merchantId } = await requireMerchant(ctx, request, "write");
     const body = parseBody(
-      z.object({
-        email: z.string().nullish(),
-        domain: z.string().nullish(),
-        scope: z.enum(["global", "merchant"]).default("merchant"),
-      }),
+      z
+        .object({
+          email: z.string().trim().min(1).nullish(),
+          domain: z.string().trim().min(1).nullish(),
+          scope: z.enum(["global", "merchant"]).default("merchant"),
+        })
+        .refine((b) => !!b.email || !!b.domain, { message: "email or domain is required" }),
       request,
     );
-    // A global (cross-tenant) suppression blocks outreach for EVERY merchant, so a
-    // per-tenant "write" user must not create one — require admin for global scope.
-    if (body.scope === "global") await requireMerchant(ctx, request, "admin");
+    // A tenant decides for its own outreach only. A platform-wide ("global") suppression
+    // silences an address — or a whole domain — for EVERY merchant, and every signed-up
+    // account is an admin of its own merchant, so no role may create one here. Global rows
+    // come only from the system paths: the signed unsubscribe link and a STOP reply.
+    if (body.scope === "global") {
+      throw forbidden("global suppressions are created only by the system (unsubscribe link, STOP reply) — use scope \"merchant\"");
+    }
     const suppression: Suppression = {
       id: newId("supp"),
-      merchantId: body.scope === "global" ? null : merchantId,
+      merchantId,
       email: body.email ?? null,
       domain: body.domain ?? null,
-      reason: "manual",
-      scope: body.scope,
+      reason: MANUAL_SUPPRESSION_REASON,
+      scope: "merchant",
+      origin: "merchant",
       ts: ctx.clock.now().toISOString(),
     };
     await ctx.db.suppressions.insert(suppression);
     await writeAudit(ctx, {
       merchantId,
-      actorId: null,
+      actorId: actorIdOf(request),
       action: "recruitment.suppression.created",
       subjectType: "suppression",
       subjectId: suppression.id,
@@ -514,7 +548,12 @@ export const recruitmentRoutes: RouteModule = (app, ctx) => {
   // No JWT — the applicant isn't logged in. Keyed by merchant id in the path.
   app.post("/join/:merchantId", async (request, reply) => {
     const merchantId = (request.params as { merchantId: string }).merchantId;
-    const body = parseBody(z.object({ email: z.string().email(), name: z.string().min(1), socialUrl: z.string().url().optional() }), request);
+    const body = parseBody(z.object({ email: z.string().email(), name: z.string().min(1), socialUrl: z.string().url().optional(), prospectId: z.string().min(1).max(100).optional() }), request);
+    // Abuse guard beyond the per-client limit in app.ts: one address can only be submitted a
+    // few times an hour, whichever merchant or client it comes through. (Counted only for a
+    // merchant that exists — posting an address at made-up ids must not use up its allowance.)
+    if (!(await ctx.db.merchants.get(merchantId))) throw notFound("program");
+    enforcePublicFormEmailLimit(app.rateLimiter, body.email);
     const result = await applyToJoin(ctx, merchantId, body);
     if (!result) throw notFound("program");
     // Auto-approval → active immediately → welcome now. Manual → welcome fires on approve.
@@ -538,30 +577,46 @@ export const recruitmentRoutes: RouteModule = (app, ctx) => {
     if (!step) throw badRequest("campaign has no sequence steps");
     const tokens = { name: "there", merchant: merchant.name, offer: merchant.niche ?? "our products", angle: "Your content is a great match for our products." };
     const mailbox = campaign.mailboxId ? await ctx.db.mailboxes.get(campaign.mailboxId) : null;
-    const sender = await ctx.mailboxResolver(campaign.mailboxId);
-    const results: Array<{ seed: string; status: string }> = [];
+    const results: Array<{ seed: string; status: string; reason?: string }> = [];
+    // A resolver failure is a failed seed send with its reason — never a 500, never the mock.
+    let sender;
+    try {
+      sender = await ctx.mailboxResolver(campaign.mailboxId);
+    } catch (e) {
+      const reason = `mailbox sender could not be resolved: ${e instanceof Error ? e.message : String(e)}`.slice(0, 200);
+      return ok(reply, { results: body.seeds.map((seed) => ({ seed, status: "failed", reason })), note: "Nothing was sent." });
+    }
     for (const seed of body.seeds) {
-      const r = await sender.send({
-        fromName: merchant.name,
-        fromEmail: mailbox?.email ?? `team@${merchant.name.toLowerCase().replace(/\s+/g, "")}.com`,
-        toEmail: seed,
-        subject: `[seed] ${renderTemplate(step.subject, tokens)}`,
-        body: renderTemplate(step.body, tokens),
-      });
-      results.push({ seed, status: r.status });
+      const r = await sender
+        .send({
+          fromName: merchant.name,
+          // The campaign mailbox's own address. Never an invented `team@<name>.com`: without a
+          // connected mailbox only the dev/test mock can send, from a reserved .invalid address.
+          fromEmail: mailbox?.email ?? "no-reply@example.invalid",
+          toEmail: seed,
+          subject: `[seed] ${renderTemplate(step.subject, tokens)}`,
+          body: renderTemplate(step.body, tokens),
+        })
+        .catch((e: unknown) => ({ status: "failed" as const, reason: e instanceof Error ? e.message : String(e) }));
+      results.push({ seed, status: r.status, ...(r.reason ? { reason: r.reason } : {}) });
     }
     await writeAudit(ctx, { merchantId, actorId: null, action: "recruitment.seed_test", subjectType: "campaign", subjectId: id, metadata: { count: body.seeds.length } });
     return ok(reply, { results, note: "Check each seed inbox for primary-vs-spam placement. Automated detection requires seed-inbox IMAP or a GlockApps integration." });
   });
 
   // ---- Inbound reply webhook (Graph / ESP inbound-parse) --------------------
-  // Public endpoint (no JWT — the provider posts here). Guarded by a shared secret:
-  // set INBOUND_WEBHOOK_SECRET in prod; when unset (dev) the guard is skipped.
+  // Public endpoint (no JWT — the provider posts here). Guarded by a shared secret
+  // (INBOUND_WEBHOOK_SECRET) sent in the `x-webhook-secret` header — never the query string,
+  // which ends up in access logs. A forged inbound "STOP" suppresses a contacted prospect, so
+  // in production an unset secret means the route is CLOSED, not open; only outside
+  // production is the guard skipped when no secret is configured.
   app.post("/webhooks/inbound", async (request, reply) => {
-    const secret = process.env.INBOUND_WEBHOOK_SECRET;
-    if (secret) {
-      const provided = (request.headers["x-webhook-secret"] as string | undefined) ?? (request.query as { secret?: string }).secret;
-      if (provided !== secret) throw badRequest("invalid webhook secret");
+    const secret = ctx.config.inboundWebhookSecret;
+    if (!secret) {
+      if (ctx.config.isProduction) throw serviceUnavailable("inbound webhook is not configured", "webhook_not_configured");
+    } else {
+      const provided = request.headers["x-webhook-secret"];
+      if (typeof provided !== "string" || !constantTimeEqual(provided, secret)) throw unauthorized("invalid webhook secret");
     }
     const inbound = parseInboundWebhook(request.body);
     if (!inbound) return ok(reply, { matched: false, reason: "unparseable payload" });

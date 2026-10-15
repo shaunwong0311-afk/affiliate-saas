@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { api, money, num, shortDate } from "../api";
-import { useApi, Card, Stat, Spinner, ErrorBanner, PageHeader, Badge, EmptyState, statusKind } from "../ui";
+import { useApi, Card, Stat, Spinner, ErrorBanner, PageHeader, Badge, EmptyState, statusKind, humanize } from "../ui";
 
 type PlanKey = "track_export" | "managed_payouts" | "done_for_you";
 
@@ -13,11 +13,17 @@ interface Subscription {
 
 interface Entitlement {
   feature: string;
-  limitValue: number;
+  /** null = unlimited (the API's own convention — see `services/entitlements.ts`). */
+  limitValue: number | null;
 }
 
-type UsageMap = Record<string, number>;
 type UsageRow = { kind: string; total: number };
+
+/** Which metered usage counts against an entitlement (names differ: the entitlement
+ *  "recruitment_credits" is consumed by "recruitment_credit" usage events). */
+const USAGE_KIND_FOR_FEATURE: Record<string, string> = {
+  recruitment_credits: "recruitment_credit",
+};
 
 const PLANS: { key: PlanKey; name: string; tier: string; tagline: string; bullets: string[]; priceCents: number }[] = [
   {
@@ -36,11 +42,13 @@ const PLANS: { key: PlanKey; name: string; tier: string; tagline: string; bullet
     key: "managed_payouts",
     name: "Managed Payouts",
     tier: "B",
-    tagline: "We move the money",
+    // Money never passes through the platform (no custody): the merchant pays affiliates
+    // from their own account. This tier is the payout WORKFLOW, not money movement.
+    tagline: "We run the payout workflow",
     bullets: [
       "Everything in Track & Export",
       "Held balances, clawbacks, and reversal handling",
-      "Automated multi-rail payouts with compliance + tax",
+      "Payout batches with PayPal / Wise / CSV files — you pay from your own account",
     ],
     priceCents: 29900,
   },
@@ -62,16 +70,27 @@ function planMeta(key: PlanKey) {
   return PLANS.find((p) => p.key === key) ?? PLANS[0];
 }
 
-function normalizeUsage(raw: UsageMap | UsageRow[] | null): UsageRow[] {
-  if (!raw) return [];
-  if (Array.isArray(raw)) return raw;
-  return Object.entries(raw).map(([kind, total]) => ({ kind, total: Number(total) || 0 }));
+/**
+ * `GET /billing/usage` answers `{ usage: { <kind>: <total> } }`. Reading the outer object
+ * as the map produced a single bogus row called "usage" and left every entitlement's
+ * "used" column empty. A bare map or a row list is still accepted.
+ */
+function normalizeUsage(raw: unknown): UsageRow[] {
+  if (!raw || typeof raw !== "object") return [];
+  if (Array.isArray(raw)) return raw.filter((r): r is UsageRow => !!r && typeof r.kind === "string" && typeof r.total === "number");
+  const record = raw as Record<string, unknown>;
+  const inner = record.usage;
+  const map = inner && typeof inner === "object" && !Array.isArray(inner) ? (inner as Record<string, unknown>) : record;
+  // Only numeric totals are usage rows (this also drops a `usage: null` envelope key).
+  return Object.entries(map)
+    .filter((entry): entry is [string, number] => typeof entry[1] === "number" && Number.isFinite(entry[1]))
+    .map(([kind, total]) => ({ kind, total }));
 }
 
 export function Billing() {
   const sub = useApi<Subscription>(() => api.get("/billing/subscription"));
-  const ents = useApi<Entitlement[]>(() => api.get("/billing/entitlements"));
-  const usage = useApi<UsageMap | UsageRow[]>(() => api.get("/billing/usage"));
+  const ents = useApi<Entitlement[] | null>(() => api.get("/billing/entitlements"));
+  const usage = useApi<unknown>(() => api.get("/billing/usage"));
 
   const [busy, setBusy] = useState<string | null>(null);
   const [msg, setMsg] = useState<string | null>(null);
@@ -100,7 +119,8 @@ export function Billing() {
     setErr(null);
     try {
       await api.post("/billing/cancel", {});
-      setMsg("Subscription set to cancel at period end.");
+      // The API marks the subscription cancelled immediately — there is no period-end grace.
+      setMsg("Subscription cancelled.");
       sub.reload();
     } catch (e: any) {
       setErr(e?.message ?? "Cancel failed");
@@ -124,7 +144,7 @@ export function Billing() {
     }
   }
 
-  async function adjustEntitlement(feature: string, limitValue: number) {
+  async function adjustEntitlement(feature: string, limitValue: number | null) {
     setBusy(`ent:${feature}`);
     setMsg(null);
     setErr(null);
@@ -182,7 +202,7 @@ export function Billing() {
           foot={<Badge kind={statusKind(current.status)}>{current.status}</Badge>}
         />
         <Stat label="Tier price" value={money(meta.priceCents)} foot="per month" footClass="muted" />
-        <Stat label="Renews" value={shortDate(current.renewsAt)} foot={canceling ? "ends at period close" : "auto-renews"} footClass={canceling ? "neg" : "muted"} />
+        <Stat label="Renews" value={shortDate(current.renewsAt)} foot={canceling ? "cancelled — will not renew" : "auto-renews"} footClass={canceling ? "neg" : "muted"} />
         <Stat label="Trial ends" value={shortDate(current.trialEndsAt)} foot={current.trialEndsAt ? "trialing" : "no trial"} footClass="muted" />
       </div>
 
@@ -257,7 +277,7 @@ export function Billing() {
               <tbody>
                 {usageRows.map((r) => (
                   <tr key={r.kind}>
-                    <td style={{ fontWeight: 600 }}>{r.kind.replace(/_/g, " ")}</td>
+                    <td style={{ fontWeight: 600 }}>{humanize(r.kind)}</td>
                     <td className="num mono">{num(r.total)}</td>
                   </tr>
                 ))}
@@ -285,26 +305,31 @@ export function Billing() {
               </thead>
               <tbody>
                 {entitlements.map((e) => {
-                  const used = usageByKind.get(e.feature);
-                  const overLimit = used != null && e.limitValue >= 0 && used > e.limitValue;
+                  // A null (or missing) limit means unlimited — it is not a number to format
+                  // or to step, and calling a number formatter on it used to crash this card.
+                  const limit = typeof e.limitValue === "number" ? e.limitValue : null;
+                  const used = usageByKind.get(USAGE_KIND_FOR_FEATURE[e.feature] ?? e.feature);
+                  const overLimit = used != null && limit !== null && used > limit;
                   return (
                     <tr key={e.feature}>
-                      <td style={{ fontWeight: 600 }}>{e.feature.replace(/_/g, " ")}</td>
-                      <td className="num mono">{e.limitValue < 0 ? "∞" : num(e.limitValue)}</td>
+                      <td style={{ fontWeight: 600 }}>{humanize(e.feature)}</td>
+                      <td className="num mono">{limit === null ? "∞" : num(limit)}</td>
                       <td className={`num mono ${overLimit ? "neg" : "muted"}`}>{used != null ? num(used) : "—"}</td>
                       <td className="num">
                         <div className="row gap-8" style={{ justifyContent: "flex-end" }}>
                           <button
                             className="btn ghost sm"
-                            disabled={busy === `ent:${e.feature}` || e.limitValue <= 0}
-                            onClick={() => adjustEntitlement(e.feature, Math.max(0, e.limitValue - 1))}
+                            disabled={busy === `ent:${e.feature}` || limit === null || limit <= 0}
+                            onClick={() => adjustEntitlement(e.feature, Math.max(0, (limit ?? 0) - 1))}
+                            aria-label={`Lower the ${humanize(e.feature)} limit`}
                           >
                             −
                           </button>
                           <button
                             className="btn ghost sm"
-                            disabled={busy === `ent:${e.feature}`}
-                            onClick={() => adjustEntitlement(e.feature, e.limitValue + 1)}
+                            disabled={busy === `ent:${e.feature}` || limit === null}
+                            onClick={() => adjustEntitlement(e.feature, (limit ?? 0) + 1)}
+                            aria-label={`Raise the ${humanize(e.feature)} limit`}
                           >
                             +
                           </button>

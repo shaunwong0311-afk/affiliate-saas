@@ -11,12 +11,22 @@ import {
   mergeProfiles,
   identitySignalsFromProfile,
   hasIdentitySignal,
+  IdentityKeyIndex,
+  classifyAccountUrl,
   audienceOverlapScore,
   targetMarketForCurrency,
   activityRecency,
   isStale,
   scanContent,
   signUnsubscribeToken,
+  resolveUnsubscribeSecret,
+  hostIsOrUnder,
+  isHostedTenantHost,
+  isMarketplaceHost,
+  isReferenceHost,
+  isSharedPlatformHost,
+  isSocialHost,
+  normalizeHost,
   type ScoringSignals,
   type AffiliateSignal,
   type Tier,
@@ -31,15 +41,17 @@ import {
   extractHrefs,
   discoverContactUrls,
   detectsContactForm,
+  type DiscoveryIssue,
   type DiscoveryQuery,
+  type EmailFinder,
   type RedirectResolver,
   type RawCandidate,
 } from "@affiliate/integrations";
 import type { RecruitmentDeps } from "./deps.js";
 import type { DiscoveryPlan } from "./discovery-planner.js";
 import { isSuppressed, suppress } from "./suppression.js";
-import { isExistingAffiliate } from "./guards.js";
-import { resolveContact } from "./contact-resolver.js";
+import { isExistingAffiliate, ingestExclusionsFor, ingestExclusionReason, excludedContactDomains, type IngestExclusions } from "./guards.js";
+import { resolveContact, screenContacts, contactRejection } from "./contact-resolver.js";
 import { personalizeOutreach } from "./personalization.js";
 import { firstStep, personalizationDepth, pickVariant } from "./sequencing.js";
 import { weightsForMerchant } from "./learning.js";
@@ -55,7 +67,18 @@ import { weightsForMerchant } from "./learning.js";
 export async function discover(
   deps: RecruitmentDeps,
   merchantId: string,
-  opts?: { limit?: number; excludeSourceTypes?: string[]; plan?: DiscoveryPlan },
+  opts?: {
+    limit?: number;
+    excludeSourceTypes?: string[];
+    plan?: DiscoveryPlan;
+    /**
+     * Told about every source failure — a provider that rejected the key, ran out of
+     * quota or timed out. Failures are still ISOLATED (one source down does not stop the
+     * others); this is what keeps "the provider refused us" from looking like "nothing
+     * was found".
+     */
+    onSourceError?: (issue: DiscoveryIssue) => void;
+  },
 ): Promise<Prospect[]> {
   const merchant = await deps.db.merchants.require(merchantId);
   const query: DiscoveryQuery = {
@@ -81,36 +104,100 @@ export async function discover(
 
   const created: Prospect[] = [];
   // One identity-key index for the whole run: candidates dedup/merge against it in O(1)
-  // instead of each ingest rescanning every prospect (was O(C×N)).
+  // instead of each ingest rescanning every prospect (was O(C×N)). Same for the domains
+  // discovery must keep away from (competitors + the merchant's own).
   const identityIndex = await buildIdentityIndex(deps, merchantId);
+  const exclusions = await ingestExclusionsFor(deps, merchant);
+  const report = (issue: DiscoveryIssue) => {
+    try {
+      opts?.onSourceError?.(issue);
+    } catch {
+      /* a reporting hook must never break sourcing */
+    }
+  };
   for (const source of sources) {
     if (excluded.has(source.sourceType)) continue; // source-yield pruning
     let candidates;
     try {
-      candidates = await source.discover(query);
-    } catch {
-      continue; // isolate source failures (Section 8.1)
+      candidates = await source.discover(query, { onError: report });
+    } catch (err) {
+      // Isolate source failures (Section 8.1) — but say what failed.
+      report({ sourceType: source.sourceType, message: err instanceof Error ? err.message : String(err) });
+      continue;
     }
     for (const cand of candidates) {
-      const prospect = await ingestCandidate(deps, merchant, cand, { identityIndex });
+      const prospect = await ingestCandidate(deps, merchant, cand, { identityIndex, exclusions });
       if (prospect) created.push(prospect);
     }
   }
   return created;
 }
 
+/** Low-confidence links followed per candidate — each is a real request to a third party. */
+const MAX_LINKS_RESOLVED_PER_CANDIDATE = 5;
+
 /**
- * Turn one raw candidate into a persisted prospect (dedup → detect → identity graph →
- * insert prospect + source + signals). Returns null on a duplicate. Shared by the
- * discovery loop and the recursive frontier engine so both ingest identically.
+ * Pick which LOW-confidence links are worth following, then follow at most
+ * {@link MAX_LINKS_RESOLVED_PER_CANDIDATE} of them — one request per distinct URL. A page
+ * can carry hundreds of `?ref=` links (every Amazon URL has one); resolving them all
+ * meant hundreds of outbound requests per page to hosts chosen by whoever wrote the page.
+ * Skipped without a request: links that are not absolute http(s), links already pointing
+ * straight at a competitor (the destination is not in doubt), links to a retailer, a
+ * social network or a search engine (each is its own destination — a shortener is NOT
+ * skipped, following it is the whole point), and the candidate's OWN pages carrying a
+ * mere `?ref=` (site navigation; an own-site `/go/…` path IS followed — that is what a
+ * cloaked affiliate link looks like). Everything not selected is returned unchanged —
+ * unverified, so it never counts as competitor evidence.
+ */
+async function resolveSelectedLinks(
+  resolver: RedirectResolver,
+  signals: AffiliateSignal[],
+  competitorDomains: string[],
+  ownHost: string | null,
+): Promise<AffiliateSignal[]> {
+  const chosen = new Map<string, AffiliateSignal>();
+  for (const s of signals) {
+    if (chosen.size >= MAX_LINKS_RESOLVED_PER_CANDIDATE) break;
+    if (s.confidence !== "low" || s.verified || chosen.has(s.url)) continue;
+    if (!/^https?:\/\//i.test(s.url)) continue;
+    const host = normalizeHost(s.url);
+    if (!host || isSocialHost(host) || isMarketplaceHost(host) || isReferenceHost(host)) continue;
+    if (competitorDomains.some((c) => hostIsOrUnder(host, c))) continue;
+    if (ownHost && hostIsOrUnder(host, ownHost) && !s.evidence.startsWith("path:")) continue;
+    chosen.set(s.url, s);
+  }
+  if (chosen.size === 0) return signals;
+  const resolved = new Map((await resolveLowConfidenceSignals(resolver, [...chosen.values()])).map((s) => [s.url, s]));
+  return signals.map((s) => {
+    const r = s.confidence === "low" && !s.verified ? resolved.get(s.url) : undefined;
+    return r?.verified ? { ...s, verified: true, resolvedHost: r.resolvedHost } : s;
+  });
+}
+
+/**
+ * Turn one raw candidate into a persisted prospect (exclude → dedup → detect → identity
+ * graph → insert prospect + source + signals). Returns null when nothing new was created:
+ * the candidate is excluded (a competitor's own domain, the merchant's own, a retailer or
+ * bare platform host — see `ingestExclusionReason`), a duplicate, or another surface of a
+ * creator we already have (merged into that prospect). Shared by the discovery loop, the
+ * recursive frontier and bulk import so all three ingest identically.
  */
 export async function ingestCandidate(
   deps: RecruitmentDeps,
   merchant: Merchant,
   cand: RawCandidate,
-  opts?: { identityIndex?: IdentityIndex },
+  opts?: {
+    identityIndex?: IdentityIndex;
+    /** The domains to keep away from; built once per run by the loop callers. */
+    exclusions?: IngestExclusions;
+    /** The MERCHANT supplied this candidate (import): skip the retailer/platform denylist. */
+    trusted?: boolean;
+  },
 ): Promise<Prospect | null> {
   const merchantId = merchant.id;
+  // Never a prospect: the competitor itself, the merchant itself, a retailer, a platform.
+  const exclusions = opts?.exclusions ?? (await ingestExclusionsFor(deps, merchant));
+  if (ingestExclusionReason(cand, exclusions, { trusted: opts?.trusted })) return null;
   // Fast path: exact re-discovery of the same surface (cheap, runs before the resolver).
   // For URL-less candidates (e.g. customer mining) fall back to identity-name equality.
   const exact = await deps.db.prospects.findOne((p) => {
@@ -125,19 +212,32 @@ export async function ingestCandidate(
   const now = deps.clock.now().toISOString();
   let signals: AffiliateSignal[] = cand.outboundLinks.flatMap((l) => detectAffiliateUrl(l));
   // Resolve LOW-confidence generic links to their final host (only real candidates,
-  // only when a resolver is wired) so they can be trusted as competitor evidence.
+  // only when a resolver is wired, and only a bounded few) so they can be trusted as
+  // competitor evidence.
   if (deps.redirectResolver && !cand.synthetic) {
-    signals = await resolveLowConfidenceSignals(deps.redirectResolver, signals);
+    signals = await resolveSelectedLinks(deps.redirectResolver, signals, exclusions.competitorDomains, normalizeHost(cand.siteUrl));
   }
   // A source may already have CONFIRMED the competitor (backlink mining filtered by the
   // merchant id) even though the link points at a network domain — trust it.
   const isAffiliate = hasProvenAffiliateSignal(signals);
-  const promotesComp = !!cand.confirmedCompetitor || detectPromotesCompetitor(signals, merchant.competitors);
-  const competitorPromoted = cand.confirmedCompetitor ?? firstPromotedCompetitor(signals, merchant.competitors);
-  const contactEmails = cand.pageHtml ? extractEmailsFromHtml(cand.pageHtml).slice(0, 5) : [];
+  // Matched against the competitors' HOSTS (an ICP entry typed as a URL still counts).
+  const promotesComp = !!cand.confirmedCompetitor || detectPromotesCompetitor(signals, exclusions.competitorDomains);
+  const competitorPromoted = cand.confirmedCompetitor ?? firstPromotedCompetitor(signals, exclusions.competitorDomains);
+  // Contact addresses on file, best first: what the SOURCE vouched for (a podcast feed's
+  // declared owner), then what the page printed — screened so that a competitor's, the
+  // merchant's, a platform's or (for a prospect with its own domain) a third party's
+  // address is not kept as a candidate contact at all.
+  const candHost = normalizeHost(cand.siteUrl);
+  const pageEmails = cand.pageHtml ? extractEmailsFromHtml(cand.pageHtml) : [];
+  const contactEmails = screenContacts(
+    uniqueEmails([...(cand.contactEmails ?? []).map((e) => ({ email: e.email.trim().toLowerCase(), source: e.source })), ...pageEmails]),
+    { ownDomains: candHost && !isSharedPlatformHost(candHost) ? [candHost] : [], excludedDomains: excludedContactDomains(exclusions) },
+  ).usable.slice(0, 5);
   const contactUrls = cand.pageHtml ? discoverContactUrls(cand.pageHtml, cand.siteUrl) : [];
-  if (cand.channelUrl && /(^|\.)youtube\.com$/i.test(hostOf(cand.channelUrl) ?? "")) {
-    const about = `${cand.channelUrl.replace(/\/+$/, "")}/about`;
+  // A YouTube CHANNEL has an About tab; a /watch URL names no channel and has none.
+  const channel = cand.channelUrl ? classifyAccountUrl(cand.channelUrl) : null;
+  if (channel?.platform === "youtube") {
+    const about = `${cand.channelUrl!.replace(/\/+$/, "")}/about`;
     if (!contactUrls.some((u) => u.url === about)) contactUrls.push({ url: about, kind: "youtube_about" });
   }
   const hasContactForm = cand.pageHtml ? detectsContactForm(cand.pageHtml) : false;
@@ -150,13 +250,15 @@ export async function ingestCandidate(
   // Cross-platform identity merge: is this the SAME creator as an existing prospect,
   // surfaced via a DIFFERENT channel (e.g. a YouTube channel found on its own, then the
   // creator's website via backlinks)? Merge into it — one comprehensive profile — rather
-  // than creating a duplicate. Matches on a shared social handle, contact email, or
-  // website domain (never on name alone).
+  // than creating a duplicate. Matches on a shared social handle, a shared website domain,
+  // or a shared contact email at the creator's OWN domain — never on a name, a platform
+  // host, or an address at somebody else's domain (two blogs printing the same ad
+  // network's email are two blogs).
   const candSignals = identitySignalsFromProfile(profile, contactEmails.map((e) => e.email));
   // Look the candidate up against a merchant identity-key INDEX rather than rescanning (and
   // recomputing signals for) every prospect per candidate (was O(C×N)). The loop callers
-  // (discover/frontier) build ONE index per run and pass it; absent one we build it once for
-  // this call. The index mirrors identitiesOverlap exactly, so merge decisions are unchanged.
+  // (discover/frontier/import) build ONE index per run and pass it; absent one we build it
+  // once for this call.
   const index = opts?.identityIndex ?? (await buildIdentityIndex(deps, merchantId));
   if (hasIdentitySignal(candSignals)) {
     const matchId = index.lookup(candSignals);
@@ -211,7 +313,7 @@ export async function ingestCandidate(
   await deps.db.prospectSignals.insert({
     id: newId("psig"),
     prospectId: prospect.id,
-    relevance: 0,
+    relevance: null, // not judged yet — score() fills it (or leaves it unknown)
     isAffiliate,
     promotesCompetitor: promotesComp,
     intent: /review|best|vs|compare/i.test(cand.evidenceSummary ?? "") ? 0.8 : 0.3,
@@ -226,52 +328,53 @@ export async function ingestCandidate(
 }
 
 /**
- * A merchant's identity-key index: Map<hard identifier, prospectId>, built once per run so
+ * A merchant's identity-key index: hard identifier → prospectId, built once per run so
  * ingestCandidate resolves the "is this an existing creator?" merge in O(1) instead of
- * rescanning every prospect. Keys mirror {@link identitiesOverlap}: a candidate's STRONG
- * identifiers (owned accounts, emails, domains) match an existing strong OR weak key; a
- * candidate's WEAK (page_link) account keys match only an existing STRONG key. First writer
- * wins per key so a match resolves to the earliest-ingested prospect (mirrors scan order).
+ * rescanning every prospect. The matching rule itself lives in core
+ * ({@link IdentityKeyIndex}) — there is exactly one implementation of it.
  */
 export interface IdentityIndex {
   lookup(signals: IdentitySignals): string | null;
   add(prospectId: string, signals: IdentitySignals): void;
 }
 
-class ProspectIdentityIndex implements IdentityIndex {
-  private readonly strong = new Map<string, string>(); // strong account keys + emails + domains
-  private readonly weak = new Map<string, string>(); // page_link account keys
+/**
+ * A finder that FABRICATES addresses (the demo stub) rather than looking them up. Such a
+ * finder may act only on synthetic prospects and is never a verifier for a real one.
+ */
+function isGuessingFinder(finder: EmailFinder): boolean {
+  return finder.guesses === true || finder.name === "stub-finder";
+}
 
-  add(prospectId: string, s: IdentitySignals): void {
-    for (const k of this.strongKeys(s)) if (!this.strong.has(k)) this.strong.set(k, prospectId);
-    for (const k of s.weakAccountKeys) {
-      const wk = `a:${k}`;
-      if (!this.weak.has(wk)) this.weak.set(wk, prospectId);
-    }
-  }
+let lastFinderWarnAt = 0;
+/** Log an email-finder failure, at most once a minute (it would otherwise repeat per prospect). */
+function warnFinderFailure(err: unknown): void {
+  const now = Date.now();
+  if (now - lastFinderWarnAt < 60_000) return;
+  lastFinderWarnAt = now;
+  // eslint-disable-next-line no-console
+  console.warn(`[enrichment] email finder failed — prospects stay without a contact: ${err instanceof Error ? err.message : String(err)}`);
+}
 
-  lookup(s: IdentitySignals): string | null {
-    for (const k of this.strongKeys(s)) {
-      const id = this.strong.get(k) ?? this.weak.get(k); // strong↔strong or strong↔weak
-      if (id) return id;
-    }
-    for (const k of s.weakAccountKeys) {
-      const id = this.strong.get(`a:${k}`); // weak↔strong only (never weak↔weak)
-      if (id) return id;
-    }
-    return null;
-  }
+function uniqueRejections(items: { email: string; reason: string }[]): { email: string; reason: string }[] {
+  const seen = new Set<string>();
+  return items.filter((r) => (seen.has(r.email) ? false : (seen.add(r.email), true)));
+}
 
-  private *strongKeys(s: IdentitySignals): Iterable<string> {
-    for (const k of s.accountKeys) yield `a:${k}`;
-    for (const e of s.emails) yield `e:${e}`;
-    for (const d of s.domains) yield `d:${d}`;
-  }
+/** Keep the first occurrence of each address (order = trust order). */
+function uniqueEmails(emails: { email: string; source: string }[]): { email: string; source: string }[] {
+  const seen = new Set<string>();
+  return emails.filter((e) => {
+    const key = e.email.toLowerCase();
+    if (!key || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
 }
 
 /** Build the identity-key index for a merchant from its existing prospects (once per run). */
 export async function buildIdentityIndex(deps: RecruitmentDeps, merchantId: string): Promise<IdentityIndex> {
-  const index = new ProspectIdentityIndex();
+  const index = new IdentityKeyIndex();
   const others = await deps.db.prospects.find((p) => p.merchantId === merchantId);
   for (const other of others) {
     const otherEmails = [other.email, ...(((other.evidence?.contactEmails as { email: string }[] | undefined) ?? []).map((e) => e.email))];
@@ -288,15 +391,41 @@ export async function enrich(
 ): Promise<Prospect> {
   const prospect = await deps.db.prospects.require(prospectId);
   if (!canTransition(prospect.state, "enriched")) return prospect;
+  const merchant = await deps.db.merchants.require(prospect.merchantId);
+  const exclusions = await ingestExclusionsFor(deps, merchant);
+  // The ingest rule, re-checked: a prospect found BEFORE the merchant connected a mailbox
+  // (so its own domain was not yet known) or before a competitor was added to the ICP may
+  // turn out to be the merchant itself or that competitor. Stop here rather than spend
+  // enrichment on it and hand it to outreach.
+  const excluded = ingestExclusionReason({ siteUrl: prospect.siteUrl, channelUrl: prospect.channelUrl }, exclusions, { trusted: true });
+  if (excluded) {
+    return deps.db.prospects.update(prospectId, {
+      state: "dead",
+      evidence: { ...(prospect.evidence ?? {}), excludedReason: excluded },
+      updatedAt: deps.clock.now().toISOString(),
+    });
+  }
+  // Domains no contact address may be at: the competitors' and the merchant's own.
+  const excludedDomains = excludedContactDomains(exclusions);
+  // The prospect's OWN website domain, when it has one. A platform host (youtube.com) or
+  // a hosted tenant (jane.substack.com) is not a domain the prospect receives mail at.
+  const siteHost = normalizeHost(prospect.siteUrl);
+  const ownDomain = siteHost && !isSharedPlatformHost(siteHost) && !isHostedTenantHost(siteHost) ? siteHost : null;
 
-  const domain = hostOf(prospect.siteUrl ?? prospect.channelUrl);
   // Deliverability check. The EmailFinder's own verify() (e.g. Hunter) is MAILBOX-level —
   // strictly better than a domain-level MX check, which happily passes any well-formed
   // gmail.com guess. So when the finder does real verification we trust it, using the MX
   // verifier only as a cheap PRE-filter: a domain with no mail server can never receive
-  // mail, so we short-circuit undeliverable BEFORE spending a paid mailbox lookup. The
-  // stub finder's verify() is deterministic (not real), so we don't prefer it over MX.
-  const finderVerifies = deps.emailFinder.name !== "stub-finder";
+  // mail, so we short-circuit undeliverable BEFORE spending a paid mailbox lookup.
+  //
+  // The demo stub is NOT a verifier: its verdict is a hash of the address. It may colour
+  // demo data (synthetic prospects); for a real prospect it counts for nothing, so with no
+  // real check available a real address is simply not confirmed.
+  const finderGuesses = isGuessingFinder(deps.emailFinder);
+  // Whether the finder's verify() is a real mailbox check (Hunter): not the guessing stub,
+  // and not the "no finder configured" placeholder, whose verify() can only say no.
+  const finderVerifies = !finderGuesses && deps.emailFinder.verifies !== false;
+  const realCheck = !!deps.emailVerifier || finderVerifies;
   const verify = async (email: string): Promise<{ deliverable: boolean; reason: string }> => {
     if (deps.emailVerifier) {
       const mx = await deps.emailVerifier.verify(email);
@@ -304,11 +433,16 @@ export async function enrich(
       if (finderVerifies) return deps.emailFinder.verify(email); // confirm the mailbox itself
       return mx; // MX passed and no real mailbox verifier available
     }
-    return deps.emailFinder.verify(email); // no MX verifier → the finder's own verify (real or stub)
+    if (finderVerifies) return deps.emailFinder.verify(email); // no MX verifier → the real finder's own check
+    // Nothing real is wired. The stub may still colour DEMO data; a real address stays unconfirmed.
+    return prospect.synthetic && finderGuesses ? deps.emailFinder.verify(email) : { deliverable: false, reason: "no email verifier configured" };
   };
 
   let chosenEmail: string | null = null;
   let contactSource: string | null = null;
+  /** True only when a REAL deliverability check confirmed `chosenEmail`. */
+  let contactVerified = false;
+  let contactRejected: { email: string; reason: string }[] = [...(prospect.evidence?.contactRejected ?? [])];
 
   let profile = (prospect.evidence?.profile as Profile | null) ?? null;
   const seedUrl = prospect.siteUrl ?? prospect.channelUrl;
@@ -318,17 +452,23 @@ export async function enrich(
   let contactFormUrl = prospect.evidence?.contactFormUrl ?? null;
   let affiliateLinks = prospect.evidence?.affiliateLinks ?? [];
 
-  // 0) If the SOURCE never fetched this prospect's page (backlink mining gives us only
+  // 0) If the SOURCE never read this prospect's page (backlink mining gives us only
   //    their domain + the one competitor link), fetch their homepage NOW so the same
   //    extractors light up: real on-page email, identity graph (their other platforms),
   //    contact URLs/form, and their full affiliate-link profile. Real prospects + a
   //    fetcher only; skipped when the source already provided page data (e.g. SERP).
-  if (deps.fetcher && !prospect.synthetic && seedUrl && pageEmails.length === 0 && contactUrls.length === 0) {
+  //    (An address the source merely VOUCHED for — a feed owner, an import — is not
+  //    "having read the page".)
+  const scrapedEmails = pageEmails.filter((e) => e.source !== "feed_owner" && e.source !== "import");
+  if (deps.fetcher && !prospect.synthetic && seedUrl && scrapedEmails.length === 0 && contactUrls.length === 0) {
     try {
       const r = await deps.fetcher.get(seedUrl);
       if (r.status >= 200 && r.status < 300 && r.html && r.html.length > 200) {
         const html = r.html;
-        pageEmails = extractEmailsFromHtml(html).slice(0, 5);
+        // Same screen as ingest: keep only addresses that could be THIS prospect's.
+        const screened = screenContacts(extractEmailsFromHtml(html), { ownDomains: ownDomain ? [ownDomain] : [], excludedDomains });
+        pageEmails = uniqueEmails([...pageEmails, ...screened.usable]).slice(0, 5);
+        contactRejected = [...contactRejected, ...screened.rejected];
         contactUrls = discoverContactUrls(html, seedUrl);
         contactForm = detectsContactForm(html);
         contactFormUrl = contactForm ? (prospect.siteUrl ?? seedUrl) : contactFormUrl;
@@ -336,7 +476,7 @@ export async function enrich(
         profile = profile ? addPageToProfile(profile, page, seedUrl) : buildProfile(seedUrl, [page]);
         // Capture their full affiliate-link profile (merged, deduped) — richer evidence
         // AND the recursive frontier reads it to find the OTHER merchants they promote.
-        const found = detectAffiliateLinksInHtml(html).map((s) => ({ url: s.url, network: s.network, confidence: s.confidence, verified: s.verified }));
+        const found = detectAffiliateLinksInHtml(html, seedUrl).map((s) => ({ url: s.url, network: s.network, confidence: s.confidence, verified: s.verified }));
         const seen = new Set(affiliateLinks.map((l) => l.url));
         affiliateLinks = [...affiliateLinks, ...found.filter((l) => !seen.has(l.url))];
       }
@@ -345,48 +485,84 @@ export async function enrich(
     }
   }
 
-  // 1+2) BEST-EFFORT contact resolution as a TRAVERSAL of the identity graph: try the
-  //   on-page emails first, then walk every linked property — Linktree, /contact, the
-  //   website, the YouTube channel description (free API), social bios — EXPANDING as it
-  //   goes (a social bio → the website → /contact → the email). Converges from any entry
-  //   point; stops at the first deliverable address. Grows the graph with all it fetched.
-  const resolution = await resolveContact(
-    { fetcher: deps.fetcher, enricher: deps.enricher, verify },
-    {
-      profile,
-      seedUrl,
-      canFetch: !!deps.fetcher && !prospect.synthetic,
-      knownEmails: pageEmails,
-      knownContactUrls: contactUrls,
-      contactForm,
-      contactFormUrl,
-    },
-  );
-  chosenEmail = resolution.email;
-  contactSource = resolution.source;
-  profile = resolution.profile;
-  contactForm = resolution.contactForm;
-  contactFormUrl = resolution.contactFormUrl;
+  if (prospect.email && prospect.evidence?.contactSource === "import") {
+    // The MERCHANT supplied this address. It is kept as given — never replaced by something
+    // found on a page, never dropped because nothing was found — and a real check, if one
+    // is wired, only decides whether it is marked verified.
+    chosenEmail = prospect.email;
+    contactSource = "import";
+    contactVerified = realCheck && (await verify(prospect.email).catch(() => ({ deliverable: false }))).deliverable;
+  } else {
+    // 1+2) BEST-EFFORT contact resolution as a TRAVERSAL of the identity graph: try the
+    //   addresses on file first, then walk the creator's properties — Linktree, /contact,
+    //   the website, the YouTube channel description (free API) — EXPANDING as it goes.
+    //   An address is only ever taken from a surface the creator demonstrably OWNS, and
+    //   never at a competitor's / the merchant's own domain (see contact-resolver.ts).
+    const resolution = await resolveContact(
+      { fetcher: deps.fetcher, enricher: deps.enricher, verify },
+      {
+        profile,
+        seedUrl,
+        canFetch: !!deps.fetcher && !prospect.synthetic,
+        knownEmails: pageEmails,
+        knownContactUrls: contactUrls,
+        contactForm,
+        contactFormUrl,
+        excludedDomains,
+      },
+    );
+    chosenEmail = resolution.email;
+    contactSource = resolution.source;
+    contactVerified = !!resolution.email && realCheck;
+    profile = resolution.profile;
+    contactForm = resolution.contactForm;
+    contactFormUrl = resolution.contactFormUrl;
+    contactRejected = [...contactRejected, ...resolution.rejected];
+  }
 
-  // 3) FALL BACK to the EmailFinder (Hunter in prod; pattern-guessing stub in dev).
-  //    Pattern-guessed addresses are clearly labeled so the UI can flag them.
-  if (!chosenEmail) {
+  // 3) FALL BACK to the EmailFinder.
+  if (!chosenEmail && finderGuesses) {
+    // The pattern-guessing stub. It INVENTS addresses, so it may only ever touch a
+    // synthetic (demo) prospect — a real one gets nothing from it — and what it returns is
+    // labelled "pattern-guess" and NEVER marked verified, whatever the stub's own
+    // "verification" says (that is only used to vary the demo data).
+    if (prospect.synthetic) {
+      const guesses = await deps.emailFinder.find({ fullName: prospect.identity, domain: ownDomain ?? undefined }).catch(() => []);
+      for (const c of guesses.sort((a, b) => b.confidence - a.confidence)) {
+        const v = await deps.emailFinder.verify(c.email).catch(() => ({ deliverable: false }));
+        if (v.deliverable) {
+          chosenEmail = c.email;
+          contactSource = "pattern-guess";
+          contactVerified = false;
+          break;
+        }
+      }
+    }
+  } else if (!chosenEmail && ownDomain) {
+    // A real finder (Hunter), asked only about a domain that is the prospect's OWN — never
+    // about youtube.com for a channel. What it returns must still be an address this
+    // prospect could have, and must be confirmed.
     const candidates = await deps.emailFinder
-      .find({ fullName: prospect.identity, domain: domain ?? undefined, siteUrl: prospect.siteUrl ?? undefined })
-      .catch(() => []);
+      .find({ fullName: prospect.identity, domain: ownDomain, siteUrl: prospect.siteUrl ?? undefined })
+      .catch((err) => {
+        // The prospect simply has no contact — but a finder that is REFUSING us (bad key,
+        // spent plan) must not be silent about it.
+        warnFinderFailure(err);
+        return [];
+      });
     for (const c of candidates.sort((a, b) => b.confidence - a.confidence)) {
+      const reason = contactRejection(c.email, { ownDomains: [ownDomain], excludedDomains });
+      if (reason) {
+        contactRejected.push({ email: c.email, reason });
+        continue;
+      }
       // Trust a candidate the finder already verified at find time (Hunter stamps
       // `verified` from its verification.status) — don't pay to re-verify what it confirmed.
-      // The stub always reports verified:false, so this never fires offline.
-      if (c.verified) {
+      const ok = c.verified || (await verify(c.email).catch(() => ({ deliverable: false }))).deliverable;
+      if (ok) {
         chosenEmail = c.email;
-        contactSource = c.source === "stub-finder" ? "pattern-guess" : c.source;
-        break;
-      }
-      const v = await verify(c.email).catch(() => ({ deliverable: false, reason: "verify error" }));
-      if (v.deliverable) {
-        chosenEmail = c.email;
-        contactSource = c.source === "stub-finder" ? "pattern-guess" : c.source;
+        contactSource = c.source;
+        contactVerified = true;
         break;
       }
     }
@@ -432,20 +608,20 @@ export async function enrich(
   // Stays null when the creator's geo AND language are both unknown — never invented.
   let audienceOverlap: number | null = null;
   if (profile && (profile.audience.primaryGeo != null || profile.audience.language != null)) {
-    const merchant = await deps.db.merchants.get(prospect.merchantId);
     audienceOverlap = audienceOverlapScore(
       { primaryGeo: profile.audience.primaryGeo, language: profile.audience.language },
-      targetMarketForCurrency(merchant?.defaultCurrency),
+      targetMarketForCurrency(merchant.defaultCurrency),
     );
   }
 
   const signal = await deps.db.prospectSignals.findOne((s) => s.prospectId === prospectId);
   if (signal) {
-    // verifiedEmail always; reach/engagement/overlap ONLY when real data backs them.
-    // DA stays as the source supplied it; nothing here is estimated. The score's
-    // confidence reflects how much is real (scoring.ts).
+    // verifiedEmail is true ONLY for an address a real check confirmed — never for a
+    // demo pattern-guess or an imported address taken on trust. reach/engagement/overlap
+    // ONLY when real data backs them. DA stays as the source supplied it; nothing here is
+    // estimated. The score's confidence reflects how much is real (scoring.ts).
     await deps.db.prospectSignals.update(signal.id, {
-      verifiedEmail: !!chosenEmail,
+      verifiedEmail: !!chosenEmail && contactVerified,
       ...(audienceReach != null ? { reach: audienceReach } : {}),
       ...(audienceEngagement != null ? { engagement: audienceEngagement } : {}),
       ...(audienceOverlap != null ? { audienceOverlap } : {}),
@@ -464,6 +640,8 @@ export async function enrich(
     evidence: {
       ...(prospect.evidence ?? {}),
       contactSource,
+      contactVerified: !!chosenEmail && contactVerified,
+      contactRejected: uniqueRejections(contactRejected).slice(0, 5),
       profile,
       contactEmails: pageEmails,
       contactUrls,
@@ -491,10 +669,18 @@ export async function score(deps: RecruitmentDeps, prospectId: string): Promise<
   const prospectText = `${prospect.identity} ${source?.evidenceSummary ?? ""}`;
   const merchantText = `${merchant.niche ?? ""} ${merchant.name}`;
   // Prefer the (LLM-backed) relevance scorer when wired — semantic niche fit, not just
-  // shared tokens. Falls back to the lexical embedder when no scorer is injected.
-  const relevance = deps.relevanceScorer
-    ? await deps.relevanceScorer.score({ prospect: prospectText, merchant: merchantText })
+  // shared tokens. Falls back to the lexical embedder when no scorer is injected. A scorer
+  // that could not answer (model down, nothing parseable) yields null = UNKNOWN: relevance
+  // is then left out of the score, not counted as zero.
+  const judged: number | null = deps.relevanceScorer
+    ? await deps.relevanceScorer.score({ prospect: prospectText, merchant: merchantText }).catch(() => null)
     : await deps.embedder.similarity(prospectText, merchantText);
+  // The scorer could not answer THIS time. A prospect that is already fully `scored` has a
+  // niche fit on file that score() itself measured — keep that measurement. Dropping it
+  // would re-rank a vetted prospect as if its fit had never been judged, and an unknown
+  // factor is left out of the score, which can LIFT a poor fit into a sendable tier.
+  // (Only for `scored`: older rows were created with a placeholder 0 that is not a measurement.)
+  const relevance: number | null = judged ?? (prospect.state === "scored" ? signal.relevance : null);
 
   const scoringSignals: ScoringSignals = {
     relevance,
@@ -504,8 +690,13 @@ export async function score(deps: RecruitmentDeps, prospectId: string): Promise<
     domainAuthority: signal.da,
     engagementRate: signal.engagement,
     commercialIntent: signal.intent,
-    contactable: signal.verifiedEmail || !!prospect.email,
+    contactable: !!prospect.email,
+    // An address on file that no real check confirmed (imported on trust, or a demo
+    // pattern-guess) must not be described as verified.
+    contactVerified: signal.verifiedEmail && prospect.evidence?.contactSource !== "pattern-guess",
     audienceOverlap: signal.audienceOverlap,
+    // Freshness is re-derived at scoring time: a channel that was fresh when enriched ages.
+    activityRecency: activityRecency(prospect.evidence?.lastContentAt, deps.clock.now()),
   };
   // Closed loop: blend toward weights learned from this merchant's producer outcomes.
   const weights = await weightsForMerchant(deps, prospect.merchantId);
@@ -517,19 +708,118 @@ export async function score(deps: RecruitmentDeps, prospectId: string): Promise<
     tier: result.tier,
     confidence: result.confidence,
     scoreBreakdown: { breakdown: result.breakdown, explanation: result.explanation, confidence: result.confidence, unknownFactors: result.unknownFactors, audienceQuality: result.audienceQuality },
-    state: "scored",
+    // When niche fit could NOT be judged the score is PROVISIONAL: the prospect is ranked
+    // and visible, but stays `enriched` — outreach only picks up `scored` — so an outage of
+    // the relevance model can never release un-vetted prospects to be emailed. It is
+    // re-scored on the next sourcing/backlog pass. (`scored` therefore always means "niche
+    // fit was judged": a scored prospect with nothing on file drops back to `enriched` too.)
+    state: relevance == null ? "enriched" : "scored",
     updatedAt: deps.clock.now().toISOString(),
   });
 }
 
 // ---- 4. Outreach: build the first message for a campaign --------------------
+// Imports for the queue/send half live here (not in the block at the top of the file) so the
+// outreach and discovery fix streams, which each own one half of this module, do not both
+// edit the same import lines.
+import { newMessageId, unavailableMailboxSender, type MailboxSender, type SendResult } from "@affiliate/integrations";
+import { stepFingerprint } from "./sequencing.js";
+import { withMerchantLock } from "./merchant-lock.js";
+import { inboundState, mailboxBackingOff, recordSendFailure, recordSendSuccess } from "./deliverability.js";
+
+/**
+ * Why NO outreach may be sent for this merchant right now, or null. Compliance is not
+ * optional: every outreach email must carry the sender's valid physical postal address
+ * (CAN-SPAM), so a merchant without one sends nothing — and is told why — instead of sending
+ * mail with the address silently left out of the footer.
+ */
+export function outreachBlockedReason(merchant: Pick<Merchant, "physicalAddress">): string | null {
+  if (!merchant.physicalAddress?.trim()) {
+    return "compliance: no business postal address is set — every outreach email must carry one, so nothing is sent until it is added in Settings";
+  }
+  return null;
+}
+
+/** A failed transmission is retried no sooner than this (doubling per attempt, capped). */
+const RETRY_BASE_MS = 3_600_000;
+const RETRY_MAX_MS = 24 * 3_600_000;
+
+/** When a message that has failed `attempts` times may next be tried. */
+export function nextAttemptAfter(attempts: number, now: Date): string {
+  return new Date(now.getTime() + Math.min(RETRY_MAX_MS, RETRY_BASE_MS * 2 ** Math.max(0, attempts - 1))).toISOString();
+}
+
+/** True when a failed message is still inside its retry delay. */
+export function retryNotDue(message: Pick<OutreachMessage, "nextAttemptAt">, now: Date): boolean {
+  return !!message.nextAttemptAt && new Date(message.nextAttemptAt).getTime() > now.getTime();
+}
+
+function firstTouchTokens(merchant: Merchant, prospect: Prospect): Record<string, string> {
+  const depth = personalizationDepth(prospect.tier);
+  return {
+    name: prospect.identity,
+    merchant: merchant.name,
+    offer: merchant.niche ?? "our products",
+    angle:
+      depth === "deep"
+        ? "I saw your reviews in this exact niche and your affiliate links — you'd be a strong fit."
+        : depth === "medium"
+          ? "Your content is a great match for our products."
+          : "Thought our affiliate program might interest you.",
+  };
+}
+
+/** Render the first-touch copy for a prospect (A/B variant pick + the merchant's plan). */
+async function renderFirstTouch(
+  deps: RecruitmentDeps,
+  merchant: Merchant,
+  prospect: Prospect,
+  step: NonNullable<ReturnType<typeof firstStep>>,
+): Promise<{ subject: string; body: string; variant: string }> {
+  const depth = personalizationDepth(prospect.tier);
+  // A/B: when the step defines variants, pick one (even, deterministic per prospect) and
+  // personalize within it. The chosen variant is recorded for reply-rate-by-variant analysis.
+  let effectiveStep = step;
+  let abLabel: string | null = null;
+  if (step.variants?.length) {
+    const picked = pickVariant(step.variants, prospect.id);
+    effectiveStep = { ...step, subject: picked.value.subject, body: picked.value.body };
+    abLabel = `ab:v${picked.index}`;
+  }
+  // Personalize per the merchant's plan (template / hybrid / llm). The LLM path cites the
+  // prospect's real evidence; falls back to the token template otherwise or on any failure.
+  const personalized = await personalizeOutreach(deps, { merchant, prospect, step: effectiveStep, tokens: firstTouchTokens(merchant, prospect) });
+  // LLM bodies are personalized per-prospect (no fixed variant to test); template sends
+  // carry the A/B label so variant reply-rates are comparable.
+  return { subject: personalized.subject, body: personalized.body, variant: personalized.mode === "llm" ? "llm" : abLabel ?? depth };
+}
+
+/**
+ * Queue the first touch for a prospect. Runs under the merchant's send lock and is safe to
+ * call twice (AUDIT-2026-10 O3): only a SCORED prospect is queued, and there is exactly one
+ * first-touch row per prospect and campaign — a second run finds it and does not add another.
+ *
+ *  - already sent → null (and a prospect that slipped back to `scored` is put right);
+ *  - a failed attempt → the SAME row is retried once its retry delay has passed: no new row,
+ *    no second LLM personalization, nothing billed again (O10);
+ *  - blocked by the content gate → held only while the step copy is unchanged; once the
+ *    operator edits the copy it is re-rendered and released (O11).
+ */
 export async function queueFirstTouch(
   deps: RecruitmentDeps,
   prospectId: string,
   campaign: OutreachCampaign,
 ): Promise<OutreachMessage | null> {
+  return withMerchantLock(deps, campaign.merchantId, () => queueFirstTouchLocked(deps, prospectId, campaign));
+}
+
+async function queueFirstTouchLocked(deps: RecruitmentDeps, prospectId: string, campaign: OutreachCampaign): Promise<OutreachMessage | null> {
   const prospect = await deps.db.prospects.require(prospectId);
   if (!prospect.email) return null;
+  // A campaign only ever emails its own merchant's prospects.
+  if (prospect.merchantId !== campaign.merchantId) return null;
+  // Read fresh, under the lock: whoever listed this prospect as `scored` may be a run behind.
+  if (prospect.state !== "scored") return null;
   if (await isSuppressed(deps, prospect.merchantId, prospect.email)) {
     await deps.db.prospects.update(prospectId, { state: "suppressed", suppressionStatus: "suppressed" });
     return null;
@@ -541,61 +831,55 @@ export async function queueFirstTouch(
   }
   const step = firstStep(campaign);
   if (!step) return null;
-  // A content-gate-blocked first touch is deterministic — re-queuing would fail identically and
-  // grow a failed row per cycle. Hold the prospect until the operator fixes the copy (the failed
-  // message + blockedReason are the operator surface).
-  const gateBlocked = await deps.db.outreachMessages.findOne(
-    (m) => m.prospectId === prospectId && m.campaignId === campaign.id && m.step === step.step && m.status === "failed" && (m.blockedReason ?? "").startsWith("content gate"),
-  );
-  if (gateBlocked) return null;
+  const now = deps.clock.now();
+  const nowIso = now.toISOString();
+  const fingerprint = stepFingerprint(step);
   const merchant = await deps.db.merchants.require(prospect.merchantId);
 
-  const depth = personalizationDepth(prospect.tier);
-  const tokens = {
-    name: prospect.identity,
-    merchant: merchant.name,
-    offer: merchant.niche ?? "our products",
-    angle:
-      depth === "deep"
-        ? "I saw your reviews in this exact niche and your affiliate links — you'd be a strong fit."
-        : depth === "medium"
-          ? "Your content is a great match for our products."
-          : "Thought our affiliate program might interest you.",
-  };
-
-  // A/B: when the step defines variants, pick one (even, deterministic per prospect) and
-  // personalize within it. The chosen variant is recorded for reply-rate-by-variant analysis.
-  let effectiveStep = step;
-  let abLabel: string | null = null;
-  if (step.variants?.length) {
-    const picked = pickVariant(step.variants, prospectId);
-    effectiveStep = { ...step, subject: picked.value.subject, body: picked.value.body };
-    abLabel = `ab:v${picked.index}`;
+  const rows = await deps.db.outreachMessages.find((m) => m.prospectId === prospectId && m.campaignId === campaign.id && m.step === step.step);
+  if (rows.some((m) => m.status === "sent" || m.status === "replied")) {
+    // The first touch already went out; the prospect's state lost that fact. Never send it again.
+    await deps.db.prospects.update(prospectId, { state: "contacted", updatedAt: nowIso });
+    return null;
   }
-  // Personalize per the merchant's plan (template / hybrid / llm). The LLM path cites the
-  // prospect's real evidence; falls back to the token template otherwise or on any failure.
-  const personalized = await personalizeOutreach(deps, { merchant, prospect, step: effectiveStep, tokens });
+  if (rows.some((m) => m.status === "bounced")) return null;
 
-  const now = deps.clock.now().toISOString();
+  const existing = rows.find((m) => m.status === "queued") ?? rows[rows.length - 1];
+  if (existing) {
+    if (existing.status === "failed") {
+      const copyChanged = existing.stepFingerprint !== fingerprint;
+      const gateBlocked = (existing.blockedReason ?? "").startsWith("content gate");
+      // A content-gate block is deterministic for a given copy: hold it until the copy changes.
+      if (gateBlocked && !copyChanged) return null;
+      if (!gateBlocked && !copyChanged && retryNotDue(existing, now)) return null;
+      if (copyChanged) {
+        const fresh = await renderFirstTouch(deps, merchant, prospect, step);
+        await deps.db.outreachMessages.update(existing.id, { ...fresh, stepFingerprint: fingerprint, attempts: 0, nextAttemptAt: null });
+      }
+    }
+    const requeued = await deps.db.outreachMessages.update(existing.id, { status: "queued", blockedReason: undefined });
+    await deps.db.prospects.update(prospectId, { state: "queued", updatedAt: nowIso });
+    return requeued;
+  }
+
+  const rendered = await renderFirstTouch(deps, merchant, prospect, step);
   const message: OutreachMessage = {
     id: newId("omsg"),
     prospectId,
     campaignId: campaign.id,
     step: step.step,
-    // LLM bodies are personalized per-prospect (no fixed variant to test); template sends
-    // carry the A/B label so variant reply-rates are comparable.
-    variant: personalized.mode === "llm" ? "llm" : abLabel ?? depth,
-    subject: personalized.subject,
-    body: personalized.body,
+    variant: rendered.variant,
+    subject: rendered.subject,
+    body: rendered.body,
     sentAt: null,
     status: "queued",
+    stepFingerprint: fingerprint,
+    attempts: 0,
   };
   await deps.db.outreachMessages.insert(message);
-  // Meter LLM personalizations for plan-tier billing (one event per LLM-written email).
-  if (personalized.mode === "llm") {
-    await deps.db.usageEvents.insert({ id: newId("use"), merchantId: prospect.merchantId, kind: "personalization", quantity: 1, sourceId: message.id, ts: now });
-  }
-  await deps.db.prospects.update(prospectId, { state: "queued", updatedAt: now });
+  // LLM personalization is metered when the message is actually SENT (see send()), not here:
+  // metering at queue time billed a personalization on every tick of an SMTP outage.
+  await deps.db.prospects.update(prospectId, { state: "queued", updatedAt: nowIso });
   return message;
 }
 
@@ -604,38 +888,68 @@ export async function previewOutreach(
   deps: RecruitmentDeps,
   prospectId: string,
   campaign: OutreachCampaign,
-): Promise<{ subject: string; body: string; mode: "template" | "llm"; scan: ReturnType<typeof scanContent> } | null> {
+): Promise<{ subject: string; body: string; mode: "template" | "llm"; scan: ReturnType<typeof scanContent>; blockedReason: string | null } | null> {
   const prospect = await deps.db.prospects.require(prospectId);
   const step = firstStep(campaign);
   if (!step) return null;
   const merchant = await deps.db.merchants.require(prospect.merchantId);
-  const depth = personalizationDepth(prospect.tier);
-  const tokens = {
-    name: prospect.identity,
-    merchant: merchant.name,
-    offer: merchant.niche ?? "our products",
-    angle:
-      depth === "deep"
-        ? "I saw your reviews in this exact niche and your affiliate links — you'd be a strong fit."
-        : depth === "medium"
-          ? "Your content is a great match for our products."
-          : "Thought our affiliate program might interest you.",
-  };
-  const rendered = await personalizeOutreach(deps, { merchant, prospect, step, tokens });
-  // Surface the pre-send content gate in the preview so the operator sees issues before launch.
-  return { ...rendered, scan: scanContent({ subject: rendered.subject, body: rendered.body }) };
+  const rendered = await personalizeOutreach(deps, { merchant, prospect, step, tokens: firstTouchTokens(merchant, prospect) });
+  // Surface the pre-send content gate — and anything that would stop the send outright — in
+  // the preview, so the operator sees it before launch.
+  return { ...rendered, scan: scanContent({ subject: rendered.subject, body: rendered.body }), blockedReason: outreachBlockedReason(merchant) };
 }
 
 // ---- 4b. Send a queued message as the merchant ------------------------------
+/** Prospect states in which an outreach email may still go out. Anything else (replied,
+ *  converted, suppressed, bounced, dead) means the conversation moved on while it waited. */
+const SENDABLE_STATES: ReadonlySet<string> = new Set(["scored", "queued", "contacted", "in_sequence"]);
+
+/**
+ * Transmit one outreach message as the merchant. Runs under the merchant's send lock and
+ * re-reads everything inside it (AUDIT-2026-10 O3): a message that is already sent is left
+ * alone, so two overlapping runs cannot both transmit it.
+ *
+ * What the outcome means:
+ *  - sent     → recorded, billed, the prospect advances;
+ *  - bounced  → the RECIPIENT address is permanently bad: suppressed for this merchant,
+ *               counted against the mailbox's daily cap and its bounce rate;
+ *  - failed   → nothing was sent and nothing is recorded as sent. The prospect is NOT
+ *               suppressed; the row is retried later with the same copy and Message-Id, and
+ *               the mailbox is held back so an outage cannot burn through the list (O2/O10).
+ */
 export async function send(deps: RecruitmentDeps, messageId: string): Promise<OutreachMessage> {
+  const queued = await deps.db.outreachMessages.require(messageId);
+  const owner = await deps.db.prospects.require(queued.prospectId);
+  return withMerchantLock(deps, owner.merchantId, () => sendLocked(deps, messageId));
+}
+
+async function sendLocked(deps: RecruitmentDeps, messageId: string): Promise<OutreachMessage> {
   const message = await deps.db.outreachMessages.require(messageId);
+  // Claim check: only a queued (or retryable failed) row is transmitted.
+  if (message.status !== "queued" && message.status !== "failed") return message;
   const prospect = await deps.db.prospects.require(message.prospectId);
   const campaign = await deps.db.campaigns.require(message.campaignId);
   const merchant = await deps.db.merchants.require(prospect.merchantId);
-  if (!prospect.email) return message;
   const now0 = deps.clock.now().toISOString();
+  /** Not sent, for a reason that is nobody's transport failure: record why, keep it retryable,
+   *  and never leave a first-touch prospect stranded in `queued`. */
+  const block = async (blockedReason: string): Promise<OutreachMessage> => {
+    if (prospect.state === "queued") await deps.db.prospects.update(prospect.id, { state: "scored", updatedAt: now0 });
+    return deps.db.outreachMessages.update(messageId, { status: "failed", blockedReason });
+  };
+  if (!prospect.email) return block("prospect has no email address");
+  const toEmail = prospect.email;
 
-  if (await isSuppressed(deps, prospect.merchantId, prospect.email)) {
+  if (!SENDABLE_STATES.has(prospect.state)) {
+    return deps.db.outreachMessages.update(messageId, { status: "failed", blockedReason: `not sent: prospect is ${prospect.state}` });
+  }
+
+  if (await isSuppressed(deps, prospect.merchantId, toEmail)) {
+    // They opted out (the unsubscribe link, a STOP, a bounce) after this was queued. Take the
+    // prospect out of the cadence too, so the next cycle does not come back to it.
+    if (canTransition(prospect.state, "suppressed")) {
+      await deps.db.prospects.update(prospect.id, { state: "suppressed", suppressionStatus: "suppressed", updatedAt: now0 });
+    }
     return deps.db.outreachMessages.update(messageId, { status: "failed", blockedReason: "suppressed contact" });
   }
 
@@ -646,83 +960,161 @@ export async function send(deps: RecruitmentDeps, messageId: string): Promise<Ou
     return deps.db.outreachMessages.update(messageId, { status: "failed", blockedReason: `geo-gated (${prospect.country.toUpperCase()} — GDPR/CASL)` });
   }
 
+  // Compliance (O13): no postal address → no send, with a reason the operator can see.
+  const compliance = outreachBlockedReason(merchant);
+  if (compliance) return block(compliance);
+
   // Pre-send content gate (§16 #7): scan the personalized subject+body BEFORE it leaves. A
   // hard-block (empty field, egregious spam) fails the send with a reason for the operator to
   // fix, rather than burning domain reputation. Warnings pass through. Scans the raw personalized
   // content (the compliance footer's unsubscribe link is added after + is legitimate).
-  // A blocked FIRST touch reverts the prospect to `scored` so it isn't stranded in `queued`
-  // (queueFirstTouch skips re-queuing while a content-gate-failed message exists at that step).
+  // A blocked FIRST touch reverts the prospect to `scored` so it isn't stranded in `queued`;
+  // queueFirstTouch holds it there until the step copy changes.
   const scan = scanContent({ subject: message.subject, body: message.body });
   if (!scan.ok) {
-    if (prospect.state === "queued") await deps.db.prospects.update(prospect.id, { state: "scored", updatedAt: now0 });
-    return deps.db.outreachMessages.update(messageId, {
-      status: "failed",
-      blockedReason: `content gate: ${scan.issues.filter((i) => i.severity === "block").map((i) => i.message).join("; ")}`,
-    });
+    return block(`content gate: ${scan.issues.filter((i) => i.severity === "block").map((i) => i.message).join("; ")}`);
   }
 
   const mailbox = campaign.mailboxId ? await deps.db.mailboxes.get(campaign.mailboxId) : null;
   // A mailbox the deliverability monitor auto-paused (status "error") must never send —
   // even when the resolver would happily build a working transport for it.
   if (mailbox && (mailbox.status === "error" || mailbox.status === "disconnected")) {
-    if (prospect.state === "queued") await deps.db.prospects.update(prospect.id, { state: "scored", updatedAt: now0 });
-    return deps.db.outreachMessages.update(messageId, { status: "failed", blockedReason: `mailbox ${mailbox.status === "error" ? "auto-paused" : "disconnected"}` });
+    return block(`mailbox ${mailbox.status === "error" ? "auto-paused" : "disconnected"}`);
   }
+  // Nor one being held back after transport failures (callers check capacity first; this is
+  // the backstop for anything that calls send() directly).
+  if (mailbox && mailboxBackingOff(mailbox, deps.clock.now())) {
+    return block(`mailbox is backing off until ${mailbox.sendBackoffUntil} after send failures${mailbox.lastSendError ? `: ${mailbox.lastSendError}` : ""}`);
+  }
+
   const unsubUrl = unsubscribeLink(prospect.merchantId, prospect.email);
-  // CAN-SPAM compliant footer: valid physical address + one-click unsubscribe.
-  const footer =
-    `\n\n—\n${merchant.name}` +
-    (merchant.physicalAddress ? `\n${merchant.physicalAddress}` : "") +
-    `\nUnsubscribe: reply STOP, or ${unsubUrl}`;
+  // CAN-SPAM compliant footer: valid physical address (guaranteed present above) + one-click
+  // unsubscribe. "Reply STOP" is offered only when replies to this mailbox are actually being
+  // read: a mailbox with no working inbound path (O5) must not promise an opt-out it cannot
+  // hear. The signed link always works.
+  const footer = `\n\n—\n${merchant.name}\n${merchant.physicalAddress}\nUnsubscribe: ${inboundState(mailbox).working ? "reply STOP, or " : ""}${unsubUrl}`;
   // One-click List-Unsubscribe (RFC 8058) — REQUIRED by Gmail/Yahoo bulk-sender rules. The
   // POST variant lets the inbox unsubscribe the user without opening the link.
   const headers: Record<string, string> = {
     "List-Unsubscribe": `<${unsubUrl}>`,
     "List-Unsubscribe-Post": "List-Unsubscribe=One-Click",
   };
-  // Thread follow-ups into the same conversation: reference the previous step's provider
-  // Message-Id so step 2+ lands as a reply, not a fresh cold email.
+  // Thread follow-ups into the same conversation: reference the earlier steps' Message-Ids
+  // (ours — the ones we stamped) so step 2+ lands as a reply, not a fresh cold email.
   let inReplyTo: string | undefined;
+  let references: string[] | undefined;
   if (message.step > 1) {
     const prior = (await deps.db.outreachMessages.find(
       (m) => m.prospectId === prospect.id && m.campaignId === campaign.id && m.status === "sent" && m.step < message.step && !!m.providerMessageId,
-    )).sort((a, b) => b.step - a.step)[0];
-    inReplyTo = prior?.providerMessageId ?? undefined;
+    )).sort((a, b) => a.step - b.step);
+    // Only real Message-Ids: rows sent before every rail stamped its own may hold a provider's
+    // API id (Gmail) or a mock id, which must never be put in a threading header.
+    const ids = prior.map((m) => m.providerMessageId!).filter((id) => /^<?[^\s<>]+@[^\s<>]+>?$/.test(id)).map((id) => (id.startsWith("<") ? id : `<${id}>`));
+    if (ids.length) {
+      references = ids;
+      inReplyTo = ids[ids.length - 1];
+    }
   }
-  // Send AS the merchant: resolve their connected mailbox (SMTP/Graph/Gmail). Falls back to
-  // the default mailer (the dev/test mock) when no resolver is wired or the mailbox is gone.
-  const sender = deps.mailboxResolver ? await deps.mailboxResolver(campaign.mailboxId).catch(() => deps.mailer) : deps.mailer;
-  const result = await sender.send({
-    fromName: merchant.name,
-    // Never invent a plausible-looking from domain: without a connected mailbox the send can
-    // only be the dev/test mock, so use an RFC 2606 reserved address that cannot be mistaken
-    // for (or delivered as) a real identity.
-    fromEmail: mailbox?.email ?? "no-reply@example.invalid",
-    toEmail: prospect.email,
-    subject: message.subject,
-    body: message.body + footer,
-    headers,
-    inReplyTo,
+  // Never invent a plausible-looking from domain: without a connected mailbox the send can
+  // only be the dev/test mock, so use an RFC 2606 reserved address that cannot be mistaken
+  // for (or delivered as) a real identity.
+  const fromEmail = mailbox?.email ?? "no-reply@example.invalid";
+  // OUR Message-Id, fixed before the first attempt and reused by every retry of this row: it
+  // is what the reply (or the bounce) will reference, on every rail (O9).
+  const ourMessageId = message.providerMessageId && message.providerMessageId.includes("@") ? message.providerMessageId : newMessageId(fromEmail);
+  const attempts = (message.attempts ?? 0) + 1;
+  await deps.db.outreachMessages.update(messageId, { providerMessageId: ourMessageId, attempts });
+
+  // Send AS the merchant: resolve their connected mailbox (SMTP/Graph/Gmail). With no resolver
+  // wired this is the dev/test default mailer. A resolver that THROWS yields a sender that
+  // fails — it must never fall back to the default mailer, which is a mock that would record
+  // mail as sent that never left (O4).
+  let sender: MailboxSender;
+  if (deps.mailboxResolver) {
+    try {
+      sender = await deps.mailboxResolver(campaign.mailboxId);
+    } catch (e) {
+      sender = unavailableMailboxSender(`mailbox sender could not be resolved: ${e instanceof Error ? e.message : String(e)}`.slice(0, 200));
+    }
+  } else {
+    sender = deps.mailer;
+  }
+  // A synthetic (demo) prospect has an invented address at a plausible domain. It may only ever
+  // go to the mock sender; through a real mailbox it would be mail to a stranger (or a bounce
+  // against the merchant's reputation). Honesty rule: demo data never leaves the building.
+  if (prospect.synthetic && sender.provider !== "mock") {
+    sender = unavailableMailboxSender("demo prospect (synthetic data) — never emailed through a real mailbox");
+  }
+  let result: SendResult;
+  try {
+    result = await sender.send({
+      fromName: merchant.name,
+      fromEmail,
+      toEmail: prospect.email,
+      subject: message.subject,
+      body: message.body + footer,
+      headers,
+      messageId: ourMessageId,
+      inReplyTo,
+      ...(references ? { references } : {}),
+    });
+  } catch (e) {
+    // Adapters are meant never to throw; if one does, it is a failed send, not a crashed tick.
+    result = { messageId: "", status: "failed", reason: `sender error: ${e instanceof Error ? e.message : String(e)}`.slice(0, 200), failure: "unknown" };
+  }
+
+  const nowDate = deps.clock.now();
+  const now = nowDate.toISOString();
+  // Record the outcome as ONE unit — the message row first, then the prospect, the usage and
+  // the suppression rows — so a crash cannot leave "sent" without its prospect state, or a
+  // bounce without its suppression. (A crash between the transport's answer and this point
+  // leaves the row queued; the retry goes out under the same Message-Id.)
+  return deps.db.transaction(async (tx) => {
+    const txDeps: RecruitmentDeps = { ...deps, db: tx };
+    if (result.status === "bounced") {
+      // `sentAt` is set: a bounced message was transmitted, so it spends the mailbox's daily cap.
+      const bounced = await tx.outreachMessages.update(messageId, { status: "bounced", sentAt: now, blockedReason: undefined, deliveryError: result.reason, nextAttemptAt: null });
+      await suppress(txDeps, { merchantId: prospect.merchantId, email: toEmail, reason: "hard bounce", scope: "merchant" });
+      await tx.prospects.update(prospect.id, { state: "bounced", suppressionStatus: "bounced", updatedAt: now });
+      return bounced;
+    }
+    // A transport failure (outage, expired token, quota, sender/policy rejection) is NOT a send:
+    // keep the row retryable after a delay, do NOT advance the prospect, do NOT bill. A failed
+    // first touch returns the prospect to `scored`. Unless the failure is specific to this one
+    // recipient (greylisted, mailbox full), the MAILBOX is held back too.
+    if (result.status === "failed") {
+      const failedRow = await tx.outreachMessages.update(messageId, {
+        status: "failed",
+        blockedReason: `send failed: ${result.reason ?? "transport error"}`,
+        nextAttemptAt: nextAttemptAfter(attempts, nowDate),
+      });
+      if (prospect.state === "queued") await tx.prospects.update(prospect.id, { state: "scored", updatedAt: now });
+      if (mailbox && result.failure !== "recipient") {
+        await recordSendFailure(txDeps, mailbox.id, result.reason ?? "transport error", nowDate);
+      }
+      return failedRow;
+    }
+
+    const sent = await tx.outreachMessages.update(messageId, {
+      status: "sent",
+      sentAt: now,
+      // Store the Message-Id that is on the wire: ours, unless the sender reports the id it
+      // actually used. Never a provider-internal API id (those carry no "@").
+      providerMessageId: result.messageId && result.messageId.includes("@") ? result.messageId : ourMessageId,
+      blockedReason: undefined,
+      nextAttemptAt: null,
+    });
+    const nextState = prospect.state === "queued" || prospect.state === "scored" ? "contacted" : "in_sequence";
+    await tx.prospects.update(prospect.id, { state: nextState, updatedAt: now });
+    await tx.usageEvents.insert({ id: newId("use"), merchantId: prospect.merchantId, kind: "send", quantity: 1, sourceId: message.id, ts: now });
+    // Meter LLM personalizations for plan-tier billing — one event per LLM-written email that
+    // actually went out (a row is sent at most once, so this cannot double-bill).
+    if (message.variant === "llm") {
+      await tx.usageEvents.insert({ id: newId("use"), merchantId: prospect.merchantId, kind: "personalization", quantity: 1, sourceId: message.id, ts: now });
+    }
+    if (mailbox) await recordSendSuccess(txDeps, mailbox.id);
+    return sent;
   });
-
-  const now = deps.clock.now().toISOString();
-  if (result.status === "bounced") {
-    await suppress(deps, { merchantId: prospect.merchantId, email: prospect.email, reason: "hard bounce", scope: "merchant" });
-    await deps.db.prospects.update(prospect.id, { state: "bounced", suppressionStatus: "bounced", updatedAt: now });
-    return deps.db.outreachMessages.update(messageId, { status: "bounced", sentAt: now });
-  }
-  // A transient transport failure (SMTP outage, expired token, network) is NOT a send: keep the
-  // message retryable, do NOT advance the prospect, do NOT bill. A failed first touch returns the
-  // prospect to `scored` so the next cycle retries with a fresh message.
-  if (result.status === "failed") {
-    if (prospect.state === "queued") await deps.db.prospects.update(prospect.id, { state: "scored", updatedAt: now });
-    return deps.db.outreachMessages.update(messageId, { status: "failed", blockedReason: `send failed: ${result.reason ?? "transport error"}` });
-  }
-
-  const nextState = prospect.state === "queued" ? "contacted" : "in_sequence";
-  await deps.db.prospects.update(prospect.id, { state: nextState, updatedAt: now });
-  await deps.db.usageEvents.insert({ id: newId("use"), merchantId: prospect.merchantId, kind: "send", quantity: 1, sourceId: message.id, ts: now });
-  return deps.db.outreachMessages.update(messageId, { status: "sent", sentAt: now, providerMessageId: result.messageId || undefined });
 }
 
 // ---- 5. Reply handling ------------------------------------------------------
@@ -915,11 +1307,14 @@ const GEO_GATED: ReadonlySet<string> = new Set([
   "LT", "LU", "MT", "NL", "PL", "PT", "RO", "SK", "SI", "ES", "SE", "CA",
 ]);
 
-function unsubscribeLink(merchantId: string, email: string): string {
+/** The signed one-click unsubscribe URL put in every outreach footer + List-Unsubscribe header. */
+export function unsubscribeLink(merchantId: string, email: string): string {
   // Points at the API's real public unsubscribe endpoint. SIGNED: the endpoint rejects
   // unsigned requests, so nobody can suppress arbitrary addresses by enumerating `?e=`.
-  const base = process.env.PUBLIC_API_URL ?? "http://localhost:8787";
-  const secret = process.env.UNSUBSCRIBE_SECRET ?? process.env.JWT_SECRET ?? "dev-insecure-secret-change-me";
-  const token = signUnsubscribeToken(merchantId, email, secret);
+  // (`||`, not `??`: a PUBLIC_API_URL that is present but empty must not yield a relative link.)
+  const base = (process.env.PUBLIC_API_URL ?? "").trim() || "http://localhost:8787";
+  // The API verifies with this same helper (UNSUBSCRIBE_SECRET → JWT_SECRET; an env var that
+  // is present but empty counts as unset) — signer and verifier cannot drift apart.
+  const token = signUnsubscribeToken(merchantId, email, resolveUnsubscribeSecret());
   return `${base}/track/unsubscribe?m=${encodeURIComponent(merchantId)}&e=${encodeURIComponent(email)}&t=${token}`;
 }

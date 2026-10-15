@@ -114,13 +114,15 @@ export async function moneyOps(ctx: AppContext, merchantId: string) {
     list.push(e);
     byAffiliate.set(e.affiliateId, list);
   }
-  let unpaidLiability = 0;
+  let payableNow = 0;
+  let inPayouts = 0;
   let heldBalance = 0;
   let pending = 0;
   let negativeExposure = 0;
   for (const list of byAffiliate.values()) {
     for (const [, b] of computeBalances(list, now)) {
-      unpaidLiability += Math.max(0, b.availableCents);
+      payableNow += Math.max(0, b.availableCents);
+      inPayouts += b.processingCents;
       heldBalance += b.onHoldCents;
       pending += b.pendingCents;
       if (b.availableCents < 0) negativeExposure += b.availableCents;
@@ -131,7 +133,13 @@ export async function moneyOps(ctx: AppContext, merchantId: string) {
   const reversalEntries = entries.filter((e) => e.type === "reversal").length;
 
   return {
-    unpaidLiabilityCents: unpaidLiability,
+    // Owed and not yet paid: payable now PLUS what open payouts have reserved. A payout that
+    // is drafted or awaiting the merchant's own payment is still a liability — leaving it
+    // out made the figure drop to zero the moment a batch was created.
+    unpaidLiabilityCents: payableNow + inPayouts,
+    payableNowCents: payableNow,
+    inPayoutsCents: inPayouts,
+    awaitingPaymentCents: payouts.filter((p) => p.status === "awaiting_payment").reduce((s, p) => s + p.amountCents, 0),
     heldBalanceCents: heldBalance,
     pendingCents: pending,
     negativeBalanceExposureCents: negativeExposure,

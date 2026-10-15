@@ -18,6 +18,17 @@ function rng(seed: string): () => number {
   };
 }
 
+/**
+ * The seed for a merchant's demo data: what the merchant IS (niche + competitors), never
+ * its id. Ids are random per run, so seeding on one made these "deterministic" generators
+ * produce different reach / affiliate flags — and therefore different scores and tier
+ * counts — every time the demo was seeded (AUDIT-2026-10 D17).
+ */
+function demoSeed(query: DiscoveryQuery): string {
+  const competitors = query.competitors.map((c) => c.trim().toLowerCase()).filter(Boolean).sort().join(",");
+  return `${query.niche.trim().toLowerCase()}|${competitors}`;
+}
+
 const AFFILIATE_LINK_TEMPLATES = [
   (host: string) => `https://${host}/review?ref=creator${"X"}`,
   (host: string) => `https://amzn.to/3abc?tag=creator-20`,
@@ -38,7 +49,7 @@ export class CompetitorAffiliateSource implements DiscoverySource {
     const competitors = query.competitors.length ? query.competitors : ["competitor.com"];
     const n = Math.min(query.limit, 8);
     for (let i = 0; i < n; i++) {
-      const rand = rng(`${query.merchantId}:comp:${i}`);
+      const rand = rng(`${demoSeed(query)}:comp:${i}`);
       const competitor = competitors[i % competitors.length]!;
       const slug = `${query.niche.replace(/\s+/g, "")}creator${i + 1}`.toLowerCase();
       const host = `${slug}.com`;
@@ -70,7 +81,7 @@ export class CreatorDiscoverySource implements DiscoverySource {
     const out: RawCandidate[] = [];
     const n = Math.min(query.limit, 6);
     for (let i = 0; i < n; i++) {
-      const rand = rng(`${query.merchantId}:creator:${i}`);
+      const rand = rng(`${demoSeed(query)}:creator:${i}`);
       const slug = `${query.niche.replace(/\s+/g, "")}tube${i + 1}`.toLowerCase();
       const promotes = rand() > 0.5;
       out.push({
@@ -97,7 +108,7 @@ export class CustomerMiningSource implements DiscoverySource {
     const out: RawCandidate[] = [];
     const n = Math.min(query.limit, 4);
     for (let i = 0; i < n; i++) {
-      const rand = rng(`${query.merchantId}:cust:${i}`);
+      const rand = rng(`${demoSeed(query)}:cust:${i}`);
       out.push({
         identity: `Engaged customer ${i + 1}`,
         siteUrl: rand() > 0.5 ? `https://customer${i + 1}-blog.com` : null,
@@ -114,6 +125,10 @@ export class CustomerMiningSource implements DiscoverySource {
   }
 }
 
+/**
+ * The demo generators as one list — a TEST/DEMO fixture: the application wires its
+ * sources in `api/src/context.ts` and never reads this.
+ */
 export const DEFAULT_DISCOVERY_SOURCES: DiscoverySource[] = [
   new CompetitorAffiliateSource(),
   new CreatorDiscoverySource(),

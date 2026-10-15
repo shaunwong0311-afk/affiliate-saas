@@ -2,10 +2,13 @@ import { z } from "zod";
 import type { Affiliate } from "@affiliate/db";
 import type { RouteModule } from "./helpers.js";
 import { parseBody, parseQuery, ok, paginationSchema, paginate } from "./helpers.js";
-import { requireMerchant } from "../auth/middleware.js";
-import { notFound } from "../errors.js";
+import { requireMerchant, requirePrincipal } from "../auth/middleware.js";
+import { forbidden, notFound } from "../errors.js";
 import { signJwt } from "../auth/jwt.js";
-import { writeAudit } from "../services/audit.js";
+import { writeAudit, actorIdOf } from "../services/audit.js";
+
+/** A support session is a look, not a login: long enough to check something, no longer. */
+const IMPERSONATION_TTL_SECONDS = 15 * 60;
 
 /**
  * Admin / governance surface (Section 9). Every handler is merchant-scoped and
@@ -37,7 +40,7 @@ export const adminRoutes: RouteModule = (app, ctx) => {
     const updated = await ctx.db.merchantUsers.update(membership.id, { role: body.role });
     await writeAudit(ctx, {
       merchantId,
-      actorId: null,
+      actorId: actorIdOf(request),
       action: "user.role_changed",
       subjectType: "merchantUser",
       subjectId: membership.id,
@@ -47,8 +50,15 @@ export const adminRoutes: RouteModule = (app, ctx) => {
   });
 
   // ---- Impersonation (support tooling) --------------------------------------
+  // An affiliate is a GLOBAL identity shared by every merchant they work with, so "view the
+  // portal as them" must not become "read their business with other merchants" or "act as
+  // them". The token therefore names the merchant and the user behind it: the session is
+  // read-only, shows only this merchant's slice (see requirePortalScope), and is short-lived.
   app.post("/admin/impersonate/:affiliateId", async (request, reply) => {
     const { merchantId } = await requireMerchant(ctx, request, "owner");
+    const principal = requirePrincipal(request);
+    // A person, not a key: the audit trail has to be able to name who looked.
+    if (principal.kind !== "user" || !principal.userId) throw forbidden("impersonation requires a signed-in user");
     const affiliateId = (request.params as { affiliateId: string }).affiliateId;
     const affiliate = await ctx.db.affiliates.get(affiliateId);
     if (!affiliate) throw notFound("affiliate");
@@ -57,17 +67,19 @@ export const adminRoutes: RouteModule = (app, ctx) => {
     );
     if (!relationship) throw notFound("affiliate");
     const token = signJwt(
-      { sub: affiliateId, kind: "affiliate", email: affiliate.primaryEmail },
+      { sub: affiliateId, kind: "affiliate", email: affiliate.primaryEmail, imp: { merchantId, userId: principal.userId } },
       ctx.config.jwtSecret,
+      IMPERSONATION_TTL_SECONDS,
     );
     await writeAudit(ctx, {
       merchantId,
-      actorId: null,
+      actorId: principal.userId,
       action: "affiliate.impersonated",
       subjectType: "affiliate",
       subjectId: affiliateId,
+      metadata: { readOnly: true, expiresInSeconds: IMPERSONATION_TTL_SECONDS },
     });
-    return ok(reply, { token });
+    return ok(reply, { token, readOnly: true, merchantId, expiresInSeconds: IMPERSONATION_TTL_SECONDS });
   });
 
   // ---- Tenant data export ---------------------------------------------------
@@ -126,7 +138,7 @@ export const adminRoutes: RouteModule = (app, ctx) => {
     }
     await writeAudit(ctx, {
       merchantId,
-      actorId: null,
+      actorId: actorIdOf(request),
       action: "affiliate.data_deleted",
       subjectType: "affiliate",
       subjectId: body.affiliateId,

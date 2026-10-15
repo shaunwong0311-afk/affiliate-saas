@@ -6,7 +6,7 @@ import { parseBody, ok } from "./helpers.js";
 import { requireMerchant } from "../auth/middleware.js";
 import { notFound, badRequest } from "../errors.js";
 import { generateApiKey } from "../auth/jwt.js";
-import { writeAudit } from "../services/audit.js";
+import { writeAudit, actorIdOf } from "../services/audit.js";
 import { isPublicWebhookUrl } from "../services/webhooks.js";
 
 /**
@@ -40,7 +40,7 @@ export const developerRoutes: RouteModule = (app, ctx) => {
       }),
       request,
     );
-    const { plaintext, prefix, hashed } = generateApiKey();
+    const { plaintext, prefix, hashed } = generateApiKey(ctx.config.apiKeyPepper);
     const key: ApiKey = {
       id: newId("ak"),
       merchantId,
@@ -55,7 +55,7 @@ export const developerRoutes: RouteModule = (app, ctx) => {
     await ctx.db.apiKeys.insert(key);
     await writeAudit(ctx, {
       merchantId,
-      actorId: null,
+      actorId: actorIdOf(request),
       action: "api_key.created",
       subjectType: "api_key",
       subjectId: key.id,
@@ -72,7 +72,7 @@ export const developerRoutes: RouteModule = (app, ctx) => {
     const updated = await ctx.db.apiKeys.update(id, { revokedAt: ctx.clock.now().toISOString() });
     await writeAudit(ctx, {
       merchantId,
-      actorId: null,
+      actorId: actorIdOf(request),
       action: "api_key.revoked",
       subjectType: "api_key",
       subjectId: id,
@@ -109,7 +109,7 @@ export const developerRoutes: RouteModule = (app, ctx) => {
     await ctx.db.webhookSubscriptions.insert(sub);
     await writeAudit(ctx, {
       merchantId,
-      actorId: null,
+      actorId: actorIdOf(request),
       action: "webhook.created",
       subjectType: "webhook_subscription",
       subjectId: sub.id,
@@ -130,6 +130,7 @@ export const developerRoutes: RouteModule = (app, ctx) => {
       }),
       request,
     );
+    if (body.url !== undefined && !isPublicWebhookUrl(body.url)) throw badRequest("webhook url must be a public http(s) endpoint");
     const updated = await ctx.db.webhookSubscriptions.update(id, body as Partial<WebhookSubscription>);
     return ok(reply, updated);
   });
@@ -142,7 +143,7 @@ export const developerRoutes: RouteModule = (app, ctx) => {
     await ctx.db.webhookSubscriptions.delete(id);
     await writeAudit(ctx, {
       merchantId,
-      actorId: null,
+      actorId: actorIdOf(request),
       action: "webhook.deleted",
       subjectType: "webhook_subscription",
       subjectId: id,

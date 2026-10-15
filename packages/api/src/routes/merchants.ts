@@ -4,9 +4,11 @@ import type { Merchant, MerchantUser, User } from "@affiliate/db";
 import type { RouteModule } from "./helpers.js";
 import { parseBody, ok } from "./helpers.js";
 import { requireMerchant, requirePrincipal } from "../auth/middleware.js";
+import { mintTeamInvite, TEAM_INVITE_TTL_SECONDS } from "../auth/invite.js";
+import { enforceEmailRateLimit, enforceRateLimit, TEAM_INVITE_PER_EMAIL_LIMIT, TEAM_INVITE_PER_MERCHANT_LIMIT } from "../auth/rate-limit.js";
 import { ROLE_RANK } from "../auth/rbac.js";
-import { notFound, forbidden } from "../errors.js";
-import { writeAudit } from "../services/audit.js";
+import { notFound, forbidden, conflict } from "../errors.js";
+import { writeAudit, actorIdOf } from "../services/audit.js";
 import { publicMerchant } from "../sanitize.js";
 import type { MerchantRole } from "@affiliate/db";
 
@@ -84,7 +86,7 @@ export const merchantRoutes: RouteModule = (app, ctx) => {
     const updated = await ctx.db.merchants.update(merchantId, patch);
     await writeAudit(ctx, {
       merchantId,
-      actorId: null,
+      actorId: actorIdOf(request),
       action: "merchant.updated",
       subjectType: "merchant",
       subjectId: merchantId,
@@ -102,7 +104,7 @@ export const merchantRoutes: RouteModule = (app, ctx) => {
     await ctx.db.merchants.update(merchantId, { postbackSecret });
     await writeAudit(ctx, {
       merchantId,
-      actorId: null,
+      actorId: actorIdOf(request),
       action: "merchant.postback_secret_rotated",
       subjectType: "merchant",
       subjectId: merchantId,
@@ -125,27 +127,44 @@ export const merchantRoutes: RouteModule = (app, ctx) => {
     assertCanGrant(callerRole, body.role);
     const email = body.email.toLowerCase();
 
-    let user = await ctx.db.users.findOne((u) => u.email === email);
-    const isNewUser = !user;
+    // (Case-insensitive, like login: signup keeps the address as typed, and a second row for
+    // the same inbox must never be created.)
+    let user = await ctx.db.users.findOne((u) => u.email.toLowerCase() === email);
+    let membership = user
+      ? await ctx.db.merchantUsers.findOne((m) => m.merchantId === merchantId && m.userId === user!.id)
+      : null;
+    // This route also UPDATES an existing member, so the PATCH rule applies here too: a
+    // member who outranks the caller cannot be touched (an admin re-adding the owner's
+    // address as "viewer" would otherwise demote the owner).
+    if (membership && ROLE_RANK[membership.role] > ROLE_RANK[callerRole]) throw forbidden("cannot modify a higher-ranked member");
+
+    // Only someone who is ALREADY an accepted member stays active (this call is then just a
+    // role / name update). Everyone else — a new address, a pending account, and also an
+    // existing account that is not yet a member — is `invited` and becomes active only by
+    // redeeming the emailed link (auth/invite.ts). An existing account is NOT added on the
+    // spot: signup verifies nothing, so whoever registered an address first would otherwise
+    // receive the role meant for the person who owns that inbox.
+    const alreadyMember = !!user && user.passwordHash !== "" && membership?.status === "active";
+    const memberStatus: MerchantUser["status"] = alreadyMember ? "active" : "invited";
+
+    // Every invitation sends an email to an address the inviter chose: bound how often one
+    // merchant, and one address, can cause mail.
+    if (!alreadyMember) {
+      enforceRateLimit(app.rateLimiter, `team-invite-merchant|${merchantId}`, TEAM_INVITE_PER_MERCHANT_LIMIT);
+      enforceEmailRateLimit(app.rateLimiter, "team-invite-email", email, TEAM_INVITE_PER_EMAIL_LIMIT);
+    }
     if (!user) {
       const created: User = {
         id: newId("user"),
         email,
         name: body.name,
-        passwordHash: "", // set when the invitee accepts via /auth/accept-invite
+        passwordHash: "", // set when the invitee accepts via /auth/accept-invite (token required)
         createdAt: ctx.clock.now().toISOString(),
       };
       await ctx.db.users.insert(created);
       user = created;
     }
 
-    // A brand-new (password-less) invitee is `invited` until they accept and set a
-    // password; an existing real user is added as `active`.
-    const memberStatus: MerchantUser["status"] = isNewUser && user.passwordHash === "" ? "invited" : "active";
-
-    let membership = await ctx.db.merchantUsers.findOne(
-      (m) => m.merchantId === merchantId && m.userId === user!.id,
-    );
     if (membership) {
       membership = await ctx.db.merchantUsers.update(membership.id, {
         role: body.role,
@@ -167,15 +186,38 @@ export const merchantRoutes: RouteModule = (app, ctx) => {
       membership = newMembership;
     }
 
+    // The invitee proves they own the address by opening a single-use link sent TO it. The
+    // token is never returned in production; outside it, `devInviteToken` lets the flow run
+    // without an inbox.
+    let inviteSent = false;
+    let devInviteToken: string | undefined;
+    if (!alreadyMember) {
+      const invite = await mintTeamInvite(ctx, user, merchantId);
+      const merchantName = merchant.name.replace(/[\r\n]+/g, " ").slice(0, 80);
+      const delivery = await ctx.transactionalMailer
+        .send({
+          to: user.email,
+          subject: `You have been invited to ${merchantName} on Vantage`,
+          text:
+            `You have been invited to join ${merchantName} on Vantage as ${body.role}.\n\n` +
+            `Accept the invitation: ${invite.url}\n\n` +
+            `You will be asked to choose a password, or to sign in if you already have an account. ` +
+            `This link works once and expires in ${TEAM_INVITE_TTL_SECONDS / 86_400} days. If you were not expecting it, ignore this email.`,
+        })
+        .catch(() => null);
+      inviteSent = delivery?.status === "sent";
+      if (ctx.config.exposeMagicLink) devInviteToken = invite.token;
+    }
+
     await writeAudit(ctx, {
       merchantId,
-      actorId: null,
+      actorId: actorIdOf(request),
       action: "merchant.user_added",
       subjectType: "merchant_user",
       subjectId: membership.id,
-      metadata: { userId: user.id, role: body.role },
+      metadata: { userId: user.id, role: body.role, invited: !alreadyMember, inviteSent },
     });
-    return ok(reply, membership, 201);
+    return ok(reply, { ...membership, inviteSent, ...(devInviteToken ? { devInviteToken } : {}) }, 201);
   });
 
   app.patch("/merchants/:merchantId/users/:userId", async (request, reply) => {
@@ -194,11 +236,17 @@ export const merchantRoutes: RouteModule = (app, ctx) => {
       assertCanGrant(callerRole, body.role);
       patch.role = body.role;
     }
+    // A membership becomes active ONLY by its invitee accepting the emailed invitation —
+    // never by an edit here (that would hand the role to whoever holds the account, proof or
+    // not). To bring back a disabled member, invite them again.
+    if (body.status === "active" && membership.status !== "active") {
+      throw conflict("a member becomes active by accepting an invitation — send the invitation again instead");
+    }
     if (body.status !== undefined) patch.status = body.status;
     const updated = await ctx.db.merchantUsers.update(membership.id, patch);
     await writeAudit(ctx, {
       merchantId,
-      actorId: null,
+      actorId: actorIdOf(request),
       action: "merchant.user_updated",
       subjectType: "merchant_user",
       subjectId: membership.id,

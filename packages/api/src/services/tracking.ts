@@ -1,5 +1,6 @@
 import { uuidv7, newId, type Click } from "@affiliate/core";
 import { normalizeOrder, type IngestionInput } from "@affiliate/integrations";
+import { DbLinkResolver } from "@affiliate/tracking-edge";
 import type { AppContext } from "../context.js";
 import { ingestNormalizedOrder, type IngestResult } from "./conversion-pipeline.js";
 
@@ -46,17 +47,15 @@ export async function writeClick(ctx: AppContext, clickId: string, capture: Clic
   return ctx.db.clicks.insert(click);
 }
 
-/** Resolve an offer's tracking code → affiliate + offer (encoded in the link). */
+/**
+ * Resolve a tracking code (`<affiliateId>.<offerId>`) → affiliate + offer. The SAME rule as
+ * the redirect edge, so a click can only be recorded for a link that could earn: an active
+ * offer, an active affiliate, and an active relationship in that offer's program. (This used
+ * to accept any affiliate id next to any existing offer.)
+ */
 export async function resolveTrackingCode(ctx: AppContext, code: string): Promise<{ merchantId: string; affiliateId: string; offerId: string } | null> {
-  // Link codes are encoded as `<affiliateShort>-<offerShort>`; for the demo we
-  // store a direct lookup table via affiliate_codes of kind 'referral' that double
-  // as link codes, or fall back to decoding ids joined by '.'.
-  const [affiliateId, offerId] = code.split(".");
-  if (affiliateId && offerId) {
-    const offer = await ctx.db.offers.get(offerId);
-    if (offer) return { merchantId: offer.merchantId, affiliateId, offerId };
-  }
-  return null;
+  const link = await new DbLinkResolver(ctx.db).resolve(code);
+  return link ? { merchantId: link.merchantId, affiliateId: link.affiliateId, offerId: link.offerId } : null;
 }
 
 /** Entry point for inbound order events from any source. */
