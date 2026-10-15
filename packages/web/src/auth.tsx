@@ -46,6 +46,8 @@ interface AuthCtx {
   affiliateLogin(email: string): Promise<AffiliateLoginResult>;
   /** Exchange an emailed magic-link token for a portal session. */
   completeAffiliateLogin(magicToken: string): Promise<void>;
+  /** Accept an emailed team invitation: with a password for a new account, or as the signed-in account. */
+  acceptInvite(inviteToken: string, password?: string): Promise<void>;
   selectMerchant(id: string): void;
   logout(): void;
 }
@@ -148,6 +150,16 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     await refresh();
   }
 
+  async function acceptInvite(inviteToken: string, password?: string) {
+    const res = await api.post<{ token: string; merchants?: Membership[] }>("/auth/accept-invite", password ? { token: inviteToken, password } : { token: inviteToken });
+    // The invitation is spent from here on.
+    setToken(res.token);
+    const first = res.merchants?.[0];
+    setMerchant(first?.merchantId ?? null);
+    setActive(first?.merchantId ?? null);
+    await refresh();
+  }
+
   function completeAffiliateLogin(magicToken: string): Promise<void> {
     const shared = magicLogins.get(magicToken);
     if (shared) return shared;
@@ -219,6 +231,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         signup,
         affiliateLogin,
         completeAffiliateLogin,
+        acceptInvite,
         selectMerchant,
         logout,
       }}

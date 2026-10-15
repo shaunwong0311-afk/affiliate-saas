@@ -2,7 +2,7 @@ import { randomBytes } from "node:crypto";
 import type { MerchantUser, User } from "@affiliate/db";
 import type { AppContext } from "../context.js";
 import { hashPassword, signJwt, verifyJwt } from "./jwt.js";
-import { appendOutstanding, hashNonce, loadOutstanding, nowSeconds, saveOutstanding, serialized } from "./single-use.js";
+import { appendOutstanding, hashNonce, loadOutstanding, nowSeconds, saveOutstanding, serializedWith } from "./single-use.js";
 
 /**
  * Team invites — the emailed `{app}/#/accept-invite?token=…` link through which someone
@@ -52,7 +52,7 @@ const purposeFor = (merchantId: string) => `team_invite:${merchantId}`;
 
 /** Mint the single-use link inviting `user` to `merchantId`'s team. */
 export function mintTeamInvite(ctx: AppContext, user: Pick<User, "id" | "email">, merchantId: string): Promise<TeamInvite> {
-  return serialized(recordKey(user.id), async () => {
+  return serializedWith(ctx, recordKey(user.id), async () => {
     const nonce = randomBytes(24).toString("base64url");
     const token = signJwt({ sub: user.id, kind: "user_invite", email: user.email, jti: nonce, mid: merchantId }, ctx.config.jwtSecret, TEAM_INVITE_TTL_SECONDS);
     const exp = verifyJwt(token, ctx.config.jwtSecret)?.exp ?? nowSeconds() + TEAM_INVITE_TTL_SECONDS;
@@ -81,7 +81,7 @@ export async function acceptTeamInvite(
     return { status: "invalid" };
   }
   const { sub: userId, jti, email, mid: merchantId } = claims;
-  return serialized(recordKey(userId), async (): Promise<AcceptInviteResult> => {
+  return serializedWith(ctx, recordKey(userId), async (): Promise<AcceptInviteResult> => {
     const user = await ctx.db.users.get(userId);
     if (!user) return { status: "invalid" };
     // The invite proves control of the inbox it was SENT to.

@@ -130,6 +130,7 @@ export const developerRoutes: RouteModule = (app, ctx) => {
       }),
       request,
     );
+    if (body.url !== undefined && !isPublicWebhookUrl(body.url)) throw badRequest("webhook url must be a public http(s) endpoint");
     const updated = await ctx.db.webhookSubscriptions.update(id, body as Partial<WebhookSubscription>);
     return ok(reply, updated);
   });

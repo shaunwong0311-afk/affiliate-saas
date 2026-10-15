@@ -3,7 +3,7 @@ import { api } from "../api";
 import { Card, PageHeader, Field, Badge } from "../ui";
 
 type FormType = "W-9" | "W-8BEN" | "W-8BEN-E" | "other";
-type Rail = "stripe" | "paypal" | "wise";
+type Rail = "stripe" | "paypal" | "wise" | "bank";
 
 const FORM_TYPES: { value: FormType; label: string }[] = [
   { value: "W-9", label: "W-9 — U.S. person / entity" },
@@ -17,6 +17,7 @@ const FORM_TYPES: { value: FormType; label: string }[] = [
 const RAILS: { value: Rail; label: string; hint: string }[] = [
   { value: "paypal", label: "PayPal", hint: "the email on your PayPal account" },
   { value: "wise", label: "Wise", hint: "the email on your Wise account, or your IBAN / account details" },
+  { value: "bank", label: "Bank transfer", hint: "account holder name, IBAN or account number, and SWIFT/BIC" },
   { value: "stripe", label: "Stripe", hint: "your Stripe account ID — only useful if the merchant pays through Stripe" },
 ];
 

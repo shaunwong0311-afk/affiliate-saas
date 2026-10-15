@@ -355,6 +355,18 @@ function PostbackSecretCard({ mid }: { mid: string }) {
 
 // ---- Team -------------------------------------------------------------------
 
+/** What to tell the admin after an invite: emailed, a dev link to hand over, or not sent. */
+function inviteNote(email: string, role: string, member: { status?: string; inviteSent?: boolean; devInviteToken?: string } | null): string {
+  if (member?.status !== "invited") return `${email} now has ${role} access.`;
+  if (member.devInviteToken) {
+    // Outside production the API returns the one-time token so the flow can be finished without an inbox.
+    return `${email} was invited. Dev link (single-use): ${window.location.origin}${window.location.pathname}#/accept-invite?token=${member.devInviteToken}`;
+  }
+  return member.inviteSent
+    ? `Invitation emailed to ${email}. The link is single-use and lasts 7 days.`
+    : `${email} was added as "invited", but the invitation email could not be sent — check that a transactional email provider is configured, then re-invite.`;
+}
+
 function TeamTab({ mid }: { mid: string }) {
   const { data, loading, error, reload } = useApi<MerchantUser[]>(() => api.get(`/merchants/${mid}/users`), [mid]);
   const [open, setOpen] = useState(false);
@@ -372,7 +384,7 @@ function TeamTab({ mid }: { mid: string }) {
     setInviteErr(null);
     setNote(null);
     try {
-      const member = await api.post<MerchantUser | null>(`/merchants/${mid}/users`, {
+      const member = await api.post<(MerchantUser & { inviteSent?: boolean; devInviteToken?: string }) | null>(`/merchants/${mid}/users`, {
         email,
         // The API requires a name; fall back to the mailbox name rather than failing the add.
         name: invite.name.trim() || email.split("@")[0] || email,
@@ -381,17 +393,31 @@ function TeamTab({ mid }: { mid: string }) {
       setOpen(false);
       setInvite({ email: "", name: "", role: "viewer" });
       setNote(
-        member?.status === "invited"
-          ? // Honest about the gap: the API creates the seat but mails nothing, and this app
-            // has no accept-invite screen for the password-less account to finish signup.
-            `${email} was added as "invited". Invitation emails and the accept-invite screen aren't available yet, so they can't sign in until then.`
-          : `${email} now has ${invite.role} access.`,
+        inviteNote(email, invite.role, member),
       );
       reload();
     } catch (e) {
       setInviteErr(errorMessage(e, "Could not add the member."));
     } finally {
       setSaving(false);
+    }
+  }
+
+  // A suspended member is brought back by a fresh invitation (the API no longer lets an admin
+  // flip a seat straight to "active" — the member accepts it themselves).
+  async function reinvite(u: MerchantUser) {
+    setErr(null);
+    setNote(null);
+    try {
+      const member = await api.post<(MerchantUser & { inviteSent?: boolean; devInviteToken?: string }) | null>(`/merchants/${mid}/users`, {
+        email: u.email,
+        name: u.name?.trim() || u.email.split("@")[0] || u.email,
+        role: u.role,
+      });
+      setNote(inviteNote(u.email, u.role, member));
+      reload();
+    } catch (e) {
+      setErr(errorMessage(e, "Could not send the invitation."));
     }
   }
 
@@ -480,8 +506,8 @@ function TeamTab({ mid }: { mid: string }) {
                     </td>
                     <td className="num">
                       {u.status === "disabled" ? (
-                        <button className="btn sm" onClick={() => updateUser(u, { status: "active" })}>
-                          Reactivate
+                        <button className="btn sm" onClick={() => reinvite(u)}>
+                          Re-invite
                         </button>
                       ) : (
                         <button className="btn sm ghost" onClick={() => updateUser(u, { status: "disabled" })}>

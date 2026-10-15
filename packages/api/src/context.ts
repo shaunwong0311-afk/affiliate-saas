@@ -291,8 +291,8 @@ export function createContext(overrides: Partial<AppContext> = {}): AppContext {
   const relevanceLlm: LlmClient | null = process.env.RELEVANCE_LLM_API_KEY
     ? new OpenAiCompatibleLlmClient({
         apiKey: process.env.RELEVANCE_LLM_API_KEY,
-        baseUrl: process.env.RELEVANCE_LLM_BASE_URL ?? "https://api.x.ai/v1",
-        model: process.env.RELEVANCE_LLM_MODEL ?? "grok-4-fast-non-reasoning",
+        baseUrl: process.env.RELEVANCE_LLM_BASE_URL || "https://api.x.ai/v1",
+        model: process.env.RELEVANCE_LLM_MODEL || "grok-4-fast-non-reasoning",
       })
     : process.env.ANTHROPIC_API_KEY
       ? new AnthropicLlmClient({ apiKey: process.env.ANTHROPIC_API_KEY, model: "claude-haiku-4-5-20251001" })

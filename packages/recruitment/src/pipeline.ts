@@ -1039,6 +1039,12 @@ async function sendLocked(deps: RecruitmentDeps, messageId: string): Promise<Out
   } else {
     sender = deps.mailer;
   }
+  // A synthetic (demo) prospect has an invented address at a plausible domain. It may only ever
+  // go to the mock sender; through a real mailbox it would be mail to a stranger (or a bounce
+  // against the merchant's reputation). Honesty rule: demo data never leaves the building.
+  if (prospect.synthetic && sender.provider !== "mock") {
+    sender = unavailableMailboxSender("demo prospect (synthetic data) — never emailed through a real mailbox");
+  }
   let result: SendResult;
   try {
     result = await sender.send({

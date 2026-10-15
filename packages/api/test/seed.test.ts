@@ -28,7 +28,9 @@ describe("demo seeding is idempotent", () => {
     expect(before.merchants).toBe(1);
 
     const second = await seedDemo(createContext({ db })); // a later boot: new context, same store
-    expect(second).toEqual(first);
+    // Same tenant and credentials; the second call says it found the tenant instead of creating it.
+    expect(first.alreadySeeded).toBeUndefined();
+    expect(second).toEqual({ ...first, alreadySeeded: true });
     expect(await counts()).toEqual(before);
     expect(await db.users.find((u) => u.email === "owner@demo.test")).toHaveLength(1);
   });

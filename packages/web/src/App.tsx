@@ -33,6 +33,7 @@ import { PortalStatement } from "./portal/PortalStatement";
 import { PortalPayouts } from "./portal/PortalPayouts";
 import { PortalSettings } from "./portal/PortalSettings";
 import { PortalVerify } from "./portal/PortalVerify";
+import { AcceptInvite } from "./pages/AcceptInvite";
 
 interface NavItem {
   label: string;
@@ -216,7 +217,10 @@ export function App() {
   // link (`#/portal/verify?token=…`), which by definition arrives with no session.
   const joinMatch = matchRoute("/join/:merchantId", path);
   const isVerify = path === "/portal/verify";
-  const isPublic = joinMatch !== null || isVerify;
+  // The emailed team invitation (`#/accept-invite?token=…`): works signed out (new account)
+  // and signed in (adds the workspace to that account).
+  const isAcceptInvite = path === "/accept-invite";
+  const isPublic = joinMatch !== null || isVerify || isAcceptInvite;
   const inPortal = path === "/portal" || path.startsWith("/portal/");
 
   // Resolve the screen for a signed-in principal — and where to send anyone standing on
@@ -249,6 +253,7 @@ export function App() {
 
   if (joinMatch) return <Join merchantId={joinMatch.merchantId!} />;
   if (isVerify) return <PortalVerify />;
+  if (isAcceptInvite) return loading ? <Spinner label="initializing vantage…" /> : <AcceptInvite />;
 
   if (loading) return <Spinner label="initializing vantage…" />;
 

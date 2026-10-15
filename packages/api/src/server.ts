@@ -27,7 +27,7 @@ async function start() {
   if (process.env.SEED_DEMO === "true") {
     const creds = await seedDemo(app.appContext);
     // eslint-disable-next-line no-console
-    console.log(`seeded demo tenant — login: ${creds.email} / ${creds.password}`);
+    console.log(`${creds.alreadySeeded ? "demo tenant already present" : "seeded demo tenant"} — login: ${creds.email} / ${creds.password}`);
   }
 
   // Optional: run the autonomous recruitment scheduler in-process (dev). In

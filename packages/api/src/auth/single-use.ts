@@ -31,15 +31,15 @@ export const nowSeconds = (): number => Math.floor(Date.now() / 1000);
  * Run `work` alone for `recordKey`. A record is read, changed and written back, so issuing
  * and spending run one at a time per subject — otherwise two simultaneous redemptions of the
  * same token would both find it, and two simultaneous issues would lose one link. This is an
- * in-process queue: exact for a single API instance, which is where every issue and spend
- * happens. Running several API instances needs the cross-process lock instead — wrap `work`
- * in `ctx.db.withLock(recordKey, work)` (AUDIT-2026-10 contract 2) once the Database has it.
+ * in-process queue; pass `ctx` and the work also runs under `ctx.db.withLock`, which makes it
+ * exact across several API instances sharing one database.
  */
 const queues = new Map<string, Promise<void>>();
 
-export function serialized<T>(recordKey: string, work: () => Promise<T>): Promise<T> {
+export function serialized<T>(recordKey: string, work: () => Promise<T>, ctx?: AppContext): Promise<T> {
   const previous = queues.get(recordKey) ?? Promise.resolve();
-  const run = previous.then(work); // `previous` is a tail that never rejects
+  const locked = ctx ? () => ctx.db.withLock(`single-use:${recordKey}`, work) : work;
+  const run = previous.then(locked); // `previous` is a tail that never rejects
   const tail = run.then(
     () => undefined,
     () => undefined,
@@ -49,6 +49,11 @@ export function serialized<T>(recordKey: string, work: () => Promise<T>): Promis
     if (queues.get(recordKey) === tail) queues.delete(recordKey);
   });
   return run;
+}
+
+/** `serialized` plus the cross-process database lock — what every issue and spend uses. */
+export function serializedWith<T>(ctx: AppContext, recordKey: string, work: () => Promise<T>): Promise<T> {
+  return serialized(recordKey, work, ctx);
 }
 
 /** The unexpired entries of a record. An unreadable record counts as empty (fail closed). */

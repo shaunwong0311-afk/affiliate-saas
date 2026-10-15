@@ -548,7 +548,7 @@ export const recruitmentRoutes: RouteModule = (app, ctx) => {
   // No JWT — the applicant isn't logged in. Keyed by merchant id in the path.
   app.post("/join/:merchantId", async (request, reply) => {
     const merchantId = (request.params as { merchantId: string }).merchantId;
-    const body = parseBody(z.object({ email: z.string().email(), name: z.string().min(1), socialUrl: z.string().url().optional() }), request);
+    const body = parseBody(z.object({ email: z.string().email(), name: z.string().min(1), socialUrl: z.string().url().optional(), prospectId: z.string().min(1).max(100).optional() }), request);
     // Abuse guard beyond the per-client limit in app.ts: one address can only be submitted a
     // few times an hour, whichever merchant or client it comes through. (Counted only for a
     // merchant that exists — posting an address at made-up ids must not use up its allowance.)

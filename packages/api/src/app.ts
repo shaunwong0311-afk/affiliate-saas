@@ -28,7 +28,7 @@ export async function buildApp(ctxOverride?: Partial<AppContext>, options: Build
     trustProxy: ctx.config.trustProxy,
   });
 
-  await app.register(cors, { origin: ctx.config.corsOrigins, credentials: true });
+  await app.register(cors, { origin: ctx.config.corsOrigins, credentials: true, exposedHeaders: ["content-disposition"] });
 
   // Capture the raw JSON body (for HMAC verification of signed webhooks) while
   // still parsing it normally.

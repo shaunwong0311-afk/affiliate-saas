@@ -2,7 +2,7 @@ import { randomBytes } from "node:crypto";
 import type { Affiliate } from "@affiliate/db";
 import type { AppContext } from "../context.js";
 import { signJwt, verifyJwt } from "./jwt.js";
-import { appendOutstanding, hashNonce, loadOutstanding, nowSeconds, saveOutstanding, serialized } from "./single-use.js";
+import { appendOutstanding, hashNonce, loadOutstanding, nowSeconds, saveOutstanding, serializedWith } from "./single-use.js";
 
 /**
  * Affiliate magic links (emailed `{app}/#/portal/verify?token=…`) — SINGLE-USE.
@@ -69,7 +69,7 @@ export async function redeemMagicLinkToken(ctx: AppContext, token: string): Prom
   const claims = verifyJwt(token, ctx.config.jwtSecret);
   if (!claims || claims.kind !== "affiliate_magic" || typeof claims.jti !== "string" || !claims.jti) return null;
   const { sub: affiliateId, jti, email } = claims;
-  return serialized(recordKey(affiliateId), async () => {
+  return serializedWith(ctx, recordKey(affiliateId), async () => {
     const affiliate = await ctx.db.affiliates.get(affiliateId);
     if (!affiliate) return null;
     // The link proves control of the inbox it was SENT to, not of whatever address is on file now.
@@ -92,7 +92,7 @@ function mint(
   max: number,
   whenFull: "refuse" | "drop-oldest",
 ): Promise<MagicLink | null> {
-  return serialized(recordKey(affiliate.id), async () => {
+  return serializedWith(ctx, recordKey(affiliate.id), async () => {
     const outstanding = await loadOutstanding(ctx, recordKey(affiliate.id));
     if (whenFull === "refuse" && outstanding.filter((link) => link.p === purpose).length >= max) return null;
 

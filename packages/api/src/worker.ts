@@ -18,7 +18,9 @@ async function main(): Promise<void> {
   // Each tick reads every mailbox for replies/bounces and then sends for each merchant
   // (isolated per merchant; failures are logged and recorded, never swallowed). Sourcing runs
   // on its own per-merchant interval (default daily), not on this one.
-  const handle = runScheduler(ctx, Number(process.env.SCHEDULER_INTERVAL_MS ?? 60_000));
+  // A blank or non-numeric value must not become a 0 ms loop.
+  const rawInterval = Number(process.env.SCHEDULER_INTERVAL_MS);
+  const handle = runScheduler(ctx, Number.isFinite(rawInterval) && rawInterval > 0 ? rawInterval : 60_000);
   const drain = setInterval(
     () =>
       void queue.drain().catch((err) => {

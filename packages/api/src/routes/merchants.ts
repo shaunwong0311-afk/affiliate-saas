@@ -196,7 +196,6 @@ export const merchantRoutes: RouteModule = (app, ctx) => {
       const merchantName = merchant.name.replace(/[\r\n]+/g, " ").slice(0, 80);
       const delivery = await ctx.transactionalMailer
         .send({
-          from: "no-reply@vantage.dev",
           to: user.email,
           subject: `You have been invited to ${merchantName} on Vantage`,
           text:

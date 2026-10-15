@@ -16,6 +16,8 @@ export interface SeedResult {
   email: string;
   password: string;
   merchantId: string;
+  /** True when the demo tenant was already in the database and nothing was inserted. */
+  alreadySeeded?: boolean;
 }
 
 export async function seedDemo(ctx: AppContext): Promise<SeedResult> {
@@ -33,7 +35,7 @@ export async function seedDemo(ctx: AppContext): Promise<SeedResult> {
       if (existing) {
         const membership = await ctx.db.merchantUsers.findOne((m) => m.userId === existing.id);
         if (!membership) throw new Error(`cannot seed the demo tenant: a user ${email} already exists without a merchant`);
-        return { email, password, merchantId: membership.merchantId };
+        return { email, password, merchantId: membership.merchantId, alreadySeeded: true };
       }
       return seedTenant(ctx, email, password);
     },

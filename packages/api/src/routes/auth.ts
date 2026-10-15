@@ -126,7 +126,6 @@ export const authRoutes: RouteModule = (app, ctx) => {
     const magic = affiliate ? await mintSignInMagicLink(ctx, affiliate) : null;
     if (affiliate && magic) {
       await ctx.transactionalMailer.send({
-        from: "no-reply@vantage.dev",
         to: affiliate.primaryEmail,
         subject: "Your Vantage sign-in link",
         text: `Sign in to your affiliate portal: ${magic.url}\n\nThis link works once and expires in ${SIGN_IN_LINK_TTL_SECONDS / 60} minutes.`,
