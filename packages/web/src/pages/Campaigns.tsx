@@ -19,8 +19,8 @@ interface Campaign {
   mailboxId: string | null;
   sendingDomainId: string | null;
   name: string;
-  sequence: SequenceStep[];
-  sendWindow: SendWindow;
+  sequence?: SequenceStep[] | null;
+  sendWindow?: SendWindow | null;
   dailyCap: number;
   status: "draft" | "active" | "paused" | "archived";
 }
@@ -122,7 +122,7 @@ export function Campaigns() {
                   <tr key={c.id} style={selectedId === c.id ? { background: "var(--ink-850)" } : undefined}>
                     <td><div style={{ fontWeight: 600 }}>{c.name}</div><div className="faint mono" style={{ fontSize: 11 }}>{c.id}</div></td>
                     <td><Badge kind={statusKind(c.status)}>{c.status}</Badge></td>
-                    <td className="num mono">{c.sequence.length}</td>
+                    <td className="num mono">{c.sequence?.length ?? 0}</td>
                     <td className="muted mono" style={{ fontSize: 12 }}>{boxes.find((b) => b.id === c.mailboxId)?.email ?? "—"}</td>
                     <td className="num"><button className="btn sm" onClick={() => setSelectedId(selectedId === c.id ? null : c.id)}>{selectedId === c.id ? "Close" : "Edit"}</button></td>
                   </tr>
@@ -203,7 +203,7 @@ function NewCampaignForm({ boxes, onCancel, onCreated, onError }: { boxes: Mailb
 
 // ---- Editor -----------------------------------------------------------------
 function CampaignEditor({ campaign, boxes, onSaved }: { campaign: Campaign; boxes: Mailbox[]; onSaved: () => void }) {
-  const [steps, setSteps] = useState<SequenceStep[]>(campaign.sequence.length ? campaign.sequence : renumber(TEMPLATES[0].steps));
+  const [steps, setSteps] = useState<SequenceStep[]>(campaign.sequence?.length ? campaign.sequence : renumber(TEMPLATES[0].steps));
   const [dailyCap, setDailyCap] = useState(campaign.dailyCap);
   const [status, setStatus] = useState(campaign.status);
   const [scan, setScan] = useState<Record<number, ScanResult>>({});
@@ -303,7 +303,7 @@ function CampaignEditor({ campaign, boxes, onSaved }: { campaign: Campaign; boxe
 
         <div className="grid grid-4 mt-16" style={{ alignItems: "end" }}>
           <Field label="Daily cap"><input className="input" type="number" min={1} value={dailyCap} onChange={(e) => setDailyCap(Math.max(1, Number(e.target.value) || 1))} /></Field>
-          <div><div className="field"><label>Send window</label><div className="mono faint" style={{ fontSize: 12 }}>{campaign.sendWindow.startHour}:00–{campaign.sendWindow.endHour}:00 {campaign.sendWindow.timezone}</div></div></div>
+          <div><div className="field"><label>Send window</label><div className="mono faint" style={{ fontSize: 12 }}>{campaign.sendWindow ? `${campaign.sendWindow.startHour}:00–${campaign.sendWindow.endHour}:00 ${campaign.sendWindow.timezone}` : "not set"}</div></div></div>
           <div><div className="field"><label>Mailbox</label><div className="mono faint" style={{ fontSize: 12 }}>{mailbox?.email ?? "none set"}</div></div></div>
           <div className="faint" style={{ fontSize: 11 }}>Send window &amp; mailbox are set at creation.</div>
         </div>

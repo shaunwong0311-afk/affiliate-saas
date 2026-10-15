@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { api, shortDate } from "../api";
-import { useApi, Card, Badge, PageHeader, EmptyState, Stat } from "../ui";
+import { useApi, Card, Badge, PageHeader, EmptyState, Stat, humanize } from "../ui";
 
 interface Handoff {
   id: string;
@@ -98,7 +98,7 @@ export function Handoffs() {
                   <div className="row wrap gap-8" style={{ alignItems: "center" }}>
                     {h.tier && <Badge kind={h.tier === "A" ? "neg" : h.tier === "B" ? "warn" : ""}>{h.tier}-tier</Badge>}
                     <Badge kind={REASON_KIND[h.reason]}>{REASON_LABEL[h.reason]}</Badge>
-                    <span className="mono faint" style={{ fontSize: 12 }}>{h.topic.replace(/_/g, " ")}</span>
+                    <span className="mono faint" style={{ fontSize: 12 }}>{humanize(h.topic, "")}</span>
                   </div>
                   <span className="faint" style={{ fontSize: 12 }}>{shortDate(h.createdAt)}</span>
                 </div>

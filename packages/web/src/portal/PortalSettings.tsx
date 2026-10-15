@@ -12,10 +12,12 @@ const FORM_TYPES: { value: FormType; label: string }[] = [
   { value: "other", label: "Other / I'm not sure" },
 ];
 
+// Merchants pay affiliates directly from their own account, so what matters here is that
+// the reference is something a person can actually pay to.
 const RAILS: { value: Rail; label: string; hint: string }[] = [
-  { value: "stripe", label: "Stripe", hint: "bank account or card via Connect" },
   { value: "paypal", label: "PayPal", hint: "the email on your PayPal account" },
-  { value: "wise", label: "Wise", hint: "multi-currency account or IBAN" },
+  { value: "wise", label: "Wise", hint: "the email on your Wise account, or your IBAN / account details" },
+  { value: "stripe", label: "Stripe", hint: "your Stripe account ID — only useful if the merchant pays through Stripe" },
 ];
 
 function SuccessBanner({ message }: { message: string }) {
@@ -35,7 +37,7 @@ export function PortalSettings() {
   const [taxMsg, setTaxMsg] = useState<string | null>(null);
   const [taxErr, setTaxErr] = useState<string | null>(null);
 
-  const [rail, setRail] = useState<Rail>("stripe");
+  const [rail, setRail] = useState<Rail>("paypal");
   const [accountRef, setAccountRef] = useState("");
   const [currency, setCurrency] = useState("USD");
   const [payoutBusy, setPayoutBusy] = useState(false);
@@ -69,7 +71,7 @@ export function PortalSettings() {
     try {
       const cur = currency.trim().toUpperCase();
       await api.post("/portal/payout-account", { rail, accountRef: accountRef.trim(), currency: cur });
-      setPayoutMsg(`Payout account saved — ${rail} → ${accountRef.trim()} in ${cur}. Earnings will settle here.`);
+      setPayoutMsg(`Payout details saved — ${rail} → ${accountRef.trim()} in ${cur}. Merchants will pay you here.`);
     } catch (err: any) {
       setPayoutErr(err?.message ?? "Could not save payout account.");
     } finally {
@@ -84,7 +86,7 @@ export function PortalSettings() {
       <PageHeader
         title="Payout & tax setup"
         crumb="PORTAL · SETTINGS"
-        subtitle="Two things stand between your earnings and your bank: a tax form on file and a payout account. Both live here. Until a valid tax form is certified, every payout is held — so do this once and get paid on schedule."
+        subtitle="Two things stand between your earnings and your bank: a tax form on file and payout details. Both live here. Merchants pay you directly from their own account, and they can't include you in a payout until both are set — so do this once."
       />
 
       <div className="grid grid-2">
@@ -122,9 +124,9 @@ export function PortalSettings() {
           </form>
         </Card>
 
-        <Card title="Payout account" sub="where your settled commissions are sent">
+        <Card title="Payout details" sub="where merchants send your commissions">
           <form onSubmit={submitPayout} className="mt-16">
-            <Field label="Payout rail">
+            <Field label="How you want to be paid">
               <select className="select" value={rail} onChange={(e) => setRail(e.target.value as Rail)}>
                 {RAILS.map((r) => (
                   <option key={r.value} value={r.value}>
@@ -184,17 +186,17 @@ export function PortalSettings() {
               </p>
             </div>
             <div className="muted" style={{ fontSize: 13 }}>
-              <strong className="acc">2 · Connect a payout account</strong>
+              <strong className="acc">2 · Save your payout details</strong>
               <p style={{ marginTop: 4 }}>
-                Pick a rail and tell us where to send funds. Stripe and Wise suit bank transfers; PayPal pays to your
-                account email.
+                Pick how you want to be paid and give the details a merchant needs — your PayPal email, or your Wise
+                account. This is exactly what they will pay to, so double-check it.
               </p>
             </div>
             <div className="muted" style={{ fontSize: 13 }}>
-              <strong className="acc">3 · Get paid on schedule</strong>
+              <strong className="acc">3 · The merchant pays you</strong>
               <p style={{ marginTop: 4 }}>
-                Once both are on file, cleared commissions settle automatically each payout cycle in your chosen
-                currency.
+                Once both are on file and your balance clears a merchant's minimum, they include you in their next payout
+                batch and pay you directly from their own account. It appears under Payouts.
               </p>
             </div>
           </div>

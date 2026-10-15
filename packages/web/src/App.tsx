@@ -1,6 +1,8 @@
+import { useEffect, type ReactNode } from "react";
 import { useHashRoute, matchRoute, navigate } from "./router";
 import { useAuth } from "./auth";
 import { Spinner } from "./ui";
+import { ErrorBoundary } from "./ErrorBoundary";
 import { Login } from "./pages/Login";
 import { Dashboard } from "./pages/Dashboard";
 import { Recruitment } from "./pages/Recruitment";
@@ -30,6 +32,7 @@ import { PortalCodes } from "./portal/PortalCodes";
 import { PortalStatement } from "./portal/PortalStatement";
 import { PortalPayouts } from "./portal/PortalPayouts";
 import { PortalSettings } from "./portal/PortalSettings";
+import { PortalVerify } from "./portal/PortalVerify";
 
 interface NavItem {
   label: string;
@@ -94,7 +97,12 @@ const PORTAL_NAV: { section: string; items: NavItem[] }[] = [
   },
 ];
 
-const ROUTES: { pattern: string; render: (params: Record<string, string>) => JSX.Element }[] = [
+type Route = { pattern: string; render: (params: Record<string, string>) => JSX.Element };
+
+// Two disjoint route tables: a merchant user only ever matches merchant screens and an
+// affiliate only portal screens, so neither can land on a page whose API calls are
+// guaranteed to be refused for their kind of session.
+const MERCHANT_ROUTES: Route[] = [
   { pattern: "/dashboard", render: () => <Dashboard /> },
   { pattern: "/recruitment", render: () => <Recruitment /> },
   { pattern: "/niche-map", render: () => <NicheMap /> },
@@ -116,6 +124,9 @@ const ROUTES: { pattern: string; render: (params: Record<string, string>) => JSX
   { pattern: "/billing", render: () => <Billing /> },
   { pattern: "/developer", render: () => <Developer /> },
   { pattern: "/settings", render: () => <Settings /> },
+];
+
+const PORTAL_ROUTES: Route[] = [
   { pattern: "/portal", render: () => <PortalDashboard /> },
   { pattern: "/portal/links", render: () => <PortalLinks /> },
   { pattern: "/portal/codes", render: () => <PortalCodes /> },
@@ -154,7 +165,7 @@ function Sidebar({ path, isAffiliate }: { path: string; isAffiliate: boolean }) 
 }
 
 function Topbar() {
-  const { me, logout, isAffiliate } = useAuth();
+  const { me, logout, isAffiliate, activeRole } = useAuth();
   const name = isAffiliate ? me?.affiliate?.name : me?.user?.name;
   return (
     <div className="topbar">
@@ -162,7 +173,7 @@ function Topbar() {
       <div className="topbar-actions">
         <div className="merchant-pill">
           <span className="dot" />
-          {isAffiliate ? "Affiliate" : me?.merchants?.[0]?.role ?? "member"} · {name ?? "you"}
+          {isAffiliate ? "Affiliate" : activeRole ?? "member"} · {name ?? "you"}
         </div>
         <button className="btn ghost sm" onClick={logout}>
           Sign out
@@ -172,36 +183,114 @@ function Topbar() {
   );
 }
 
+/** A centred card outside the app shell, for states where there is no shell to show. */
+function Standalone({ title, children, actions }: { title: string; children: ReactNode; actions: ReactNode }) {
+  return (
+    <div className="auth">
+      <div className="auth-card">
+        <div className="brand">
+          <div className="brand-mark">V</div>
+          <div className="brand-name">
+            Vantage
+            <small>recruitment os</small>
+          </div>
+        </div>
+        <h3 style={{ fontSize: 17, textAlign: "center" }}>{title}</h3>
+        <div className="muted" style={{ fontSize: 13.5, lineHeight: 1.55, textAlign: "center", margin: "10px 0 22px" }}>
+          {children}
+        </div>
+        <div className="row gap-8" style={{ justifyContent: "center" }}>
+          {actions}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export function App() {
-  const { path, navigate: go } = useHashRoute();
-  const { me, loading, isAffiliate } = useAuth();
+  const { path } = useHashRoute();
+  const { me, loading, sessionError, retrySession, logout, isAffiliate, activeMerchant } = useAuth();
 
-  // PUBLIC routes render outside the authenticated shell (no session required) — this is
-  // where the self-serve signup links the reply router hands out actually land.
+  // PUBLIC routes render outside the authenticated shell (no session required): the
+  // self-serve signup link the reply router hands out, and the emailed portal sign-in
+  // link (`#/portal/verify?token=…`), which by definition arrives with no session.
   const joinMatch = matchRoute("/join/:merchantId", path);
-  if (joinMatch) return <Join merchantId={joinMatch.merchantId!} />;
+  const isVerify = path === "/portal/verify";
+  const isPublic = joinMatch !== null || isVerify;
+  const inPortal = path === "/portal" || path.startsWith("/portal/");
 
-  if (loading) return <Spinner label="initializing vantage…" />;
-  if (!me) {
-    if (path !== "/login") setTimeout(() => go("/login"), 0);
-    return <Login />;
-  }
-
-  // Default landing per principal kind.
-  if (path === "/" || path === "/login") {
-    setTimeout(() => go(isAffiliate ? "/portal" : "/dashboard"), 0);
-  }
-
-  let body: JSX.Element | null = null;
-  for (const route of ROUTES) {
-    const params = matchRoute(route.pattern, path);
-    if (params) {
-      body = route.render(params);
-      break;
+  // Resolve the screen for a signed-in principal — and where to send anyone standing on
+  // a path that is not theirs ("/", "/login", an unknown path, the other principal's area).
+  let screen: JSX.Element | null = null;
+  let redirectTo: string | null = null;
+  if (!isPublic && !loading) {
+    if (me) {
+      for (const route of isAffiliate ? PORTAL_ROUTES : MERCHANT_ROUTES) {
+        const params = matchRoute(route.pattern, path);
+        if (params) {
+          screen = route.render(params);
+          break;
+        }
+      }
+      if (!screen) {
+        redirectTo = isAffiliate ? "/portal" : "/dashboard";
+        screen = isAffiliate ? <PortalDashboard /> : <Dashboard />;
+      }
+    } else if (!sessionError && path !== "/login") {
+      redirectTo = "/login";
     }
   }
-  if (!body) {
-    body = isAffiliate ? <PortalDashboard /> : <Dashboard />;
+
+  // Redirects REPLACE the history entry: pushing one made Back return to the path that
+  // redirects, which immediately bounced forward again.
+  useEffect(() => {
+    if (redirectTo) navigate(redirectTo, { replace: true });
+  }, [redirectTo]);
+
+  if (joinMatch) return <Join merchantId={joinMatch.merchantId!} />;
+  if (isVerify) return <PortalVerify />;
+
+  if (loading) return <Spinner label="initializing vantage…" />;
+
+  if (!me) {
+    if (sessionError) {
+      return (
+        <Standalone
+          title="Can't reach Vantage right now"
+          actions={
+            <>
+              <button className="btn primary" onClick={retrySession}>
+                ↻ Try again
+              </button>
+              <button className="btn ghost" onClick={logout}>
+                Sign out
+              </button>
+            </>
+          }
+        >
+          You're still signed in — we just couldn't load your account. This is usually a brief connection problem.
+          <div className="faint mono" style={{ fontSize: 11.5, marginTop: 10 }}>{sessionError}</div>
+        </Standalone>
+      );
+    }
+    // Someone following a portal link while signed out is an affiliate, not a merchant.
+    return <Login initialMode={inPortal ? "affiliate" : "login"} />;
+  }
+
+  if (me.kind === "user" && !activeMerchant) {
+    return (
+      <Standalone
+        title="No workspace on this account"
+        actions={
+          <button className="btn primary" onClick={logout}>
+            Sign out
+          </button>
+        }
+      >
+        You're signed in{me.user?.email ? <> as <span className="mono">{me.user.email}</span></> : null}, but this account isn't an
+        active member of any workspace. Ask a workspace owner or admin to invite or reactivate you.
+      </Standalone>
+    );
   }
 
   return (
@@ -209,7 +298,12 @@ export function App() {
       <Sidebar path={path} isAffiliate={isAffiliate} />
       <div className="main">
         <Topbar />
-        <div className="content">{body}</div>
+        <div className="content">
+          {/* One bad screen must not take the shell with it; navigating away clears the error. */}
+          <ErrorBoundary variant="page" resetKey={path}>
+            {screen}
+          </ErrorBoundary>
+        </div>
       </div>
     </div>
   );

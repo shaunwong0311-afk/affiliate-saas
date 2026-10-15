@@ -1,14 +1,14 @@
 import { useState } from "react";
 import { api, shortDate } from "../api";
-import { useApi, Card, Badge, PageHeader, EmptyState, Stat } from "../ui";
+import { useApi, Card, Badge, PageHeader, EmptyState, Stat, safeHref } from "../ui";
 
 interface DmFollowupTarget {
   prospectId: string;
   identity: string;
-  tier: "A" | "B" | "C" | null;
-  score: number | null;
-  daysSinceEmail: number | null;
-  target: { platform: string; handle: string; profileUrl: string; deepLink: string | null; opensComposer: boolean };
+  tier?: "A" | "B" | "C" | null;
+  score?: number | null;
+  daysSinceEmail?: number | null;
+  target?: { platform?: string; handle?: string; profileUrl?: string | null; deepLink?: string | null; opensComposer?: boolean } | null;
 }
 
 interface DmTask {
@@ -83,12 +83,17 @@ export function DmQueue() {
               <tbody>
                 {followup.data.map((t) => (
                   <tr key={t.prospectId}>
-                    <td><strong>{t.identity}</strong> <span className="faint mono" style={{ fontSize: 12 }}>@{t.target.handle}</span></td>
+                    <td><strong>{t.identity}</strong> {t.target?.handle && <span className="faint mono" style={{ fontSize: 12 }}>@{t.target.handle}</span>}</td>
                     <td>{t.tier ? <Badge kind={t.tier === "A" ? "neg" : t.tier === "B" ? "warn" : ""}>{t.tier}</Badge> : <span className="faint">—</span>}</td>
-                    <td className="muted" style={{ fontSize: 12 }}>{t.target.platform}</td>
+                    <td className="muted" style={{ fontSize: 12 }}>{t.target?.platform ?? "—"}</td>
                     <td className="num mono">{t.daysSinceEmail != null ? Math.round(t.daysSinceEmail) : "—"}</td>
                     <td className="num">
-                      <a className="btn sm ghost" href={t.target.deepLink ?? t.target.profileUrl} target="_blank" rel="noreferrer">{t.target.opensComposer ? "Open DM ↗" : "Open profile ↗"}</a>
+                      {/* The profile URL comes from the scraped identity graph — link only to http(s). */}
+                      {safeHref(t.target?.deepLink ?? t.target?.profileUrl) ? (
+                        <a className="btn sm ghost" href={safeHref(t.target?.deepLink ?? t.target?.profileUrl)} target="_blank" rel="noreferrer">{t.target?.opensComposer ? "Open DM ↗" : "Open profile ↗"}</a>
+                      ) : (
+                        <span className="faint">—</span>
+                      )}
                     </td>
                   </tr>
                 ))}
@@ -122,8 +127,8 @@ export function DmQueue() {
                 {t.status === "pending" && (
                   <div className="row wrap gap-8 mt-16">
                     <button className="btn sm" onClick={() => copy(t.id, t.message)}>{copied === t.id ? "✓ copied" : "Copy message"}</button>
-                    {t.deepLink && (
-                      <a className="btn sm" href={t.deepLink} target="_blank" rel="noreferrer">{t.opensComposer ? "Open DM composer ↗" : "Open profile ↗"}</a>
+                    {safeHref(t.deepLink) && (
+                      <a className="btn sm" href={safeHref(t.deepLink)} target="_blank" rel="noreferrer">{t.opensComposer ? "Open DM composer ↗" : "Open profile ↗"}</a>
                     )}
                     <button className="btn sm primary" onClick={() => markSent(t.id)} disabled={busy === t.id}>Mark sent</button>
                     <button className="btn sm ghost" onClick={() => skip(t.id)} disabled={busy === t.id}>Skip</button>

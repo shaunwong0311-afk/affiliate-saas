@@ -1,7 +1,8 @@
 import { useMemo, useState } from "react";
-import { api, num, shortDate } from "../api";
-import { useApi, Card, Stat, Spinner, ErrorBanner, PageHeader, Badge, EmptyState, Field, Modal, statusKind } from "../ui";
+import { api, errorMessage, num, shortDate } from "../api";
+import { useApi, Card, Stat, Spinner, ErrorBanner, PageHeader, Badge, EmptyState, Field, Modal, statusKind, humanize } from "../ui";
 import { navigate } from "../router";
+import { BulkImport } from "../BulkImport";
 
 interface AffiliateObj {
   name?: string | null;
@@ -13,10 +14,11 @@ interface Relationship {
   id: string;
   affiliateId: string;
   status: string;
-  role: string;
+  role?: string | null;
   tags?: string[] | null;
-  joinedAt: string | null;
-  source: string | null;
+  joinedAt?: string | null;
+  source?: string | null;
+  /** Joined in by the list route; null when the global affiliate row is gone. */
   affiliate?: AffiliateObj | null;
   // defensive flattened fallbacks
   name?: string | null;
@@ -28,10 +30,19 @@ interface Relationship {
 interface Program {
   id: string;
   name: string;
+  status?: string;
 }
 
-const STATUS_FILTERS = ["all", "active", "pending", "paused", "rejected"] as const;
+// The relationship statuses and roles the API accepts (`routes/affiliates.ts`).
+const STATUS_FILTERS = ["all", "active", "pending", "paused", "rejected", "banned"] as const;
 type StatusFilter = (typeof STATUS_FILTERS)[number];
+
+/** `role` is what the affiliate does in the program, not what kind of creator they are. */
+const ROLE_OPTIONS: { value: "seller" | "recruiter" | "both"; label: string }[] = [
+  { value: "seller", label: "Seller — earns on their own sales" },
+  { value: "recruiter", label: "Recruiter — earns on recruits' sales" },
+  { value: "both", label: "Both" },
+];
 
 function affName(r: Relationship): string {
   return r.affiliate?.name ?? r.name ?? "Unnamed affiliate";
@@ -47,6 +58,7 @@ export function Affiliates() {
   const [status, setStatus] = useState<StatusFilter>("all");
   const [role, setRole] = useState<string>("");
   const [inviteOpen, setInviteOpen] = useState(false);
+  const [importOpen, setImportOpen] = useState(false);
   const [busy, setBusy] = useState<string | null>(null);
   const [actionErr, setActionErr] = useState<string | null>(null);
 
@@ -57,13 +69,15 @@ export function Affiliates() {
     return p.toString();
   }, [status, role]);
 
-  const { data, loading, error, reload } = useApi<{ items: Relationship[]; total: number }>(
+  const { data, loading, error, reload } = useApi<{ items?: Relationship[]; total?: number } | null>(
     () => api.get(`/affiliates?${qs}`),
     [qs]
   );
-  const programs = useApi<{ items: Program[]; total: number } | Program[]>(() => api.get("/programs"), []);
+  const programs = useApi<{ items?: Program[]; total?: number } | Program[] | null>(() => api.get("/programs"), []);
 
   const programList: Program[] = Array.isArray(programs.data) ? programs.data : programs.data?.items ?? [];
+  // The roster import attaches everyone to a program; with none, the API skips every row.
+  const noPrograms = !programs.loading && !programs.error && programList.length === 0;
 
   async function act(id: string, action: "approve" | "reject" | "pause") {
     setBusy(id + action);
@@ -75,14 +89,14 @@ export function Affiliates() {
         await api.post(`/affiliates/${id}/${action}`, {});
       }
       reload();
-    } catch (e: any) {
-      setActionErr(e?.message ?? `${action} failed`);
+    } catch (e) {
+      setActionErr(errorMessage(e, `${action} failed`));
     } finally {
       setBusy(null);
     }
   }
 
-  if (loading) return <Spinner />;
+  if (loading && !data) return <Spinner />;
   if (error) return <ErrorBanner message={error} />;
 
   const items = data?.items ?? [];
@@ -91,6 +105,7 @@ export function Affiliates() {
     acc[r.status] = (acc[r.status] ?? 0) + 1;
     return acc;
   }, {});
+  const inactive = (counts.paused ?? 0) + (counts.rejected ?? 0) + (counts.banned ?? 0);
 
   return (
     <>
@@ -99,11 +114,32 @@ export function Affiliates() {
         crumb="THE ROSTER"
         subtitle="Every relationship — inbound applicants and recruited prospects alike. Approve who will produce, pause who won't, and keep the partnership ledger clean."
         actions={
-          <button className="btn primary" onClick={() => setInviteOpen(true)}>
-            + Invite affiliate
-          </button>
+          <>
+            <button className="btn" onClick={() => setImportOpen((v) => !v)}>
+              {importOpen ? "Close import" : "⇪ Import roster"}
+            </button>
+            <button className="btn primary" onClick={() => setInviteOpen(true)}>
+              + Add affiliate
+            </button>
+          </>
         }
       />
+
+      {importOpen && (
+        <BulkImport
+          kind="roster"
+          onClose={() => setImportOpen(false)}
+          onImported={reload}
+          blocked={
+            noPrograms ? (
+              <>
+                You need a program before importing a roster — every imported affiliate is attached to one.{" "}
+                <a href="#/programs" style={{ textDecoration: "underline" }}>Create a program</a>, then come back.
+              </>
+            ) : undefined
+          }
+        />
+      )}
 
       {actionErr && <ErrorBanner message={actionErr} />}
 
@@ -111,7 +147,7 @@ export function Affiliates() {
         <Stat label="Total relationships" value={num(total)} foot={`${num(items.length)} shown`} footClass="muted" />
         <Stat label="Active" value={num(counts.active ?? 0)} foot="producing-capable" footClass="muted" />
         <Stat label="Pending review" value={num(counts.pending ?? 0)} foot="awaiting approval" footClass={(counts.pending ?? 0) > 0 ? "warn" : "muted"} />
-        <Stat label="Paused / rejected" value={num((counts.paused ?? 0) + (counts.rejected ?? 0))} foot="inactive" footClass="muted" />
+        <Stat label="Paused / rejected / banned" value={num(inactive)} foot="inactive" footClass="muted" />
       </div>
 
       <div className="row gap-8 mt-24" style={{ flexWrap: "wrap" }}>
@@ -126,12 +162,11 @@ export function Affiliates() {
           </button>
         ))}
         <span style={{ flex: 1 }} />
-        <select className="select" value={role} onChange={(e) => setRole(e.target.value)} style={{ maxWidth: 180 }}>
+        <select className="select" value={role} onChange={(e) => setRole(e.target.value)} style={{ maxWidth: 180 }} aria-label="Filter by role">
           <option value="">All roles</option>
-          <option value="affiliate">Affiliate</option>
-          <option value="influencer">Influencer</option>
-          <option value="agency">Agency</option>
-          <option value="referral">Referral</option>
+          <option value="seller">Seller</option>
+          <option value="recruiter">Recruiter</option>
+          <option value="both">Both</option>
         </select>
       </div>
 
@@ -139,11 +174,20 @@ export function Affiliates() {
         {items.length === 0 ? (
           <EmptyState
             title="No affiliates match"
-            hint={status === "all" ? "Invite your first partner, or approve recruited prospects from the recruitment engine." : `No relationships in "${status}". Clear the filter to see the full roster.`}
+            hint={
+              status === "all" && !role
+                ? "Add your first partner, import the roster you already have, or approve recruited prospects from the recruitment engine."
+                : "No relationships match these filters. Clear them to see the full roster."
+            }
             action={
-              status === "all"
-                ? <button className="btn primary" onClick={() => setInviteOpen(true)}>Invite affiliate</button>
-                : <button className="btn ghost" onClick={() => setStatus("all")}>Clear filter</button>
+              status === "all" && !role ? (
+                <div className="row gap-8" style={{ justifyContent: "center" }}>
+                  <button className="btn primary" onClick={() => setInviteOpen(true)}>Add affiliate</button>
+                  <button className="btn" onClick={() => setImportOpen(true)}>Import roster</button>
+                </div>
+              ) : (
+                <button className="btn ghost" onClick={() => { setStatus("all"); setRole(""); }}>Clear filters</button>
+              )
             }
           />
         ) : (
@@ -172,13 +216,13 @@ export function Affiliates() {
                           </div>
                         </td>
                         <td>
-                          <Badge kind="info">{r.role ?? "affiliate"}</Badge>
+                          <Badge kind="info">{r.role ?? "seller"}</Badge>
                         </td>
                         <td>
                           <Badge kind={statusKind(r.status)}>{r.status}</Badge>
                         </td>
                         <td className="muted" style={{ fontSize: 12 }}>
-                          {r.source ? r.source.replace(/_/g, " ") : "—"}
+                          {humanize(r.source)}
                         </td>
                         <td className="muted" style={{ fontSize: 12 }}>{shortDate(r.joinedAt)}</td>
                         <td className="num">
@@ -237,7 +281,8 @@ function InviteModal({
   programs: Program[];
   onInvited: () => void;
 }) {
-  const [form, setForm] = useState({ email: "", name: "", role: "affiliate", programId: "", source: "manual_invite" });
+  const blank = { email: "", name: "", role: "seller", programId: "", source: "manual_invite" };
+  const [form, setForm] = useState(blank);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
@@ -245,30 +290,38 @@ function InviteModal({
     setForm((f) => ({ ...f, [k]: v }));
   }
 
+  // The select shows the first program when none was picked, so submit that one.
+  const programId = form.programId || programs[0]?.id || "";
+  const email = form.email.trim();
+
   async function submit() {
     setBusy(true);
     setErr(null);
     try {
       await api.post("/affiliates", {
-        email: form.email,
-        name: form.name,
+        email,
+        // The API requires a name; default to the mailbox name rather than failing.
+        name: form.name.trim() || email.split("@")[0] || email,
         role: form.role,
-        programId: form.programId || (programs[0]?.id ?? ""),
-        source: form.source,
+        programId,
+        source: form.source.trim() || undefined,
       });
-      setForm({ email: "", name: "", role: "affiliate", programId: "", source: "manual_invite" });
+      setForm(blank);
       onInvited();
-    } catch (e: any) {
-      setErr(e?.message ?? "invite failed");
+    } catch (e) {
+      setErr(errorMessage(e, "Could not add the affiliate."));
     } finally {
       setBusy(false);
     }
   }
 
   return (
-    <Modal open={open} onClose={onClose} title="Invite affiliate">
-      <div style={{ padding: "4px 20px 20px" }}>
+    <Modal open={open} onClose={onClose} title="Add affiliate">
+      <div style={{ padding: "4px 0" }}>
         {err && <ErrorBanner message={err} />}
+        {programs.length === 0 && (
+          <ErrorBanner message="Create a program first (Programs & Offers) — an affiliate is always added to a program." />
+        )}
         <Field label="Email">
           <input
             className="input"
@@ -289,14 +342,15 @@ function InviteModal({
         <div className="grid grid-2">
           <Field label="Role">
             <select className="select" value={form.role} onChange={(e) => set("role", e.target.value)}>
-              <option value="affiliate">Affiliate</option>
-              <option value="influencer">Influencer</option>
-              <option value="agency">Agency</option>
-              <option value="referral">Referral</option>
+              {ROLE_OPTIONS.map((r) => (
+                <option key={r.value} value={r.value}>
+                  {r.label}
+                </option>
+              ))}
             </select>
           </Field>
           <Field label="Program">
-            <select className="select" value={form.programId} onChange={(e) => set("programId", e.target.value)}>
+            <select className="select" value={programId} onChange={(e) => set("programId", e.target.value)}>
               {programs.length === 0 && <option value="">No programs</option>}
               {programs.map((p) => (
                 <option key={p.id} value={p.id}>
@@ -314,13 +368,13 @@ function InviteModal({
             onChange={(e) => set("source", e.target.value)}
           />
         </Field>
+        <div className="faint" style={{ fontSize: 11.5 }}>
+          They are added as an active affiliate straight away. No email is sent — they sign in to the portal by requesting a
+          link with this address.
+        </div>
         <div className="row gap-8 mt-16">
-          <button
-            className="btn primary"
-            onClick={submit}
-            disabled={busy || !form.email || (programs.length > 0 && !form.programId && !programs[0])}
-          >
-            {busy ? "inviting…" : "Send invite"}
+          <button className="btn primary" onClick={submit} disabled={busy || !email || !programId}>
+            {busy ? "adding…" : "Add affiliate"}
           </button>
           <button className="btn ghost" onClick={onClose} disabled={busy}>
             Cancel

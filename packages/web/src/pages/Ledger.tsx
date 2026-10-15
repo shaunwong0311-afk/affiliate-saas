@@ -1,18 +1,20 @@
 import { useState } from "react";
 import { api, money, shortDate } from "../api";
-import { useApi, Card, Spinner, ErrorBanner, PageHeader, Badge, EmptyState, statusKind } from "../ui";
+import { useApi, Card, Spinner, ErrorBanner, PageHeader, Badge, EmptyState, statusKind, humanize } from "../ui";
 
 interface LedgerEntry {
   id: string;
   affiliateId: string;
-  conversionId: string | null;
+  conversionId?: string | null;
+  /** commission | override | bonus | adjustment | reversal */
   type: string;
   amountCents: number;
   currency: string;
+  /** pending | approved | processing | paid | reversed */
   status: string;
-  availableAt: string | null;
-  ts: string;
-  metadata: Record<string, unknown> | null;
+  availableAt?: string | null;
+  ts?: string | null;
+  metadata?: Record<string, unknown> | null;
 }
 
 interface CurrencyBalance {
@@ -26,22 +28,31 @@ interface CurrencyBalance {
 
 interface AffiliateBalance {
   affiliateId: string;
-  name: string;
-  balances: CurrencyBalance[];
+  /** null when the affiliate record is gone. */
+  name?: string | null;
+  balances?: CurrencyBalance[] | null;
 }
 
-const TYPES = ["", "commission", "bonus", "adjustment", "reversal", "payout"];
-const STATUSES = ["", "pending", "available", "on_hold", "paid", "reversed"];
+// The values the ledger actually stores (`core/types/ledger.ts`). "available" and
+// "on hold" are BALANCE buckets derived from approved entries, not entry statuses, and a
+// payout is not an entry type — filtering on those could never match anything.
+const TYPES = ["", "commission", "override", "bonus", "adjustment", "reversal"];
+const STATUSES = ["", "pending", "approved", "processing", "paid", "reversed"];
 
 export function Ledger() {
   const [type, setType] = useState("");
   const [status, setStatus] = useState("");
 
-  const balances = useApi<AffiliateBalance[]>(() => api.get("/ledger/balances"), []);
-  const entries = useApi<{ items: LedgerEntry[]; total: number }>(
-    () => api.get(`/ledger?limit=200&status=${status}&type=${type}`),
-    [status, type]
-  );
+  const balances = useApi<AffiliateBalance[] | null>(() => api.get("/ledger/balances"), []);
+  const entries = useApi<{ items?: LedgerEntry[]; total?: number } | null>(() => {
+    // Only send a filter that is set: `status=` (empty) is a filter for the empty string
+    // on the API side and matches no entry at all.
+    const q = new URLSearchParams({ limit: "200" });
+    if (status) q.set("status", status);
+    if (type) q.set("type", type);
+    return api.get(`/ledger?${q.toString()}`);
+  }, [status, type]);
+  const entryItems = entries.data?.items ?? [];
 
   function posneg(cents: number): string {
     return cents < 0 ? "neg" : "pos";
@@ -78,10 +89,10 @@ export function Ledger() {
               </thead>
               <tbody>
                 {balances.data.flatMap((aff) =>
-                  aff.balances.map((b) => (
+                  (aff.balances ?? []).map((b) => (
                     <tr key={`${aff.affiliateId}-${b.currency}`}>
                       <td>
-                        <div style={{ fontWeight: 600 }}>{aff.name}</div>
+                        <div style={{ fontWeight: 600 }}>{aff.name ?? "Unknown affiliate"}</div>
                         <div className="faint mono" style={{ fontSize: 11 }}>{aff.affiliateId}</div>
                       </td>
                       <td className="mono muted" style={{ fontSize: 12 }}>{b.currency}</td>
@@ -123,10 +134,14 @@ export function Ledger() {
             <Spinner />
           ) : entries.error ? (
             <ErrorBanner message={entries.error} />
-          ) : !entries.data || entries.data.items.length === 0 ? (
+          ) : entryItems.length === 0 ? (
             <EmptyState
               title="No entries"
-              hint="No ledger entries match the current filters. Adjust the type or status filter above."
+              hint={
+                type || status
+                  ? "No ledger entries match the current filters. Adjust the type or status filter above."
+                  : "Entries are written as conversions are approved, reversed, adjusted and paid."
+              }
               action={
                 (type || status) ? (
                   <button className="btn sm ghost" onClick={() => { setType(""); setStatus(""); }}>Clear filters</button>
@@ -147,12 +162,12 @@ export function Ledger() {
                   </tr>
                 </thead>
                 <tbody>
-                  {entries.data.items.map((e) => (
+                  {entryItems.map((e) => (
                     <tr key={e.id}>
-                      <td><Badge kind={statusKind(e.type)}>{e.type.replace(/_/g, " ")}</Badge></td>
+                      <td><Badge kind={statusKind(e.type)}>{humanize(e.type)}</Badge></td>
                       <td className="mono faint" style={{ fontSize: 11 }}>{e.affiliateId}</td>
                       <td className={`num mono ${e.amountCents < 0 ? "neg" : ""}`}>{money(e.amountCents, e.currency)}</td>
-                      <td><Badge kind={statusKind(e.status)}>{e.status.replace(/_/g, " ")}</Badge></td>
+                      <td><Badge kind={statusKind(e.status)}>{humanize(e.status)}</Badge></td>
                       <td className="muted" style={{ fontSize: 12 }}>{shortDate(e.availableAt)}</td>
                       <td className="muted" style={{ fontSize: 12 }}>{shortDate(e.ts)}</td>
                     </tr>
@@ -161,9 +176,9 @@ export function Ledger() {
               </table>
             </div>
           )}
-          {entries.data && entries.data.items.length > 0 && (
+          {entryItems.length > 0 && (
             <div className="faint" style={{ fontSize: 11, padding: "12px 20px" }}>
-              Showing {entries.data.items.length} of {entries.data.total} entries.
+              Showing {entryItems.length} of {entries.data?.total ?? entryItems.length} entries.
             </div>
           )}
         </Card>

@@ -1,17 +1,19 @@
 import { useState } from "react";
-import { api, pct, num, shortDate } from "../api";
+import { api, num, shortDate } from "../api";
 import { useApi, Card, Spinner, ErrorBanner, PageHeader, Badge, EmptyState } from "../ui";
 
 interface AffiliateCode {
+  id?: string;
   code: string;
-  kind: "discount" | "referral" | string;
-  discountValue: number | null;
-  usageCap: number | null;
-  usageCount: number;
-  expiresAt: string | null;
+  kind: "discount" | "referral" | (string & {});
+  /** Percent off, as a whole number (15 = 15%). Null for referral codes. */
+  discountValue?: number | null;
+  usageCap?: number | null;
+  usageCount?: number | null;
+  expiresAt?: string | null;
 }
 
-function isExpired(iso: string | null): boolean {
+function isExpired(iso: string | null | undefined): boolean {
   return !!iso && new Date(iso).getTime() < Date.now();
 }
 
@@ -33,7 +35,7 @@ export function PortalCodes() {
   if (error) return <ErrorBanner message={error} />;
 
   const codes = data ?? [];
-  const totalRedemptions = codes.reduce((sum, c) => sum + c.usageCount, 0);
+  const totalRedemptions = codes.reduce((sum, c) => sum + (c.usageCount ?? 0), 0);
 
   return (
     <>
@@ -69,7 +71,7 @@ export function PortalCodes() {
               {codes.map((c) => {
                 const expired = isExpired(c.expiresAt);
                 return (
-                  <tr key={c.code}>
+                  <tr key={c.id ?? c.code}>
                     <td>
                       <code
                         className="mono"
@@ -92,10 +94,12 @@ export function PortalCodes() {
                       <Badge kind={c.kind === "discount" ? "info" : "tier-A"}>{c.kind}</Badge>
                     </td>
                     <td className="num mono">
-                      {c.discountValue != null ? pct(c.discountValue) : <span className="faint">—</span>}
+                      {/* `discountValue` is a whole-number percent (15 = 15% off), not a fraction —
+                          the fraction formatter rendered it as "1500.0%". */}
+                      {typeof c.discountValue === "number" ? `${c.discountValue}%` : <span className="faint">—</span>}
                     </td>
                     <td className="num mono">
-                      {num(c.usageCount)}
+                      {num(c.usageCount ?? 0)}
                       <span className="faint"> / {c.usageCap != null ? num(c.usageCap) : "∞"}</span>
                     </td>
                     <td>

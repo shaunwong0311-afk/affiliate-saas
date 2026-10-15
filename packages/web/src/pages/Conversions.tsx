@@ -14,6 +14,11 @@ interface Conversion {
 
 type Tab = "all" | "queue";
 
+/** First characters of an id, for display. Safe when the id is missing. */
+function shortId(id: string | null | undefined): string {
+  return id ? id.slice(0, 8) : "—";
+}
+
 export function Conversions() {
   const [tab, setTab] = useState<Tab>("all");
   const [msg, setMsg] = useState<string | null>(null);
@@ -32,7 +37,7 @@ export function Conversions() {
     setMsg(null);
     try {
       await api.post(`/conversions/${c.id}/approve`, {});
-      setMsg(`Approved ${c.id.slice(0, 8)} · ${money(c.amountCents, c.currency)}`);
+      setMsg(`Approved ${shortId(c.id)} · ${money(c.amountCents, c.currency)}`);
       reloadAll();
     } catch (e: any) {
       setMsg(e?.message ?? "approve failed");
@@ -42,13 +47,13 @@ export function Conversions() {
   }
 
   async function reject(c: Conversion) {
-    const reason = window.prompt(`Reject ${c.id.slice(0, 8)} — reason?`, "");
+    const reason = window.prompt(`Reject ${shortId(c.id)} — reason?`, "");
     if (reason === null) return;
     setBusy(c.id);
     setMsg(null);
     try {
       await api.post(`/conversions/${c.id}/reject`, { reason });
-      setMsg(`Rejected ${c.id.slice(0, 8)}${reason ? ` — ${reason}` : ""}`);
+      setMsg(`Rejected ${shortId(c.id)}${reason ? ` — ${reason}` : ""}`);
       reloadAll();
     } catch (e: any) {
       setMsg(e?.message ?? "reject failed");
@@ -152,8 +157,8 @@ export function Conversions() {
                 {rows.map((c) => (
                   <tr key={c.id}>
                     <td>
-                      <div className="mono" style={{ fontWeight: 600 }}>{c.id.slice(0, 8)}</div>
-                      <div className="faint mono" style={{ fontSize: 11 }}>aff {c.affiliateId.slice(0, 8)}</div>
+                      <div className="mono" style={{ fontWeight: 600 }}>{shortId(c.id)}</div>
+                      <div className="faint mono" style={{ fontSize: 11 }}>aff {shortId(c.affiliateId)}</div>
                     </td>
                     <td className="num mono">{money(c.amountCents, c.currency)}</td>
                     <td>
