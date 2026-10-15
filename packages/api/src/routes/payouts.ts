@@ -227,6 +227,8 @@ export const payoutRoutes: RouteModule = (app, ctx) => {
     const account: PayoutAccount = {
       id: newId("pa"),
       affiliateId,
+      // Recorded BY this merchant: used for this merchant's payouts only (see PayoutAccount.merchantId).
+      merchantId,
       rail: body.rail,
       accountRef: body.accountRef,
       status: "active",
@@ -250,6 +252,7 @@ export const payoutRoutes: RouteModule = (app, ctx) => {
     const doc: TaxDocument = {
       id: newId("tax"),
       affiliateId,
+      merchantId, // counts for this merchant only (see TaxDocument.merchantId)
       rail: null,
       formType: body.formType,
       status: "on_file",

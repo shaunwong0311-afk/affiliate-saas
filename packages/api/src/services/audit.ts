@@ -1,5 +1,6 @@
 import { newId } from "@affiliate/core";
 import type { AppContext } from "../context.js";
+import type { AuthPrincipal } from "../auth/middleware.js";
 
 export async function writeAudit(
   ctx: AppContext,
@@ -22,4 +23,13 @@ export async function writeAudit(
     metadata: params.metadata ?? {},
     ts: ctx.clock.now().toISOString(),
   });
+}
+
+/**
+ * Who performed the request, for `writeAudit`'s `actorId`: the signed-in user, else the API
+ * key, else null (a public or system path). An audit row without its actor cannot answer
+ * the one question it exists for.
+ */
+export function actorIdOf(request: { principal?: AuthPrincipal }): string | null {
+  return request.principal?.userId ?? request.principal?.apiKeyId ?? null;
 }

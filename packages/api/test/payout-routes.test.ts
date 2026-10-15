@@ -50,8 +50,9 @@ beforeAll(async () => {
   }
 
   // A read-only team member, to check the role gates.
-  await call("POST", `/merchants/${merchantId}/users`, { email: "viewer@demo.test", name: "V", role: "viewer" });
-  const accepted = await app.inject({ method: "POST", url: "/auth/accept-invite", headers: { "content-type": "application/json" }, payload: { email: "viewer@demo.test", password: "supersecret" } });
+  // Invites are accepted with the single-use token (returned outside production), not a bare email.
+  const invited = (await call("POST", `/merchants/${merchantId}/users`, { email: "viewer@demo.test", name: "V", role: "viewer" })).data;
+  const accepted = await app.inject({ method: "POST", url: "/auth/accept-invite", headers: { "content-type": "application/json" }, payload: { token: invited.devInviteToken, password: "supersecret" } });
   viewerToken = JSON.parse(accepted.body).data.token;
 
   await sell("pat", "o-pat", 10_000);

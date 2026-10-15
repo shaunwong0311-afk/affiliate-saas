@@ -1,17 +1,32 @@
-import Fastify, { type FastifyInstance } from "fastify";
+import Fastify, { type FastifyInstance, type FastifyRequest, type FastifyServerOptions } from "fastify";
 import cors from "@fastify/cors";
 import { createContext, type AppContext } from "./context.js";
 import { resolvePrincipal } from "./auth/middleware.js";
-import { HttpError } from "./errors.js";
+import { AUTH_LIMIT, PUBLIC_FORM_LIMIT, SIGNED_ENDPOINT_LIMIT, RateLimiter, clientKey, type RateRule } from "./auth/rate-limit.js";
+import { HttpError, isDataNotFound } from "./errors.js";
 import { allRouteModules } from "./routes/index.js";
+
+export interface BuildAppOptions {
+  /**
+   * Where request logs are written (default: stdout). Logging itself is governed by
+   * `config.logLevel` — "info" in production, off elsewhere unless LOG_LEVEL is set.
+   */
+  logStream?: { write(line: string): void };
+}
 
 /**
  * Build the Fastify application. Everything hangs off a single AppContext, so the
  * server is fully testable via app.inject() with no network or external services.
  */
-export async function buildApp(ctxOverride?: Partial<AppContext>): Promise<FastifyInstance> {
+export async function buildApp(ctxOverride?: Partial<AppContext>, options: BuildAppOptions = {}): Promise<FastifyInstance> {
   const ctx = createContext(ctxOverride);
-  const app = Fastify({ logger: false, bodyLimit: 1_048_576 });
+  const app = Fastify({
+    logger: loggerOptions(ctx.config.logLevel, options.logStream),
+    bodyLimit: 1_048_576,
+    // Decides whether X-Forwarded-For is believed: `request.ip` is the socket peer unless
+    // that peer is a proxy the operator listed in TRUST_PROXY.
+    trustProxy: ctx.config.trustProxy,
+  });
 
   await app.register(cors, { origin: ctx.config.corsOrigins, credentials: true });
 
@@ -21,21 +36,29 @@ export async function buildApp(ctxOverride?: Partial<AppContext>): Promise<Fasti
     (req as { rawBody?: string }).rawBody = typeof body === "string" ? body : "";
     try {
       done(null, body && (body as string).length ? JSON.parse(body as string) : {});
-    } catch (err) {
-      done(err as Error, undefined);
+    } catch {
+      // A body that is not JSON is the client's mistake (400), not a server fault (500).
+      done(new HttpError(400, "invalid JSON body", "bad_request"), undefined);
     }
   });
 
-  // Basic per-IP rate limit on auth + public webhook routes (brute-force / abuse
-  // guard). In-memory per process; production fronts this with a shared store.
-  const limiter = createRateLimiter({ windowMs: 60_000, max: 30 });
+  // Per-client rate limit on the unauthenticated surface (brute-force / abuse guard).
+  // In-memory per process; a multi-instance deployment fronts this with a shared store.
+  //  - the client is `request.ip` — never a header the caller can set (see trustProxy);
+  //  - the bucket is the MATCHED ROUTE, not the raw URL, so `/%61uth/login` or a varied
+  //    path parameter cannot mint a fresh bucket.
+  const limiter = new RateLimiter();
+  app.decorate("rateLimiter", limiter);
   app.addHook("onRequest", async (request, reply) => {
-    const url = request.url.split("?")[0] ?? "";
-    if (url.startsWith("/auth/") || url.includes("/reply-webhook/") || url.includes("/track/postback/") || url.includes("/track/unsubscribe") || url.startsWith("/join/") || url.includes("/webhooks/inbound")) {
-      const ip = (request.headers["x-forwarded-for"] as string)?.split(",")[0]?.trim() || request.ip || "unknown";
-      if (!limiter.allow(`${ip}:${url}`)) {
-        return reply.status(429).send({ error: { message: "too many requests", code: "rate_limited" } });
-      }
+    const pattern = request.routeOptions.url;
+    const rule = pattern ? rateRuleFor(request.method, pattern) : null;
+    if (!rule) return;
+    const decision = limiter.hit(`${clientKey(request.ip)}|${request.method}|${pattern}`, rule);
+    if (!decision.allowed) {
+      return reply
+        .status(429)
+        .header("retry-after", String(decision.retryAfterSeconds))
+        .send({ error: { message: "too many requests", code: "rate_limited" } });
     }
   });
 
@@ -46,17 +69,38 @@ export async function buildApp(ctxOverride?: Partial<AppContext>): Promise<Fasti
   });
 
   // Uniform error envelope.
-  app.setErrorHandler((error, _request, reply) => {
+  app.setErrorHandler((error, request, reply) => {
     if (error instanceof HttpError) {
+      if (error.statusCode >= 500) request.log.error({ err: error }, "request failed");
       return reply.status(error.statusCode).send({ error: { message: error.message, code: error.code } });
     }
-    const err = error as { statusCode?: number; message?: string; code?: string };
-    const statusCode = err.statusCode ?? 500;
-    if (statusCode >= 500) app.log.error(error);
+    if (isDataNotFound(error)) {
+      // `repo.require()` / `repo.update()` on a missing row: the id goes to the log, not the client.
+      request.log.info({ err: error }, "row not found");
+      return reply.status(404).send({ error: { message: "not found", code: "not_found" } });
+    }
+    const err = error as { statusCode?: unknown; message?: string; code?: string };
+    const statusCode = typeof err.statusCode === "number" && err.statusCode >= 400 && err.statusCode <= 599 ? err.statusCode : 500;
+    if (statusCode >= 500) {
+      // The real error is logged; a production client only ever sees a generic message
+      // (internal messages name tables, ids, hosts and upstream providers).
+      request.log.error({ err: error }, "unhandled error");
+      if (ctx.config.isProduction) {
+        return reply.status(statusCode).send({ error: { message: "internal error", code: "internal_error" } });
+      }
+    }
     return reply.status(statusCode).send({ error: { message: err.message ?? "error", code: err.code ?? "error" } });
   });
 
-  app.get("/health", async () => ({ status: "ok", ts: new Date().toISOString() }));
+  // Unknown routes: the same envelope as every other error, and a log line WITHOUT the query
+  // string (Fastify's default 404 logs the full URL — unsubscribe tokens and addresses included).
+  app.setNotFoundHandler((request, reply) => {
+    request.log.info({ path: request.url.split("?")[0] }, "route not found");
+    return reply.status(404).send({ error: { message: "not found", code: "not_found" } });
+  });
+
+  // Polled by the container health check — keep it out of the request log.
+  app.get("/health", { logLevel: "warn" }, async () => ({ status: "ok", ts: new Date().toISOString() }));
   app.get("/", async () => ({ name: "affiliate-platform-api", version: "0.1.0" }));
 
   for (const mod of allRouteModules) mod(app, ctx);
@@ -69,25 +113,42 @@ export async function buildApp(ctxOverride?: Partial<AppContext>): Promise<Fasti
 declare module "fastify" {
   interface FastifyInstance {
     appContext: AppContext;
+    /** The shared abuse limiter — public handlers add per-target buckets (e.g. per email). */
+    rateLimiter: RateLimiter;
   }
   interface FastifyRequest {
     rawBody?: string;
   }
 }
 
-/** Tiny fixed-window in-memory rate limiter. */
-function createRateLimiter(opts: { windowMs: number; max: number }) {
-  const hits = new Map<string, { count: number; resetAt: number }>();
+/**
+ * Which limit applies to a matched route (`request.routeOptions.url`, e.g. `/join/:merchantId`).
+ * Tight where a caller can guess credentials or make the platform create rows and send mail;
+ * a flood guard only where the caller already has to present an HMAC or shared secret.
+ */
+export function rateRuleFor(method: string, pattern: string): RateRule | null {
+  if (method === "POST" && pattern.startsWith("/auth/")) return AUTH_LIMIT;
+  if (method === "POST" && (pattern.startsWith("/join/") || /^\/programs\/[^/]+\/apply$/.test(pattern))) return PUBLIC_FORM_LIMIT;
+  if (
+    pattern.startsWith("/track/postback/") ||
+    pattern.startsWith("/recruitment/reply-webhook/") ||
+    pattern === "/webhooks/inbound" ||
+    pattern === "/track/unsubscribe"
+  ) {
+    return SIGNED_ENDPOINT_LIMIT;
+  }
+  return null;
+}
+
+/** Structured (JSON) request + error logs at `level`; off when no level is configured. */
+function loggerOptions(level: string | null, stream: BuildAppOptions["logStream"]): FastifyServerOptions["logger"] {
+  if (!level) return false;
   return {
-    allow(key: string): boolean {
-      const now = Date.now();
-      const e = hits.get(key);
-      if (!e || now > e.resetAt) {
-        hits.set(key, { count: 1, resetAt: now + opts.windowMs });
-        return true;
-      }
-      e.count += 1;
-      return e.count <= opts.max;
+    level,
+    ...(stream ? { stream } : {}),
+    serializers: {
+      // Path only: query strings carry unsubscribe tokens, OAuth codes and email addresses.
+      req: (request: FastifyRequest) => ({ method: request.method, url: request.url.split("?")[0], remoteAddress: request.ip }),
     },
   };
 }

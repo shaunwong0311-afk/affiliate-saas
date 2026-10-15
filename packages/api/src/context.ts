@@ -285,7 +285,7 @@ export function createContext(overrides: Partial<AppContext> = {}): AppContext {
   const mailer = overrides.mailer ?? (config.isProduction ? unavailableMailboxSender("no connected mailbox is available for this send") : new MockMailboxSender());
   // Secrets persist WITH the database (encrypted at the app level) — an in-memory-only store
   // would orphan every connected mailbox on restart and silently degrade sends to the mock.
-  const secrets = overrides.secrets ?? new DbSecretStore(db.secrets, process.env.SECRETS_ENC_KEY ?? config.jwtSecret);
+  const secrets = overrides.secrets ?? new DbSecretStore(db.secrets, config.secretsEncKey);
   const prod = config.isProduction;
   // A sender that refuses to send, with the reason surfaced on the message row. In production
   // a broken mailbox must FAIL — silently "sending" via the mock would fabricate sent state.

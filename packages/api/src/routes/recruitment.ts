@@ -15,6 +15,11 @@ import { sendActivationEmail } from "../services/activation-email.js";
 // Campaign handlers (outreach fix stream) — a separate import so it does not collide with other
 // streams' edits to the import block above.
 import { isValidTimeZone } from "@affiliate/recruitment";
+import { constantTimeEqual } from "@affiliate/core";
+import { suppressionsAffecting, MANUAL_SUPPRESSION_REASON } from "@affiliate/recruitment";
+import { forbidden, unauthorized, serviceUnavailable } from "../errors.js";
+import { actorIdOf } from "../services/audit.js";
+import { enforcePublicFormEmailLimit } from "../auth/rate-limit.js";
 
 const outcomeLabel = z.enum([
   "bad_fit",
@@ -323,38 +328,46 @@ export const recruitmentRoutes: RouteModule = (app, ctx) => {
   // ---- Suppressions ---------------------------------------------------------
   app.get("/recruitment/suppressions", async (request, reply) => {
     const { merchantId } = await requireMerchant(ctx, request, "read");
-    // Only this merchant's own suppressions — global rows (other tenants' emails /
-    // domains) are NOT enumerable here. They still apply via isSuppressed.
-    const suppressions = await ctx.db.suppressions.find((s) => s.merchantId === merchantId);
-    return ok(reply, suppressions);
+    // Everything that blocks THIS merchant's sends: its own rows, plus platform-wide rows
+    // (someone unsubscribed through another merchant) that hit one of its prospects — those
+    // come back with `merchantId: null`. Unrelated platform rows are other tenants'
+    // unsubscribers and stay non-enumerable.
+    return ok(reply, await suppressionsAffecting(ctx, merchantId));
   });
 
   app.post("/recruitment/suppressions", async (request, reply) => {
     const { merchantId } = await requireMerchant(ctx, request, "write");
     const body = parseBody(
-      z.object({
-        email: z.string().nullish(),
-        domain: z.string().nullish(),
-        scope: z.enum(["global", "merchant"]).default("merchant"),
-      }),
+      z
+        .object({
+          email: z.string().trim().min(1).nullish(),
+          domain: z.string().trim().min(1).nullish(),
+          scope: z.enum(["global", "merchant"]).default("merchant"),
+        })
+        .refine((b) => !!b.email || !!b.domain, { message: "email or domain is required" }),
       request,
     );
-    // A global (cross-tenant) suppression blocks outreach for EVERY merchant, so a
-    // per-tenant "write" user must not create one — require admin for global scope.
-    if (body.scope === "global") await requireMerchant(ctx, request, "admin");
+    // A tenant decides for its own outreach only. A platform-wide ("global") suppression
+    // silences an address — or a whole domain — for EVERY merchant, and every signed-up
+    // account is an admin of its own merchant, so no role may create one here. Global rows
+    // come only from the system paths: the signed unsubscribe link and a STOP reply.
+    if (body.scope === "global") {
+      throw forbidden("global suppressions are created only by the system (unsubscribe link, STOP reply) — use scope \"merchant\"");
+    }
     const suppression: Suppression = {
       id: newId("supp"),
-      merchantId: body.scope === "global" ? null : merchantId,
+      merchantId,
       email: body.email ?? null,
       domain: body.domain ?? null,
-      reason: "manual",
-      scope: body.scope,
+      reason: MANUAL_SUPPRESSION_REASON,
+      scope: "merchant",
+      origin: "merchant",
       ts: ctx.clock.now().toISOString(),
     };
     await ctx.db.suppressions.insert(suppression);
     await writeAudit(ctx, {
       merchantId,
-      actorId: null,
+      actorId: actorIdOf(request),
       action: "recruitment.suppression.created",
       subjectType: "suppression",
       subjectId: suppression.id,
@@ -536,6 +549,11 @@ export const recruitmentRoutes: RouteModule = (app, ctx) => {
   app.post("/join/:merchantId", async (request, reply) => {
     const merchantId = (request.params as { merchantId: string }).merchantId;
     const body = parseBody(z.object({ email: z.string().email(), name: z.string().min(1), socialUrl: z.string().url().optional() }), request);
+    // Abuse guard beyond the per-client limit in app.ts: one address can only be submitted a
+    // few times an hour, whichever merchant or client it comes through. (Counted only for a
+    // merchant that exists — posting an address at made-up ids must not use up its allowance.)
+    if (!(await ctx.db.merchants.get(merchantId))) throw notFound("program");
+    enforcePublicFormEmailLimit(app.rateLimiter, body.email);
     const result = await applyToJoin(ctx, merchantId, body);
     if (!result) throw notFound("program");
     // Auto-approval → active immediately → welcome now. Manual → welcome fires on approve.
@@ -587,13 +605,18 @@ export const recruitmentRoutes: RouteModule = (app, ctx) => {
   });
 
   // ---- Inbound reply webhook (Graph / ESP inbound-parse) --------------------
-  // Public endpoint (no JWT — the provider posts here). Guarded by a shared secret:
-  // set INBOUND_WEBHOOK_SECRET in prod; when unset (dev) the guard is skipped.
+  // Public endpoint (no JWT — the provider posts here). Guarded by a shared secret
+  // (INBOUND_WEBHOOK_SECRET) sent in the `x-webhook-secret` header — never the query string,
+  // which ends up in access logs. A forged inbound "STOP" suppresses a contacted prospect, so
+  // in production an unset secret means the route is CLOSED, not open; only outside
+  // production is the guard skipped when no secret is configured.
   app.post("/webhooks/inbound", async (request, reply) => {
-    const secret = process.env.INBOUND_WEBHOOK_SECRET;
-    if (secret) {
-      const provided = (request.headers["x-webhook-secret"] as string | undefined) ?? (request.query as { secret?: string }).secret;
-      if (provided !== secret) throw badRequest("invalid webhook secret");
+    const secret = ctx.config.inboundWebhookSecret;
+    if (!secret) {
+      if (ctx.config.isProduction) throw serviceUnavailable("inbound webhook is not configured", "webhook_not_configured");
+    } else {
+      const provided = request.headers["x-webhook-secret"];
+      if (typeof provided !== "string" || !constantTimeEqual(provided, secret)) throw unauthorized("invalid webhook secret");
     }
     const inbound = parseInboundWebhook(request.body);
     if (!inbound) return ok(reply, { matched: false, reason: "unparseable payload" });

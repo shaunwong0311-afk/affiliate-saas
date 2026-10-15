@@ -7,6 +7,7 @@ import { requireMerchant } from "../auth/middleware.js";
 import { notFound, badRequest } from "../errors.js";
 import { writeAudit } from "../services/audit.js";
 import { sendActivationEmail } from "../services/activation-email.js";
+import { enforcePublicFormEmailLimit } from "../auth/rate-limit.js";
 
 const roleEnum = z.enum(["seller", "recruiter", "both"]);
 const relationshipStatusEnum = z.enum(["pending", "active", "paused", "banned", "rejected"]);
@@ -215,6 +216,9 @@ export const affiliateRoutes: RouteModule = (app, ctx) => {
       }),
       request,
     );
+    // Abuse guard beyond the per-client limit in app.ts: one address can only be submitted a
+    // few times an hour, whichever program or client it comes through.
+    enforcePublicFormEmailLimit(app.rateLimiter, body.email);
     const affiliate = await upsertAffiliate(ctx, body.email, body.name);
     const status = program.approvalMode === "auto" ? "active" : "pending";
     const relationship: AffiliateRelationship = {

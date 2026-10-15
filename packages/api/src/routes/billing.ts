@@ -5,7 +5,7 @@ import type { RouteModule } from "./helpers.js";
 import { parseBody, ok } from "./helpers.js";
 import { requireMerchant } from "../auth/middleware.js";
 import { notFound } from "../errors.js";
-import { writeAudit } from "../services/audit.js";
+import { writeAudit, actorIdOf } from "../services/audit.js";
 
 const planSchema = z.object({
   plan: z.enum(["track_export", "managed_payouts", "done_for_you"]),
@@ -36,7 +36,7 @@ export const billingRoutes: RouteModule = (app, ctx) => {
     } as Partial<BillingSubscription>);
     await writeAudit(ctx, {
       merchantId,
-      actorId: null,
+      actorId: actorIdOf(request),
       action: "billing.plan_changed",
       subjectType: "subscription",
       subjectId: subscription.id,
@@ -64,7 +64,7 @@ export const billingRoutes: RouteModule = (app, ctx) => {
       } as Partial<Entitlement>);
       await writeAudit(ctx, {
         merchantId,
-        actorId: null,
+        actorId: actorIdOf(request),
         action: "billing.entitlement_updated",
         subjectType: "entitlement",
         subjectId: existing.id,
@@ -83,7 +83,7 @@ export const billingRoutes: RouteModule = (app, ctx) => {
     await ctx.db.entitlements.insert(entitlement);
     await writeAudit(ctx, {
       merchantId,
-      actorId: null,
+      actorId: actorIdOf(request),
       action: "billing.entitlement_created",
       subjectType: "entitlement",
       subjectId: entitlement.id,
@@ -114,7 +114,7 @@ export const billingRoutes: RouteModule = (app, ctx) => {
     await ctx.db.merchants.update(merchantId, { billingStatus: "cancelled" });
     await writeAudit(ctx, {
       merchantId,
-      actorId: null,
+      actorId: actorIdOf(request),
       action: "billing.cancelled",
       subjectType: "subscription",
       subjectId: subscription.id,
@@ -133,7 +133,7 @@ export const billingRoutes: RouteModule = (app, ctx) => {
     await ctx.db.merchants.update(merchantId, { billingStatus: "active" });
     await writeAudit(ctx, {
       merchantId,
-      actorId: null,
+      actorId: actorIdOf(request),
       action: "billing.reactivated",
       subjectType: "subscription",
       subjectId: subscription.id,

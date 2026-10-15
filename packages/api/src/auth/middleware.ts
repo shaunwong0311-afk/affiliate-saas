@@ -13,6 +13,12 @@ export interface AuthPrincipal {
   apiKeyId?: string;
   email?: string;
   scopes?: string[];
+  /**
+   * Set on a support session minted by POST /admin/impersonate/:affiliateId: `userId`, acting
+   * for `merchantId`, is viewing the portal as this affiliate. Such a session is READ-ONLY
+   * and sees only that merchant's slice of the affiliate's data.
+   */
+  impersonation?: { merchantId: string; userId: string };
 }
 
 export interface MerchantScope {
@@ -34,7 +40,7 @@ export async function resolvePrincipal(ctx: AppContext, request: FastifyRequest)
   const token = header.slice("Bearer ".length).trim();
 
   if (token.startsWith("ak_")) {
-    const hashed = hashApiKey(token);
+    const hashed = hashApiKey(token, ctx.config.apiKeyPepper);
     const key = await ctx.db.apiKeys.findOne((k) => k.hashedKey === hashed && k.revokedAt === null);
     if (!key) return null;
     await ctx.db.apiKeys.update(key.id, { lastUsedAt: ctx.clock.now().toISOString() });
@@ -43,7 +49,14 @@ export async function resolvePrincipal(ctx: AppContext, request: FastifyRequest)
 
   const claims = verifyJwt(token, ctx.config.jwtSecret);
   if (!claims) return null;
-  if (claims.kind === "affiliate") return { kind: "affiliate", affiliateId: claims.sub, email: claims.email };
+  if (claims.kind === "affiliate") {
+    if (claims.imp === undefined) return { kind: "affiliate", affiliateId: claims.sub, email: claims.email };
+    // A support session must name both the merchant and the user behind it; a token whose
+    // `imp` claim is anything else is not a session at all (never an unscoped one).
+    const imp = claims.imp as { merchantId?: unknown; userId?: unknown } | null;
+    if (!imp || typeof imp.merchantId !== "string" || !imp.merchantId || typeof imp.userId !== "string" || !imp.userId) return null;
+    return { kind: "affiliate", affiliateId: claims.sub, email: claims.email, impersonation: { merchantId: imp.merchantId, userId: imp.userId } };
+  }
   if (claims.kind === "user") return { kind: "user", userId: claims.sub, email: claims.email };
   // Any other kind (e.g. a single-use magic-link token) is NOT a valid session.
   return null;
@@ -89,8 +102,28 @@ export async function requireMerchant(
   return request.merchantScope;
 }
 
+/**
+ * The affiliate acting for THEMSELVES — the guard for anything that changes their account.
+ * A support (impersonated) session is refused here: it can only read, and only through
+ * `requirePortalScope`, so a route that forgets about impersonation fails closed.
+ */
 export function requireAffiliate(request: FastifyRequest): string {
   const principal = requirePrincipal(request);
   if (principal.kind !== "affiliate" || !principal.affiliateId) throw forbidden("affiliate principal required");
+  if (principal.impersonation) throw forbidden("support (impersonated) sessions are read-only");
   return principal.affiliateId;
+}
+
+/** Whose portal data a request may read. */
+export interface PortalScope {
+  affiliateId: string;
+  /** The one merchant a support session may see; null = the affiliate's own session (all of theirs). */
+  merchantId: string | null;
+}
+
+/** Guard for portal READS: the affiliate themselves, or a support session limited to its merchant. */
+export function requirePortalScope(request: FastifyRequest): PortalScope {
+  const principal = requirePrincipal(request);
+  if (principal.kind !== "affiliate" || !principal.affiliateId) throw forbidden("affiliate principal required");
+  return { affiliateId: principal.affiliateId, merchantId: principal.impersonation?.merchantId ?? null };
 }

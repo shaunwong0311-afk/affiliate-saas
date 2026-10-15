@@ -3,9 +3,11 @@ import { newId } from "@affiliate/core";
 import { randomBytes } from "node:crypto";
 import type { RouteModule } from "./helpers.js";
 import { parseBody, ok } from "./helpers.js";
-import { signJwt, verifyJwt, hashPassword, verifyPassword } from "../auth/jwt.js";
+import { signJwt, hashPassword, verifyPasswordOrDummy } from "../auth/jwt.js";
+import { acceptTeamInvite } from "../auth/invite.js";
+import { mintSignInMagicLink, redeemMagicLinkToken, SIGN_IN_LINK_TTL_SECONDS } from "../auth/magic-link.js";
 import { requirePrincipal } from "../auth/middleware.js";
-import { badRequest, unauthorized, conflict } from "../errors.js";
+import { HttpError, badRequest, unauthorized, conflict } from "../errors.js";
 import { writeAudit } from "../services/audit.js";
 import { publicUser } from "../sanitize.js";
 
@@ -77,7 +79,10 @@ export const authRoutes: RouteModule = (app, ctx) => {
   app.post("/auth/login", async (request, reply) => {
     const body = parseBody(loginSchema, request);
     const user = await ctx.db.users.findOne((u) => u.email.toLowerCase() === body.email.toLowerCase());
-    if (!user || !verifyPassword(body.password, user.passwordHash)) throw unauthorized("invalid credentials");
+    // Same scrypt work whether or not the account exists — response time must not reveal
+    // which emails are registered.
+    const passwordOk = verifyPasswordOrDummy(body.password, user?.passwordHash);
+    if (!user || !passwordOk) throw unauthorized("invalid credentials");
     const memberships = await ctx.db.merchantUsers.find((m) => m.userId === user.id && m.status === "active");
     const token = signJwt({ sub: user.id, kind: "user", email: user.email }, ctx.config.jwtSecret);
     return ok(reply, {
@@ -87,53 +92,61 @@ export const authRoutes: RouteModule = (app, ctx) => {
     });
   });
 
-  // ---- Accept a team invite (password-less invitee sets a password) ---------
+  // ---- Accept a team invite ------------------------------------------------
+  // Requires the single-use token from the invitation email (`{app}/#/accept-invite?token=…`,
+  // minted when the invite is created — routes/merchants.ts). An email address proves nothing:
+  // it used to be all this route asked for, so anyone who knew an invitee's address could set
+  // the password of their pending account and take the role granted with it.
+  //   new account      → { token, password }        (sets the first password)
+  //   existing account → { token } + its own Bearer session
+  // A genuine token that still lacks its second half is NOT consumed: the answer says what is
+  // missing (400 password_required / 401 sign_in_required) and the caller tries again.
   app.post("/auth/accept-invite", async (request, reply) => {
-    const body = parseBody(loginSchema.extend({ password: z.string().min(8) }), request);
-    const user = await ctx.db.users.findOne((u) => u.email.toLowerCase() === body.email.toLowerCase());
-    if (!user) throw unauthorized("no pending invite for that email");
-    if (user.passwordHash !== "") throw conflict("account already active — use sign in");
-    await ctx.db.users.update(user.id, { passwordHash: hashPassword(body.password) });
-    // Activate any invited memberships.
-    const invited = await ctx.db.merchantUsers.find((m) => m.userId === user.id && m.status === "invited");
-    for (const m of invited) await ctx.db.merchantUsers.update(m.id, { status: "active" });
+    const body = parseBody(z.object({ token: z.string().min(1), password: z.string().min(8).optional() }), request);
+    const sessionUserId = request.principal?.kind === "user" ? (request.principal.userId ?? null) : null;
+    const result = await acceptTeamInvite(ctx, body.token, { password: body.password, sessionUserId });
+    if (result.status === "password_required") throw new HttpError(400, "choose a password (at least 8 characters) to accept this invitation", "password_required");
+    if (result.status === "sign_in_required") throw new HttpError(401, "sign in to the invited account to accept this invitation", "sign_in_required");
+    if (result.status !== "accepted") throw unauthorized("invalid or expired invitation");
+    const { user, membership } = result;
+    await writeAudit(ctx, { merchantId: membership.merchantId, actorId: user.id, action: "merchant.user_invite_accepted", subjectType: "merchant_user", subjectId: membership.id });
     const token = signJwt({ sub: user.id, kind: "user", email: user.email }, ctx.config.jwtSecret);
-    return ok(reply, { token, user: publicUser({ ...user, passwordHash: "" }), merchants: invited.map((m) => ({ merchantId: m.merchantId, role: m.role })) });
+    return ok(reply, { token, user: publicUser(user), merchants: [{ merchantId: membership.merchantId, role: membership.role }] });
   });
 
   // ---- Affiliate portal login: MAGIC LINK (not email-only) ------------------
   // Knowing an affiliate's email must NOT grant a session. We email a short-lived,
-  // single-purpose link to the affiliate's own inbox; only someone who controls
-  // that inbox can complete login. Always returns 200 (no account enumeration).
+  // SINGLE-USE link to the affiliate's own inbox; only someone who controls that inbox
+  // can complete login. Always returns 200 (no account enumeration).
   app.post("/auth/affiliate/request-link", async (request, reply) => {
     const body = parseBody(z.object({ email: z.string().email() }), request);
     const affiliate = await ctx.db.affiliates.findOne((a) => a.primaryEmail.toLowerCase() === body.email.toLowerCase());
-    if (affiliate) {
-      // 15-minute, magic-only token — rejected by the session resolver.
-      const magic = signJwt({ sub: affiliate.id, kind: "affiliate_magic", email: affiliate.primaryEmail }, ctx.config.jwtSecret, 900);
-      const link = `${ctx.config.corsOrigins[0] ?? "http://localhost:5173"}/#/portal/verify?token=${magic}`;
+    // Null when this affiliate already holds the maximum number of unused sign-in links:
+    // nothing is minted or mailed (the public form cannot be used to mail-bomb them).
+    const magic = affiliate ? await mintSignInMagicLink(ctx, affiliate) : null;
+    if (affiliate && magic) {
       await ctx.transactionalMailer.send({
         from: "no-reply@vantage.dev",
         to: affiliate.primaryEmail,
         subject: "Your Vantage sign-in link",
-        text: `Sign in to your affiliate portal: ${link}\n\nThis link expires in 15 minutes.`,
+        text: `Sign in to your affiliate portal: ${magic.url}\n\nThis link works once and expires in ${SIGN_IN_LINK_TTL_SECONDS / 60} minutes.`,
       });
       // Dev only: return the token so the demo can complete login without a real
       // inbox. Never exposed in production.
       if (ctx.config.exposeMagicLink) {
-        return ok(reply, { sent: true, devToken: magic });
+        return ok(reply, { sent: true, devToken: magic.token });
       }
     }
     return ok(reply, { sent: true });
   });
 
-  // Exchange a magic-link token for a real portal session token.
+  // Exchange a magic-link token for a real portal session token — ONCE. Every failure
+  // (bad signature, expired, already used, unknown affiliate) is the same 401, on which
+  // the portal shows its "send me a new link" form.
   app.post("/auth/affiliate/verify", async (request, reply) => {
     const body = parseBody(z.object({ token: z.string() }), request);
-    const claims = verifyJwt(body.token, ctx.config.jwtSecret);
-    if (!claims || claims.kind !== "affiliate_magic") throw unauthorized("invalid or expired link");
-    const affiliate = await ctx.db.affiliates.get(claims.sub);
-    if (!affiliate) throw unauthorized("invalid link");
+    const affiliate = await redeemMagicLinkToken(ctx, body.token);
+    if (!affiliate) throw unauthorized("invalid or expired link");
     const token = signJwt({ sub: affiliate.id, kind: "affiliate", email: affiliate.primaryEmail }, ctx.config.jwtSecret);
     return ok(reply, { token, affiliate: { id: affiliate.id, name: affiliate.name } });
   });
@@ -149,7 +162,8 @@ export const authRoutes: RouteModule = (app, ctx) => {
     }
     if (principal.kind === "affiliate") {
       const affiliate = await ctx.db.affiliates.get(principal.affiliateId!);
-      return ok(reply, { kind: "affiliate", affiliate });
+      // A support session says so: the portal shows a read-only banner and whose view it is.
+      return ok(reply, { kind: "affiliate", affiliate, ...(principal.impersonation ? { impersonation: principal.impersonation } : {}) });
     }
     return ok(reply, { kind: "apikey", scopes: principal.scopes });
   });

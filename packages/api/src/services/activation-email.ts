@@ -2,7 +2,7 @@ import { newId, newCode, buildActivationEmail, commissionLineFromOffer, firstSal
 import type { AffiliateCode, Offer } from "@affiliate/core";
 import { linkCode } from "@affiliate/tracking-edge";
 import { isSuppressed, withKeyLock } from "@affiliate/recruitment";
-import { signJwt } from "../auth/jwt.js";
+import { mintActivationMagicLink } from "../auth/magic-link.js";
 import { writeAudit } from "./audit.js";
 import type { AppContext } from "../context.js";
 
@@ -58,11 +58,9 @@ async function sendActivationEmailLocked(ctx: AppContext, relationshipId: string
 
   const appUrl = ctx.config.corsOrigins[0] ?? "http://localhost:5173";
 
-  // 1) Passwordless magic link — the one-click CTA (7-day TTL; the verify route accepts it).
-  //    NOTE (AUDIT-2026-10 S8, security stream): tokens are becoming single-use behind a
-  //    helper that stream exposes — THIS is the minting call to swap for it.
-  const magic = signJwt({ sub: affiliate.id, kind: "affiliate_magic", email: affiliate.primaryEmail }, ctx.config.jwtSecret, MAGIC_TTL_SECONDS);
-  const magicLink = `${appUrl}/#/portal/verify?token=${magic}`;
+  // 1) Passwordless magic link — the one-click CTA. SINGLE-USE (minted through the shared
+  //    helper, which records it so the verify route can spend it exactly once).
+  const { url: magicLink } = await mintActivationMagicLink(ctx, affiliate, MAGIC_TTL_SECONDS, rel.merchantId);
   const portalUrl = `${appUrl}/#/portal`;
 
   // 2) Site-wide default tracking link — the program's first active offer (deterministic code).

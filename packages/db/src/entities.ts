@@ -506,6 +506,13 @@ export interface Suppression {
   domain: string | null;
   reason: string;
   scope: "global" | "merchant";
+  /**
+   * Who created the row. Only a `system` row (signed unsubscribe link, STOP reply, bounce or
+   * complaint handling) may apply across tenants; a `merchant` row — one a tenant added
+   * through the API — never reaches beyond its own merchant, whatever `scope` says. Absent
+   * on rows written before this field existed: those are read by `reason` ("manual" = merchant).
+   */
+  origin?: "system" | "merchant";
   ts: Timestamp;
 }
 

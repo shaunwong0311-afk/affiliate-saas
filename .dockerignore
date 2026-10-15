@@ -1,0 +1,26 @@
+# Build context for deploy/Dockerfile (context = repository root).
+# Keep it to what the origin image runs: package manifests + packages/*/src.
+
+# Never ship local state or secrets into an image layer.
+.env
+.env.*
+.git
+.claude
+.devbox
+.references
+
+# Installed and generated output — the image runs `npm ci` itself.
+**/node_modules
+**/dist
+**/*.tsbuildinfo
+**/.vite
+coverage
+*.log
+
+# Not needed at runtime.
+docs
+*.md
+**/test
+packages/web/src
+packages/web/index.html
+packages/web/vite.config.ts

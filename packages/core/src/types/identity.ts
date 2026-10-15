@@ -68,6 +68,13 @@ export interface CommissionTermsOverride {
 export interface PayoutAccount {
   readonly id: Id;
   readonly affiliateId: Id;
+  /**
+   * Who recorded it. Absent/null = the affiliate themselves (portal): it applies to every
+   * merchant they work with. A merchant id = that merchant typed it in on the affiliate's
+   * behalf: it is used and shown for THAT merchant only — one merchant must never be able to
+   * decide where another merchant's payout goes.
+   */
+  merchantId?: Id | null;
   rail: string; // 'stripe' | 'paypal' | 'wise'
   accountRef: string;
   status: "unverified" | "active" | "disabled";
@@ -77,6 +84,8 @@ export interface PayoutAccount {
 export interface TaxDocument {
   readonly id: Id;
   readonly affiliateId: Id;
+  /** Same scoping as PayoutAccount.merchantId: absent/null = the affiliate's own; else that merchant only. */
+  merchantId?: Id | null;
   rail: string | null;
   formType: "W-9" | "W-8BEN" | "W-8BEN-E" | "other";
   status: "missing" | "on_file" | "expired";

@@ -4,14 +4,22 @@ import type { PayoutAccount, TaxDocument, AgreementAcceptance } from "@affiliate
 import { linkCode } from "@affiliate/tracking-edge";
 import type { RouteModule } from "./helpers.js";
 import { parseBody, ok } from "./helpers.js";
-import { requireAffiliate } from "../auth/middleware.js";
+import { requireAffiliate, requirePortalScope, type PortalScope } from "../auth/middleware.js";
 import { notFound } from "../errors.js";
+
+/**
+ * Affiliate portal. An affiliate is a global identity, so their own session spans every
+ * merchant they work with. A SUPPORT session (a merchant owner impersonating them) is
+ * different: reads go through `requirePortalScope` and show only that merchant's rows, and
+ * writes go through `requireAffiliate`, which refuses the session outright.
+ */
+const sees = (scope: PortalScope, merchantId: string): boolean => scope.merchantId === null || scope.merchantId === merchantId;
 
 export const portalRoutes: RouteModule = (app, ctx) => {
   // ---- Relationships across merchants ---------------------------------------
   app.get("/portal/relationships", async (request, reply) => {
-    const me = requireAffiliate(request);
-    const relationships = await ctx.db.relationships.find((r) => r.affiliateId === me);
+    const scope = requirePortalScope(request);
+    const relationships = await ctx.db.relationships.find((r) => r.affiliateId === scope.affiliateId && sees(scope, r.merchantId));
     const withMerchant = await Promise.all(
       relationships.map(async (rel) => {
         const merchant = await ctx.db.merchants.get(rel.merchantId);
@@ -23,8 +31,9 @@ export const portalRoutes: RouteModule = (app, ctx) => {
 
   // ---- Tracking links per active offer --------------------------------------
   app.get("/portal/links", async (request, reply) => {
-    const me = requireAffiliate(request);
-    const relationships = await ctx.db.relationships.find((r) => r.affiliateId === me && r.status === "active");
+    const scope = requirePortalScope(request);
+    const me = scope.affiliateId;
+    const relationships = await ctx.db.relationships.find((r) => r.affiliateId === me && r.status === "active" && sees(scope, r.merchantId));
     const links: { offerId: string; offerName: string; code: string; url: string }[] = [];
     for (const rel of relationships) {
       const offers = await ctx.db.offers.find((o) => o.programId === rel.programId && o.status === "active");
@@ -43,33 +52,34 @@ export const portalRoutes: RouteModule = (app, ctx) => {
 
   // ---- My affiliate codes ---------------------------------------------------
   app.get("/portal/codes", async (request, reply) => {
-    const me = requireAffiliate(request);
-    const codes = await ctx.db.codes.find((c) => c.affiliateId === me);
+    const scope = requirePortalScope(request);
+    const codes = await ctx.db.codes.find((c) => c.affiliateId === scope.affiliateId && sees(scope, c.merchantId));
     return ok(reply, codes);
   });
 
   // ---- Aggregate stats ------------------------------------------------------
   app.get("/portal/stats", async (request, reply) => {
-    const me = requireAffiliate(request);
-    const clicks = await ctx.db.clicks.count((c) => c.affiliateId === me);
-    const conversions = await ctx.db.conversions.count((c) => c.affiliateId === me && c.status !== "rejected");
-    const entries = await ctx.db.ledger.find((e) => e.affiliateId === me && e.status !== "reversed");
+    const scope = requirePortalScope(request);
+    const me = scope.affiliateId;
+    const clicks = await ctx.db.clicks.count((c) => c.affiliateId === me && sees(scope, c.merchantId));
+    const conversions = await ctx.db.conversions.count((c) => c.affiliateId === me && c.status !== "rejected" && sees(scope, c.merchantId));
+    const entries = await ctx.db.ledger.find((e) => e.affiliateId === me && e.status !== "reversed" && sees(scope, e.merchantId));
     const earningsCents = entries.reduce((sum, e) => sum + e.amountCents, 0);
     return ok(reply, { clicks, conversions, earningsCents });
   });
 
   // ---- Statement: ledger + derived balances ---------------------------------
   app.get("/portal/statement", async (request, reply) => {
-    const me = requireAffiliate(request);
-    const entries = await ctx.db.ledger.find((e) => e.affiliateId === me);
+    const scope = requirePortalScope(request);
+    const entries = await ctx.db.ledger.find((e) => e.affiliateId === scope.affiliateId && sees(scope, e.merchantId));
     const balances = Array.from(computeBalances(entries, ctx.clock.now()).values());
     return ok(reply, { entries, balances });
   });
 
   // ---- Payouts --------------------------------------------------------------
   app.get("/portal/payouts", async (request, reply) => {
-    const me = requireAffiliate(request);
-    const payouts = await ctx.db.payouts.find((p) => p.affiliateId === me);
+    const scope = requirePortalScope(request);
+    const payouts = await ctx.db.payouts.find((p) => p.affiliateId === scope.affiliateId && sees(scope, p.merchantId));
     return ok(reply, payouts);
   });
 
@@ -136,8 +146,8 @@ export const portalRoutes: RouteModule = (app, ctx) => {
 
   // ---- Creatives for programs I'm in ----------------------------------------
   app.get("/portal/creatives", async (request, reply) => {
-    const me = requireAffiliate(request);
-    const relationships = await ctx.db.relationships.find((r) => r.affiliateId === me);
+    const scope = requirePortalScope(request);
+    const relationships = await ctx.db.relationships.find((r) => r.affiliateId === scope.affiliateId && sees(scope, r.merchantId));
     const programIds = new Set(relationships.map((r) => r.programId));
     const creatives = await ctx.db.creatives.find((c) => programIds.has(c.programId));
     return ok(reply, creatives);

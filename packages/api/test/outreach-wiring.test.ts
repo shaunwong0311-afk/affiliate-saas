@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { createMemoryDatabase, type Database, type Mailbox } from "@affiliate/db";
 import type { MailboxCredentials, TransactionalEmail, TransactionalMailer, TransactionalResult } from "@affiliate/integrations";
-import { ingestReplies, queueFirstTouch, send, suppress } from "@affiliate/recruitment";
+import { ingestReplies, queueFirstTouch, send } from "@affiliate/recruitment";
 import { createContext, type AppContext } from "../src/context.js";
 import { loadConfig } from "../src/config.js";
 import { sendActivationEmail } from "../src/services/activation-email.js";
@@ -136,7 +136,8 @@ describe("O13 — the activation email", () => {
     await seedRelationship();
     const mailer = new RecordingMailer();
     const ctx = createContext({ db, transactionalMailer: mailer });
-    await suppress(ctx, { merchantId: null, email: "recruit@site.com", reason: "unsubscribe", scope: "global" });
+    // A platform-wide row, as the signed unsubscribe link writes it.
+    await db.suppressions.insert({ id: "supp_unsub", merchantId: null, email: "recruit@site.com", domain: null, reason: "unsubscribe", scope: "global", origin: "system", ts: new Date().toISOString() });
 
     const res = await sendActivationEmail(ctx, "rel1");
 

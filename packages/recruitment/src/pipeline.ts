@@ -17,6 +17,7 @@ import {
   isStale,
   scanContent,
   signUnsubscribeToken,
+  resolveUnsubscribeSecret,
   type ScoringSignals,
   type AffiliateSignal,
   type Tier,
@@ -1105,11 +1106,14 @@ const GEO_GATED: ReadonlySet<string> = new Set([
   "LT", "LU", "MT", "NL", "PL", "PT", "RO", "SK", "SI", "ES", "SE", "CA",
 ]);
 
-function unsubscribeLink(merchantId: string, email: string): string {
+/** The signed one-click unsubscribe URL put in every outreach footer + List-Unsubscribe header. */
+export function unsubscribeLink(merchantId: string, email: string): string {
   // Points at the API's real public unsubscribe endpoint. SIGNED: the endpoint rejects
   // unsigned requests, so nobody can suppress arbitrary addresses by enumerating `?e=`.
-  const base = process.env.PUBLIC_API_URL ?? "http://localhost:8787";
-  const secret = process.env.UNSUBSCRIBE_SECRET ?? process.env.JWT_SECRET ?? "dev-insecure-secret-change-me";
-  const token = signUnsubscribeToken(merchantId, email, secret);
+  // (`||`, not `??`: a PUBLIC_API_URL that is present but empty must not yield a relative link.)
+  const base = (process.env.PUBLIC_API_URL ?? "").trim() || "http://localhost:8787";
+  // The API verifies with this same helper (UNSUBSCRIBE_SECRET → JWT_SECRET; an env var that
+  // is present but empty counts as unset) — signer and verifier cannot drift apart.
+  const token = signUnsubscribeToken(merchantId, email, resolveUnsubscribeSecret());
   return `${base}/track/unsubscribe?m=${encodeURIComponent(merchantId)}&e=${encodeURIComponent(email)}&t=${token}`;
 }

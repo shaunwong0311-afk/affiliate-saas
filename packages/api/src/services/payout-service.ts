@@ -86,10 +86,24 @@ export interface PayableLine {
   blockedReason: string | null;
 }
 
-/** The account a payout goes to: the affiliate's most recently added ACTIVE one for the currency. */
-async function currentPayoutAccount(db: Database, affiliateId: string, currency: string): Promise<PayoutAccount | null> {
+/**
+ * The account a payout goes to, for ONE merchant: the affiliate's own most recently added
+ * ACTIVE account for the currency, else the one this merchant recorded for them. An account
+ * another merchant recorded is never visible here (cross-tenant redirect of money).
+ */
+async function currentPayoutAccount(db: Database, merchantId: string, affiliateId: string, currency: string): Promise<PayoutAccount | null> {
   const accounts = await db.payoutAccounts.find((a) => a.affiliateId === affiliateId && a.currency === currency && a.status === "active");
-  return accounts[accounts.length - 1] ?? null;
+  const own = accounts.filter((a) => a.merchantId == null);
+  const recordedHere = accounts.filter((a) => a.merchantId === merchantId);
+  return own[own.length - 1] ?? recordedHere[recordedHere.length - 1] ?? null;
+}
+
+/** A tax form on file that counts for this merchant: the affiliate's own, or one this merchant recorded. */
+async function taxFormOnFile(db: Database, merchantId: string, affiliateId: string): Promise<boolean> {
+  const doc = await db.taxDocuments.findOne(
+    (t) => t.affiliateId === affiliateId && t.status === "on_file" && (t.merchantId == null || t.merchantId === merchantId),
+  );
+  return doc !== null;
 }
 
 export async function computePayableLines(
@@ -114,8 +128,8 @@ export async function computePayableLines(
     const balances = computeBalances(affEntries, now);
     for (const [currency, b] of balances) {
       if (b.availableCents === 0 && b.onHoldCents === 0 && b.pendingCents === 0) continue;
-      const taxDoc = await db.taxDocuments.findOne((t) => t.affiliateId === affiliateId && t.status === "on_file");
-      const account = await currentPayoutAccount(db, affiliateId, currency);
+      const taxDoc = await taxFormOnFile(db, merchantId, affiliateId);
+      const account = await currentPayoutAccount(db, merchantId, affiliateId, currency);
       const { eligible, blockedReason } = payoutEligibility(b, !!taxDoc, account?.accountRef ?? null, minPayoutCents);
       lines.push({
         affiliateId,
@@ -318,7 +332,7 @@ async function finalizePayout(tx: AppContext, payout: Payout): Promise<Payout | 
     await tx.db.payouts.update(payout.id, { status: "cancelled", amountCents: 0, failureReason: "nothing left to pay" });
     return null;
   }
-  const account = await currentPayoutAccount(tx.db, payout.affiliateId, payout.currency);
+  const account = await currentPayoutAccount(tx.db, payout.merchantId, payout.affiliateId, payout.currency);
   if (!account) {
     await releaseReservation(tx, payout.id);
     await tx.db.payouts.update(payout.id, { status: "failed", amountCents, failureReason: "no payout account" });
@@ -456,9 +470,9 @@ export async function retryPayout(ctx: AppContext, payoutId: string, opts: { man
           throw conflict("nothing is payable for this payout any more — its entries were paid by another payout or reversed");
         }
         // The same gates a new batch applies: a tax form on file and somewhere to send it.
-        const taxDoc = await tx.db.taxDocuments.findOne((t) => t.affiliateId === payout.affiliateId && t.status === "on_file");
+        const taxDoc = await taxFormOnFile(tx.db, payout.merchantId, payout.affiliateId);
         if (!taxDoc) throw conflict("the affiliate has no tax form on file");
-        const account = await currentPayoutAccount(tx.db, payout.affiliateId, payout.currency);
+        const account = await currentPayoutAccount(tx.db, payout.merchantId, payout.affiliateId, payout.currency);
         if (!account) throw conflict("the affiliate has no active payout account");
         payout = await tx.db.payouts.update(payoutId, {
           amountCents,

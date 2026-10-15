@@ -1,80 +1,176 @@
-# Local mirror of the Hetzner origin (Section 11). Brings up Postgres (the ledger),
-# Redis (the queue), the API, the recruitment worker, and the Node tracking-edge
-# fallback. In production the edge is Cloudflare Workers and the front-end is
-# Cloudflare Pages — those are not in this compose, which models the origin only.
+# Origin stack (Section 11): Postgres plus the three origin processes — the API, the
+# recruitment worker and the Node tracking-edge fallback. In production the redirect itself
+# runs on Cloudflare Workers (deploy/wrangler.toml) and the front-end on Cloudflare Pages;
+# neither is in this file, which models the origin only.
 #
-#   docker compose -f deploy/docker-compose.yml up --build
+#   cp .env.example .env          # then set the REQUIRED values listed below
+#   docker compose --env-file .env -f deploy/docker-compose.yml up --build
 #
-# NOTE: the default app runtime is the in-memory store, so Postgres/Redis here are
-# wired for the production path (DATABASE_URL / REDIS_URL) and the off-box backup
-# story; set USE_POSTGRES=true to switch the adapter.
-version: "3.9"
+# (--env-file is needed because this file lives in deploy/: without it compose looks for
+# deploy/.env, not the one at the repository root.)
+#
+# How persistence is wired — all three processes share ONE Postgres database. Setting
+# DATABASE_URL is what selects the Postgres adapter (USE_POSTGRES is redundant once it is
+# set; with neither, a process silently keeps its own private in-memory store). So the URL is
+# given to the API, the worker AND the edge: an edge without it resolves no links (every
+# click 404s), and a worker without it works on an empty database.
+#
+# The image runs with NODE_ENV=production, so the application refuses to start on missing,
+# placeholder or short secrets. REQUIRED — compose stops with a message if one is unset:
+#   POSTGRES_PASSWORD   database password; URL-safe characters only (openssl rand -hex 24)
+#   JWT_SECRET          at least 32 random characters (openssl rand -hex 32)
+#   EDGE_DEFAULT_DEST   the storefront URL tracking links redirect to
+# Everything else is optional and passed through from the same env file when present.
+#
+# Not here on purpose: Redis. No code reads REDIS_URL (the stage queue is in-process), so the
+# service was only an open port.
+
+# Every origin process: production mode + the shared database.
+x-common-env: &common-env
+  NODE_ENV: production
+  DATABASE_URL: postgres://vantage:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD (URL-safe, e.g. openssl rand -hex 24)}@postgres:5432/vantage
+
+# The API and the worker build the same application context, so they get the same settings.
+# A key with no value is passed through from the env file / shell only when it is set there.
+x-app-env: &app-env
+  <<: *common-env
+  JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET to at least 32 random characters (openssl rand -hex 32)}
+  # Optional dedicated secrets (each falls back to a JWT_SECRET-derived value when unset or empty).
+  SECRETS_ENC_KEY:
+  UNSUBSCRIBE_SECRET:
+  API_KEY_PEPPER:
+  # Shared secret for POST /webhooks/inbound. Unset = that route answers 503 in production.
+  INBOUND_WEBHOOK_SECRET:
+  # Public URLs. The defaults suit a stack reached on localhost; set all three when deploying
+  # (they end up in emailed links: magic links, unsubscribe links, tracking links).
+  CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173}
+  PUBLIC_API_URL: ${PUBLIC_API_URL:-http://localhost:8787}
+  TRACKING_BASE_URL: ${TRACKING_BASE_URL:-http://localhost:8788}
+  # Behind a reverse proxy or CDN this MUST be set (e.g. TRUST_PROXY=uniquelocal,loopback for a
+  # proxy on this host, or the CDN's ranges): otherwise every request appears to come from the
+  # proxy and all clients share one rate-limit bucket. Leave unset when clients connect directly.
+  TRUST_PROXY:
+  LOG_LEVEL:
+  DEFAULT_HOLD_DAYS:
+  DEFAULT_MIN_PAYOUT_CENTS:
+  AUTO_APPROVE_CONVERSIONS:
+  # Section 11 rule: transactional mail leaves via an ESP, never this box.
+  ESP_PROVIDER:
+  RESEND_API_KEY:
+  POSTMARK_SERVER_TOKEN:
+  SLACK_WEBHOOK_URL:
+  MS_OAUTH_CLIENT_ID:
+  MS_OAUTH_CLIENT_SECRET:
+  GOOGLE_OAUTH_CLIENT_ID:
+  GOOGLE_OAUTH_CLIENT_SECRET:
+  # Section 11 rule: scrape through rotating/residential proxies, never the box IP.
+  PROXY_URL:
+  BROWSER_FETCH:
+  ALLOW_SYNTHETIC_DISCOVERY:
+  DATAFORSEO_LOGIN:
+  DATAFORSEO_PASSWORD:
+  SERPAPI_KEY:
+  SCRAPE_API_URL:
+  SCRAPE_API_KEY:
+  YOUTUBE_API_KEY:
+  HUNTER_API_KEY:
+  ANTHROPIC_API_KEY:
+  RELEVANCE_LLM_API_KEY:
+  # Given explicit defaults (the same ones the code uses): the app reads these two with `??`,
+  # so a blank `NAME=` line passed through as an empty string would otherwise blank them.
+  RELEVANCE_LLM_BASE_URL: ${RELEVANCE_LLM_BASE_URL:-https://api.x.ai/v1}
+  RELEVANCE_LLM_MODEL: ${RELEVANCE_LLM_MODEL:-grok-4-fast-non-reasoning}
+
+x-app: &app
+  build:
+    context: ..
+    dockerfile: deploy/Dockerfile
+  init: true
+  restart: unless-stopped
 
 services:
   postgres:
     image: postgres:16-alpine
+    restart: unless-stopped
     environment:
       POSTGRES_USER: vantage
-      POSTGRES_PASSWORD: vantage
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD (URL-safe, e.g. openssl rand -hex 24)}
       POSTGRES_DB: vantage
+    # Loopback only (psql / backups from this host). The app reaches it over the compose network.
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U vantage"]
+      test: ["CMD-SHELL", "pg_isready -U vantage -d vantage"]
       interval: 5s
       timeout: 5s
       retries: 10
 
-  redis:
-    image: redis:7-alpine
-    ports:
-      - "6379:6379"
-
   api:
-    build:
-      context: ..
-      dockerfile: deploy/Dockerfile
+    <<: *app
     environment:
+      <<: *app-env
       PORT: "8787"
-      DATABASE_URL: postgres://vantage:vantage@postgres:5432/vantage
-      REDIS_URL: redis://redis:6379
-      JWT_SECRET: change-me-in-prod
-      CORS_ORIGINS: http://localhost:5173
-      # Section 11 rule: transactional mail leaves via an ESP, never this box.
-      ESP_PROVIDER: resend
+      # The scheduler runs in the worker below — never set SCHEDULER=true here as well
+      # (two schedulers on one database would both send).
+    # Plain HTTP: published on loopback by default; put a TLS-terminating proxy or tunnel in
+    # front (and set TRUST_PROXY). BIND_ADDRESS=0.0.0.0 exposes it directly.
     ports:
-      - "8787:8787"
+      - "${BIND_ADDRESS:-127.0.0.1}:8787:8787"
     depends_on:
       postgres:
         condition: service_healthy
-      redis:
-        condition: service_started
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8787/health').then((r) => process.exit(r.ok ? 0 : 1), () => process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
 
+  # The worker and the edge wait for a healthy API: the first process to connect creates the
+  # tables, and three processes doing that at once on an empty database can collide.
   worker:
-    build:
-      context: ..
-      dockerfile: deploy/Dockerfile
+    <<: *app
     command: ["node", "--import", "tsx", "packages/api/src/worker.ts"]
     environment:
-      DATABASE_URL: postgres://vantage:vantage@postgres:5432/vantage
-      REDIS_URL: redis://redis:6379
-      # Section 11 rule: scrape through rotating/residential proxies, never the box IP.
-      PROXY_URL: ""
+      <<: *app-env
+      # Explicit default: a blank value would reach the worker as "" → an interval of 0 ms.
+      SCHEDULER_INTERVAL_MS: ${SCHEDULER_INTERVAL_MS:-60000}
     depends_on:
-      - postgres
-      - redis
+      postgres:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+    # The worker has no HTTP surface; this checks that it can still reach the database with
+    # its credentials (it does not prove the scheduler loop is ticking).
+    healthcheck:
+      test: ["CMD", "node", "-e", "import('pg').then(async ({ default: pg }) => { const c = new pg.Client({ connectionString: process.env.DATABASE_URL }); await c.connect(); await c.query('select 1'); await c.end(); }).then(() => process.exit(0), () => process.exit(1))"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
 
   edge:
-    build:
-      context: ..
-      dockerfile: deploy/Dockerfile
+    <<: *app
     command: ["node", "--import", "tsx", "packages/tracking-edge/src/server.ts"]
     environment:
+      <<: *common-env
       EDGE_PORT: "8788"
+      EDGE_DEFAULT_DEST: ${EDGE_DEFAULT_DEST:?set EDGE_DEFAULT_DEST to the storefront URL tracking links redirect to}
     ports:
-      - "8788:8788"
+      - "${BIND_ADDRESS:-127.0.0.1}:8788:8788"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8788/health').then((r) => process.exit(r.ok ? 0 : 1), () => process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
 
 volumes:
   pgdata:
