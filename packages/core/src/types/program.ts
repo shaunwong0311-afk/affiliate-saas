@@ -34,6 +34,11 @@ export interface Offer {
   payoutType: PayoutType;
   /** For percentage: a decimal rate (0.15). For flat: minor units (cents). */
   payoutValue: number;
+  /**
+   * The currency every amount in this offer is in (flat payout, tier thresholds, bonuses,
+   * caps, flat overrides). There is no FX: an order in another currency is priced only when
+   * the offer is a plain percentage — see `currencyPricingIssue`.
+   */
   currency: CurrencyCode;
   windowDays: number; // attribution window
   rules: OfferRule[];
@@ -64,6 +69,15 @@ export type OfferRule =
   | { kind: "recurring"; value: true } // pays on rebills
   | { kind: "manual_review_over_cents"; value: number };
 
+/**
+ * What a percentage commission is a percentage OF (see the Order money fields):
+ *  - `gross`               the amount charged — after discounts, including tax and shipping;
+ *  - `net_of_tax_shipping` the amount charged less tax and shipping;
+ *  - `net_of_discount`     the merchandise subtotal less discounts.
+ * The last two are the same figure whenever an order's parts add up; they differ in which
+ * fields the feed has to carry (a feed with no subtotal can still use `net_of_tax_shipping`).
+ * With line items and SKU rules, the base is that figure apportioned to the eligible lines.
+ */
 export type CommissionableBasis = "gross" | "net_of_discount" | "net_of_tax_shipping";
 
 /** Volume escalation: rate increases as cumulative volume crosses thresholds. */

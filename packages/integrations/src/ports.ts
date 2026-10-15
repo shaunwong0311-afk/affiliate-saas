@@ -33,17 +33,27 @@ export interface OrderNormalizer {
 }
 
 // ---- Payout rails (Section 4) ----------------------------------------------
+//
+// No custody: money never passes through the platform, and there are NO platform-wide rail
+// credentials. A payout is either MANUAL (the merchant pays from their own account and
+// marks it paid) or goes through an automated rail that the MERCHANT connected with their
+// own credentials. These types make the second case impossible to get wrong by accident:
+// a rail instance is bound to one merchant and refuses to pay for any other.
 export interface PayoutRequest {
   payoutId: string;
+  /** The merchant whose payout this is. Must be the merchant the rail is bound to. */
+  merchantId: string;
   affiliateId: string;
   accountRef: string;
   amountCents: number;
   currency: string;
+  /** The same key is sent again when the outcome of an attempt is unknown, so the rail can deduplicate. */
   idempotencyKey: string;
 }
 
 export interface PayoutResult {
   payoutId: string;
+  /** `processing`: accepted, outcome not known yet. A rail that THROWS has an unknown outcome too. */
   status: "paid" | "processing" | "failed";
   railReference: string | null;
   failureReason: string | null;
@@ -52,10 +62,32 @@ export interface PayoutResult {
 /** Orchestration without custody: the rail moves money, the platform conducts. */
 export interface PayoutRail {
   readonly rail: string;
+  /**
+   * The ONE merchant whose own credentials this instance holds. Null only for the dev mock,
+   * which holds no credentials and moves no money.
+   */
+  readonly merchantId: string | null;
   disburse(request: PayoutRequest): Promise<PayoutResult>;
   /** Verify a payout account is usable (KYC handled by the rail itself). */
   verifyAccount(accountRef: string): Promise<{ ok: boolean; reason?: string }>;
 }
+
+/** A merchant's OWN connection to an automated rail — never a platform account. */
+export interface MerchantRailCredentials {
+  merchantId: string;
+  rail: string;
+  /** The decrypted secret material of that merchant's connection (API key, client id/secret, …). */
+  secret: Record<string, string>;
+}
+
+/** Looks up one merchant's connection to one rail. Null = not connected → that payout is manual. */
+export type MerchantRailCredentialSource = (merchantId: string, rail: string) => Promise<MerchantRailCredentials | null>;
+
+/** Builds a rail instance bound to the merchant whose credentials it is given. */
+export type PayoutRailFactory = (credentials: MerchantRailCredentials) => PayoutRail;
+
+/** How a payout leaves: through a rail the merchant connected, or by the merchant's own hand. */
+export type ResolvedRail = { mode: "automated"; rail: PayoutRail } | { mode: "manual"; reason: string };
 
 // ---- Mailbox / sending (Section 8.4) ---------------------------------------
 export interface OutboundEmail {

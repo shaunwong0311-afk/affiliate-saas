@@ -51,6 +51,12 @@ export interface OnOrderContext {
   isFirstConversionForAffiliate: boolean;
   /** Is this the recruit's first sale (override `first_sale` trigger)? */
   isFirstSaleUnderSponsor: boolean;
+  /**
+   * Ids of this offer's bonuses the affiliate already holds a live (un-reversed) ledger
+   * entry for. A milestone is earned once: without this, a refund that drops the count back
+   * under the threshold lets the next sale "cross" it and earn the bonus again.
+   */
+  awardedBonusIds?: readonly Id[];
   now: Date;
 }
 

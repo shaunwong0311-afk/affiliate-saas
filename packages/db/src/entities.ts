@@ -185,26 +185,58 @@ export interface Customer {
 }
 
 // ---- Payouts ----------------------------------------------------------------
+/**
+ * A batch's status is derived from its payouts: `draft` until approved, `processing`
+ * while any payout is still outstanding, then `paid`, `failed` (at least one payout
+ * failed) or `cancelled` (nothing left in it).
+ */
 export interface PayoutBatch {
   id: Id;
   merchantId: Id;
   rail: string;
   currency: CurrencyCode;
-  status: "draft" | "approved" | "processing" | "paid" | "failed";
+  status: "draft" | "approved" | "processing" | "paid" | "failed" | "cancelled";
   approvedBy: Id | null;
+  approvedAt?: Timestamp | null;
   ts: Timestamp;
 }
 
+/**
+ * One affiliate's payment in a batch. Money never passes through the platform:
+ *
+ *  - `pending`          in a draft batch — ledger entries reserved, nothing sent;
+ *  - `awaiting_payment` approved, MANUAL: the merchant pays from their own account, then
+ *                       marks it paid (or failed). Entries stay reserved meanwhile;
+ *  - `processing`       approved, handed to a rail the MERCHANT connected; outcome not yet
+ *                       known (asynchronous rail, or an error that may or may not have paid);
+ *  - `paid`             reservation settled;
+ *  - `failed`           definitely not paid — reservation released, may be retried;
+ *  - `cancelled`        withdrawn before approval — reservation released.
+ */
 export interface Payout {
   id: Id;
   batchId: Id | null;
   merchantId: Id;
   affiliateId: Id;
+  /**
+   * While the payout is open: the sum of the ledger entries it has reserved, re-derived
+   * whenever that set changes — never typed in. Once closed: what was paid, or was to be.
+   */
   amountCents: number;
   currency: CurrencyCode;
+  /** The affiliate's payout method — the rail named on their payout account ("paypal", "wise", …). */
   method: string;
-  status: "pending" | "processing" | "paid" | "failed" | "held";
+  status: "pending" | "awaiting_payment" | "processing" | "paid" | "failed" | "held" | "cancelled";
   failureReason: string | null;
+  /** How it leaves, decided at approval. */
+  mode?: "manual" | "automated" | null;
+  /** The account the payout was approved for (what the export file carries / the rail was given). */
+  accountRef?: string | null;
+  /** The merchant's own payment reference (mark-paid), or the rail's transfer id. */
+  reference?: string | null;
+  /** Disbursement attempt, part of the rail idempotency key. A new attempt starts only after a DEFINITE failure. */
+  attempt?: number;
+  paidAt?: Timestamp | null;
   ts: Timestamp;
 }
 

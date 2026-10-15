@@ -67,14 +67,34 @@ export const ingestionRoutes: RouteModule = (app, ctx) => {
 
   // ---- Public signed S2S postback (Section 6) -------------------------------
   // The robust conversion path: HMAC-signed with the per-merchant secret.
+  //
+  // The body is checked against a schema BEFORE anything else happens — it is a public
+  // endpoint and nothing may be written from a malformed body. (`amountCents: 1999.5` used
+  // to be stored as an order and a conversion before the money code threw; the corrected
+  // retry was then a "duplicate" and the commission was never written.) No field is
+  // transformed: the signature covers the values exactly as sent.
+  const postbackSchema = z.object({
+    merchantId: z.string().min(1).max(200),
+    txnId: z.string().min(1).max(200),
+    amountCents: z.number().int("must be a whole number of minor units (1999, not 19.99)").min(0).max(Number.MAX_SAFE_INTEGER),
+    currency: z.string().regex(/^[A-Za-z]{3}$/, "must be a 3-letter ISO-4217 code"),
+    clickId: z.string().max(200).nullish(),
+    couponCodes: z.array(z.string().max(100)).max(50).optional(),
+    customerRef: z.string().max(200).nullish(),
+    ts: z.number().int("must be a Unix time in whole seconds").positive(),
+  });
+
   app.post("/track/postback/:merchantId", async (request, reply) => {
     const merchantId = (request.params as { merchantId: string }).merchantId;
+    const body = parseBody(postbackSchema, request);
+    if (body.merchantId !== merchantId) throw badRequest("validation: merchantId does not match the postback URL");
     const merchant = await ctx.db.merchants.get(merchantId);
     if (!merchant) throw notFound("merchant");
     const signature = (request.headers["x-affiliate-signature"] as string) ?? null;
+    // A bad or missing signature is a 401 (PostbackVerificationError), never a 500.
     const result = await ingestOrder(ctx, "s2s", {
       merchantId,
-      raw: request.body,
+      raw: body,
       signature,
       secret: merchant.postbackSecret,
     });

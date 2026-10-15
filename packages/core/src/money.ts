@@ -72,15 +72,73 @@ export function roundCents(realCents: number): number {
   return Math.sign(realCents) * Math.round(Math.abs(realCents));
 }
 
+/** Exact `numerator ÷ denominator` rounded half-up (half away from zero, like roundCents). */
+function divideHalfUp(numerator: bigint, denominator: bigint): bigint {
+  if (denominator <= 0n) throw new MoneyError(`cannot divide by ${denominator}`);
+  const negative = numerator < 0n;
+  const magnitude = negative ? -numerator : numerator;
+  const quotient = (magnitude * 2n + denominator) / (denominator * 2n);
+  return negative ? -quotient : quotient;
+}
+
+function assertWholeCents(value: number, what: string): void {
+  if (!Number.isSafeInteger(value)) throw new MoneyError(`${what} must be a whole number of cents, got ${value}`);
+}
+
+// A rate is read as a decimal with this many places. Multiplying cents by the binary
+// float instead rounds the wrong way whenever the true product ends in exactly half a
+// cent: 100 × 0.145 is 14.5 → 15, but the float product is 14.499999999999998 → 14.
+const RATE_DECIMALS = 12;
+const RATE_DENOMINATOR = 10n ** BigInt(RATE_DECIMALS);
+
 /**
- * Apply a decimal rate (0.15 === 15%) to a money amount, rounding to whole cents.
- * Used for percentage commissions and percentage recruiter overrides.
+ * Apply a decimal rate (0.15 === 15%) to a money amount, rounding half-up to whole cents.
+ * Used for percentage commissions and percentage recruiter overrides. Exact: the rate is
+ * taken as the decimal it was written as, and the arithmetic is done in integers.
  */
 export function applyRate(base: Money, rate: number): Money {
   if (!Number.isFinite(rate) || rate < 0) {
     throw new MoneyError(`rate must be a finite, non-negative number, got ${rate}`);
   }
-  return money(roundCents(base.amountCents * rate), base.currency);
+  assertWholeCents(base.amountCents, "amountCents");
+  const scaledRate = BigInt(rate.toFixed(RATE_DECIMALS).replace(".", ""));
+  return money(Number(divideHalfUp(BigInt(base.amountCents) * scaledRate, RATE_DENOMINATOR)), base.currency);
+}
+
+/** `amountCents × part ÷ whole`, rounded half-up to a whole cent, computed exactly. */
+export function proRateCents(amountCents: number, part: number, whole: number): number {
+  assertWholeCents(amountCents, "amountCents");
+  assertWholeCents(part, "part");
+  assertWholeCents(whole, "whole");
+  return Number(divideHalfUp(BigInt(amountCents) * BigInt(part), BigInt(whole)));
+}
+
+/**
+ * Split `totalCents` in proportion to `weights` so that the parts add up to the total
+ * exactly (largest-remainder method; ties go to the earlier weight). Rounding each share on
+ * its own would let the parts drift a cent or two away from the whole.
+ */
+export function allocateCents(totalCents: number, weights: readonly number[]): number[] {
+  assertWholeCents(totalCents, "totalCents");
+  if (totalCents < 0) throw new MoneyError(`cannot allocate a negative amount, got ${totalCents}`);
+  for (const w of weights) {
+    assertWholeCents(w, "weight");
+    if (w < 0) throw new MoneyError(`weights must be non-negative, got ${w}`);
+  }
+  const sum = weights.reduce((s, w) => s + BigInt(w), 0n);
+  if (sum === 0n) throw new MoneyError("cannot allocate across weights that sum to zero");
+
+  const total = BigInt(totalCents);
+  const shares = weights.map((w) => (total * BigInt(w)) / sum);
+  const remainders = weights.map((w, index) => ({ index, remainder: (total * BigInt(w)) % sum }));
+  let left = total - shares.reduce((s, x) => s + x, 0n);
+  remainders.sort((a, b) => (a.remainder === b.remainder ? a.index - b.index : a.remainder > b.remainder ? -1 : 1));
+  for (const { index } of remainders) {
+    if (left === 0n) break;
+    shares[index] = shares[index]! + 1n;
+    left -= 1n;
+  }
+  return shares.map(Number);
 }
 
 /** Clamp a money amount to [min, max] (inclusive). Currencies must match. */

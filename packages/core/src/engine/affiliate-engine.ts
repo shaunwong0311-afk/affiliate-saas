@@ -1,4 +1,4 @@
-import { applyRate, money, type Money } from "../money.js";
+import { MoneyError, applyRate, money, type Money } from "../money.js";
 import { isRecruiter, isSeller } from "../types/common.js";
 import type {
   CommissionEngine,
@@ -11,10 +11,13 @@ import type {
   RunCycleContext,
 } from "./types.js";
 import {
+  assertCommissionRate,
   categoryRateFor,
   computeCommissionableBase,
+  currencyPricingIssue,
   maxCommissionCents,
   selectRate,
+  type BaseComputation,
 } from "./rules.js";
 
 /**
@@ -35,6 +38,12 @@ export class AffiliateEngine implements CommissionEngine {
     const events: CommissionEvent[] = [];
     const currency = order.currency;
 
+    // Never emit an amount in a currency it was not configured in (a USD flat fee paid as
+    // 1,000 yen). The substrate checks first and routes such an order to a human; reaching
+    // this line means a caller skipped that check.
+    const currencyIssue = currencyPricingIssue(order, offer);
+    if (currencyIssue) throw new MoneyError(`cannot price this order: ${currencyIssue}`);
+
     const base = computeCommissionableBase(order, offer, {
       isFirstConversionForAffiliate: ctx.isFirstConversionForAffiliate,
     });
@@ -44,7 +53,7 @@ export class AffiliateEngine implements CommissionEngine {
 
     // ---- Direct commission (seller earns on their own sale) --------------------
     if (isSeller(relationship.role)) {
-      const commission = this.computeDirectCommission(ctx, base.baseCents);
+      const commission = this.computeDirectCommission(ctx, base);
       if (commission.amountCents > 0) {
         events.push({
           type: "commission",
@@ -70,7 +79,7 @@ export class AffiliateEngine implements CommissionEngine {
     return events;
   }
 
-  private computeDirectCommission(ctx: OnOrderContext, baseCents: number): Money {
+  private computeDirectCommission(ctx: OnOrderContext, base: BaseComputation): Money {
     const { offer, order, relationship } = ctx;
     const currency = order.currency;
 
@@ -82,11 +91,8 @@ export class AffiliateEngine implements CommissionEngine {
 
     // Percentage offers: select effective rate, then apply per category if rules exist.
     const relRate = relationship.commissionTerms?.rate;
-    const { rate } = selectRate(offer, ctx.priorVolumeCents, relRate, ctx.now);
-
-    const base = computeCommissionableBase(order, offer, {
-      isFirstConversionForAffiliate: ctx.isFirstConversionForAffiliate,
-    });
+    const { rate, source } = selectRate(offer, ctx.priorVolumeCents, relRate, ctx.now);
+    assertCommissionRate(rate, `commission rate (from ${source})`);
 
     // If category-specific rates exist, compute per category; otherwise flat rate on base.
     const hasCategoryRates = offer.rules.some((r) => r.kind === "category_rate");
@@ -94,10 +100,11 @@ export class AffiliateEngine implements CommissionEngine {
     if (hasCategoryRates) {
       for (const [category, catBase] of base.categoryBaseCents) {
         const catRate = categoryRateFor(offer, category) ?? rate;
+        assertCommissionRate(catRate, "category commission rate");
         amountCents += applyRate(money(catBase, currency), catRate).amountCents;
       }
     } else {
-      amountCents = applyRate(money(baseCents, currency), rate).amountCents;
+      amountCents = applyRate(money(base.baseCents, currency), rate).amountCents;
     }
 
     return capCommission(money(amountCents, currency), offer);
@@ -112,8 +119,12 @@ export class AffiliateEngine implements CommissionEngine {
     const out: CommissionEvent[] = [];
     const newVolume = ctx.priorVolumeCents + baseCents;
     const newCount = ctx.priorConversionCount + 1;
+    const alreadyAwarded = new Set(ctx.awardedBonusIds ?? []);
 
     for (const bonus of ctx.offer.bonuses) {
+      // Earned once. A refund elsewhere can pull the count or volume back under the
+      // threshold; crossing it a second time must not pay the bonus a second time.
+      if (alreadyAwarded.has(bonus.id)) continue;
       let award = false;
       switch (bonus.triggerType) {
         case "first_sale":
@@ -165,6 +176,7 @@ export class AffiliateEngine implements CommissionEngine {
     // Trigger gate.
     if (policy.trigger === "first_sale" && !ctx.isFirstSaleUnderSponsor) return null;
 
+    if (policy.structure === "percentage") assertCommissionRate(policy.value, "recruiter override rate");
     const amount =
       policy.structure === "flat"
         ? money(policy.value, currency)

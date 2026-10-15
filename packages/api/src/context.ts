@@ -353,7 +353,11 @@ export function createContext(overrides: Partial<AppContext> = {}): AppContext {
     config,
     db,
     engines: overrides.engines ?? defaultEngineRegistry,
-    rails: overrides.rails ?? new PayoutRailRegistry(),
+    // No custody: there are no platform-wide rail credentials, so nothing is read from the
+    // environment here and every real payout is MANUAL (the merchant pays from their own
+    // account) until a merchant-owned connection is wired in as a factory + credential
+    // source. The mock rail marks payouts paid without moving money — outside production only.
+    rails: overrides.rails ?? new PayoutRailRegistry({ allowMock: !prod }),
     mailer,
     mailboxResolver,
     replyPoller,

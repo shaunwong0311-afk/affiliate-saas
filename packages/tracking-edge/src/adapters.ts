@@ -14,14 +14,24 @@ export class DbLinkResolver implements LinkResolver {
     private readonly opts: { defaultDestination?: string } = {},
   ) {}
 
+  /**
+   * A link resolves only while it can earn — the same three checks attribution makes, so
+   * the edge never records a click that the pipeline would then refuse to credit:
+   *  - the offer is active (a paused offer used to keep redirecting);
+   *  - the affiliate is not paused or banned;
+   *  - the affiliate has an ACTIVE relationship in THIS offer's program (any relationship
+   *    with the merchant used to do, including one in a different program).
+   */
   async resolve(code: string): Promise<ResolvedLink | null> {
     // Link code convention: `<affiliateId>.<offerId>`.
     const [affiliateId, offerId] = code.split(".");
     if (!affiliateId || !offerId) return null;
     const offer = await this.db.offers.get(offerId);
-    if (!offer) return null;
+    if (!offer || offer.status !== "active") return null;
+    const affiliate = await this.db.affiliates.get(affiliateId);
+    if (affiliate && affiliate.status !== "active") return null;
     const relationship = await this.db.relationships.findOne(
-      (r) => r.affiliateId === affiliateId && r.merchantId === offer.merchantId,
+      (r) => r.affiliateId === affiliateId && r.programId === offer.programId && r.merchantId === offer.merchantId,
     );
     if (!relationship || relationship.status !== "active") return null;
     return {

@@ -6,22 +6,23 @@ import {
   hasSponsorCycle,
   ipClickVelocity,
   commissionEventToEntry,
+  currencyPricingIssue,
   type Attribution,
+  type AttributionPriority,
   type Click,
   type Conversion,
-  type LedgerEntry,
   type Offer,
   type Order,
   type AffiliateRelationship,
-  type CommissionEvent,
   type OnOrderContext,
   type CodeMatch,
   type FraudSignals,
 } from "@affiliate/core";
-import type { NormalizedOrder } from "@affiliate/integrations";
+import { isUniqueViolation } from "@affiliate/db";
+import type { NormalizedOrderWithBuyer } from "@affiliate/integrations";
 import type { AppContext } from "../context.js";
 import { recordUsage } from "./entitlements.js";
-import { emitWebhook } from "./webhooks.js";
+import { emitAfterCommit, moneyTransaction, type PendingEvent } from "./payout-service.js";
 
 /**
  * The substrate write path (Sections 4–7). One order in → normalized, attributed,
@@ -41,30 +42,49 @@ export interface IngestResult {
   fraud?: { score: number; decision: string; reasons: string[] };
 }
 
+const duplicateOf = (order: Order): IngestResult => ({ status: "duplicate", orderId: order.id, ledgerEntryIds: [], reason: "duplicate txn_id" });
+
 /**
  * Public entry: the entire order→conversion→ledger→overrides write set runs in ONE
- * transaction, so a mid-pipeline failure can't leave partial financial state
- * (order without ledger, override without commission, etc.). On Postgres this is a
- * real BEGIN/COMMIT/ROLLBACK; the in-memory adapter is a passthrough.
+ * transaction, so a mid-pipeline failure leaves nothing behind (order without ledger,
+ * override without commission, …) — on Postgres AND in memory.
  *
- * Note: dedup on (merchant, txn_id) is enforced by a unique index in the
- * production schema (schema.sql) — the in-pipeline check is a fast path; the
- * constraint is the race-safe backstop.
+ * Idempotency on (merchant, txn_id) has two layers:
+ *  - the transaction holds the merchant's money lock, so deliveries for one merchant are
+ *    processed one at a time: the second copy of an order finds the first and reports
+ *    `duplicate`. The same serialization keeps "first sale" and milestone bonuses, code
+ *    usage caps and customer records from being decided twice by overlapping orders;
+ *  - a unique rule on orders(merchantId, txnId), enforced by the store itself, is the
+ *    backstop: if a second copy ever got past the check, its insert fails, its transaction
+ *    rolls back, and it is reported as the duplicate it is.
+ *
+ * Webhooks are emitted after commit — never for work that was rolled back.
  */
-export async function ingestNormalizedOrder(ctx: AppContext, normalized: NormalizedOrder): Promise<IngestResult> {
-  return ctx.db.transaction((db) => ingestImpl({ ...ctx, db }, normalized));
+export async function ingestNormalizedOrder(ctx: AppContext, normalized: NormalizedOrderWithBuyer): Promise<IngestResult> {
+  const { merchantId, txnId } = normalized.order;
+  const events: PendingEvent[] = [];
+  let result: IngestResult;
+  try {
+    result = await moneyTransaction(ctx, merchantId, (tx) => ingestImpl(tx, normalized, events));
+  } catch (err) {
+    if (!isUniqueViolation(err, "orders_merchant_txn")) throw err;
+    const existing = await ctx.db.orders.findOne((o) => o.merchantId === merchantId && o.txnId === txnId);
+    if (!existing) throw err;
+    return duplicateOf(existing);
+  }
+  await emitAfterCommit(ctx, events);
+  return result;
 }
 
-async function ingestImpl(ctx: AppContext, normalized: NormalizedOrder): Promise<IngestResult> {
+/** Runs inside the transaction: `ctx.db` IS the transaction handle. */
+async function ingestImpl(ctx: AppContext, normalized: NormalizedOrderWithBuyer, events: PendingEvent[]): Promise<IngestResult> {
   const { db, clock } = ctx;
   const now = clock.now();
   const incoming = normalized.order;
 
   // Idempotency: dedup on (merchant, txn_id) — Section 6.
   const existing = await db.orders.findOne((o) => o.merchantId === incoming.merchantId && o.txnId === incoming.txnId);
-  if (existing) {
-    return { status: "duplicate", orderId: existing.id, ledgerEntryIds: [], reason: "duplicate txn_id" };
-  }
+  if (existing) return duplicateOf(existing);
 
   // Resolve / persist the customer for mining + new-customer logic.
   const order = await persistCustomerAndOrder(ctx, normalized);
@@ -72,31 +92,39 @@ async function ingestImpl(ctx: AppContext, normalized: NormalizedOrder): Promise
   // Assemble attribution inputs.
   const offers = await db.offers.find((o) => o.merchantId === order.merchantId);
   const offersById = new Map(offers.map((o) => [o.id, o]));
-  const postbackClick = normalized.clickId ? await db.clicks.get(normalized.clickId) : null;
+  const programs = await db.programs.find((p) => p.merchantId === order.merchantId);
+  const programsById = new Map(programs.map((p) => [p.id, p]));
+  const claimedClick = normalized.clickId ? await db.clicks.get(normalized.clickId) : null;
+  // A click id is only a claim: it has to be one of THIS merchant's clicks.
+  const postbackClick = claimedClick && claimedClick.merchantId === order.merchantId ? claimedClick : null;
   const candidateClicks = await recentClicks(ctx, order);
-  const matchedCodes = await matchCodes(ctx, order);
-  const program = offers[0] ? await db.programs.get(offers[0].programId) : null;
-  const priority = program?.attributionPriority ?? "last_touch";
-
-  const lookupRelationship = makeRelationshipLookup(ctx, offersById);
-  // Pre-load relationships referenced by candidate clicks + codes so the pure
-  // resolver can run synchronously.
-  await primeRelationshipCache(ctx, lookupRelationship, candidateClicks, matchedCodes, postbackClick);
+  const relationships = await db.relationships.find((r) => r.merchantId === order.merchantId);
+  const matchedCodes = await matchCodes(ctx, order, relationships);
+  const lookupRelationship = makeRelationshipLookup(relationships, offersById);
+  const inactiveAffiliates = await inactiveAffiliateIds(ctx, [
+    ...(postbackClick ? [postbackClick.affiliateId] : []),
+    ...candidateClicks.map((c) => c.affiliateId),
+    ...matchedCodes.map((m) => m.relationship.affiliateId),
+  ]);
 
   const { attribution, reason } = resolveAttribution({
     order,
     clickIdFromPostback: normalized.clickId ?? null,
-    postbackClick: postbackClick ?? null,
+    postbackClick,
     candidateClicks,
     matchedCodes,
     offersById,
-    lookupRelationship: lookupRelationship.sync,
-    priority,
+    lookupRelationship,
+    isAffiliateActive: (affiliateId) => !inactiveAffiliates.has(affiliateId),
+    // Link-vs-code precedence is a PROGRAM setting. It used to be read from the program
+    // of the merchant's first offer, whichever program the sale belonged to.
+    priority: "last_touch",
+    priorityByProgram: new Map<string, AttributionPriority>(programs.map((p) => [p.id, p.attributionPriority ?? "last_touch"])),
     now,
   });
 
   if (!attribution) {
-    await emitWebhook(ctx, order.merchantId, "order.unattributed", { orderId: order.id });
+    events.push({ merchantId: order.merchantId, type: "order.unattributed", payload: { orderId: order.id } });
     return { status: "unattributed", orderId: order.id, ledgerEntryIds: [], reason };
   }
 
@@ -111,7 +139,12 @@ async function ingestImpl(ctx: AppContext, normalized: NormalizedOrder): Promise
   }
 
   // ---- Fraud assessment (Section 4) ----------------------------------------
-  const fraud = await assessOrderFraud(ctx, order, attribution, relationship, postbackClick ?? null);
+  const fraud = await assessOrderFraud(ctx, order, attribution, relationship, postbackClick, offer, normalized.customerEmailHash ?? null);
+
+  // The offer's amounts are in ITS currency and there is no FX. An order in another
+  // currency is priced only when the offer is a plain percentage; otherwise nothing is
+  // paid (a USD flat fee used to go out as that many yen) and a human decides.
+  const currencyIssue = fraud.decision === "reject" ? null : currencyPricingIssue(order, offer);
 
   const conversion: Conversion = {
     id: newId("conv"),
@@ -124,13 +157,14 @@ async function ingestImpl(ctx: AppContext, normalized: NormalizedOrder): Promise
     amountCents: order.amountCents,
     currency: order.currency,
     status: fraud.decision === "reject" ? "rejected" : "pending",
-    reviewStatus: fraud.decision === "review" ? "flagged" : "none",
+    reviewStatus: fraud.decision === "review" || currencyIssue ? "flagged" : "none",
+    flagReason: currencyIssue ? `not priced: ${currencyIssue}` : null,
     ts: now.toISOString(),
   };
   await db.conversions.insert(conversion);
 
   if (fraud.decision === "reject") {
-    await emitWebhook(ctx, order.merchantId, "conversion.rejected", { conversionId: conversion.id, reasons: fraud.reasons });
+    events.push({ merchantId: order.merchantId, type: "conversion.rejected", payload: { conversionId: conversion.id, reasons: fraud.reasons } });
     return {
       status: "rejected",
       orderId: order.id,
@@ -143,33 +177,36 @@ async function ingestImpl(ctx: AppContext, normalized: NormalizedOrder): Promise
   }
 
   // ---- Price via the routed commission engine ------------------------------
-  const onOrderCtx = await assembleOnOrderContext(ctx, { order, offer, attribution, relationship, conversionId: conversion.id, now });
-  const engine = ctx.engines.get(offer.engine);
-  const events = engine.onOrder(onOrderCtx);
-
-  // ---- Write to the append-only ledger -------------------------------------
-  const autoApprove = ctx.config.autoApproveConversions && fraud.decision === "approve";
-  const holdDays = program?.holdDays ?? ctx.config.defaultHoldDays;
-  const availableAt = new Date(now.getTime() + holdDays * 86_400_000);
   const ledgerEntryIds: string[] = [];
+  const autoApprove = ctx.config.autoApproveConversions && fraud.decision === "approve" && !currencyIssue;
+  if (!currencyIssue) {
+    const onOrderCtx = await assembleOnOrderContext(ctx, { order, offer, attribution, relationship, relationships, conversionId: conversion.id, now });
+    const engine = ctx.engines.get(offer.engine);
+    const commissionEvents = engine.onOrder(onOrderCtx);
 
-  for (const event of events) {
-    const entry = commissionEventToEntry(event, {
-      merchantId: order.merchantId,
-      status: autoApprove ? "approved" : "pending",
-      availableAt: autoApprove ? availableAt : null,
-      now,
-    });
-    await db.ledger.insert(entry);
-    ledgerEntryIds.push(entry.id);
-    if (event.type === "override") {
-      await db.overrides.insert({
-        id: newId("ovr"),
-        conversionId: conversion.id,
-        beneficiaryAffiliateId: event.affiliateId,
-        level: event.level,
-        amountCents: event.amount.amountCents,
+    // ---- Write to the append-only ledger -----------------------------------
+    // The hold period is the ATTRIBUTED offer's program's (it was the first offer's).
+    const holdDays = programsById.get(offer.programId)?.holdDays ?? ctx.config.defaultHoldDays;
+    const availableAt = new Date(now.getTime() + holdDays * 86_400_000);
+
+    for (const event of commissionEvents) {
+      const entry = commissionEventToEntry(event, {
+        merchantId: order.merchantId,
+        status: autoApprove ? "approved" : "pending",
+        availableAt: autoApprove ? availableAt : null,
+        now,
       });
+      await db.ledger.insert(entry);
+      ledgerEntryIds.push(entry.id);
+      if (event.type === "override") {
+        await db.overrides.insert({
+          id: newId("ovr"),
+          conversionId: conversion.id,
+          beneficiaryAffiliateId: event.affiliateId,
+          level: event.level,
+          amountCents: event.amount.amountCents,
+        });
+      }
     }
   }
 
@@ -182,29 +219,36 @@ async function ingestImpl(ctx: AppContext, normalized: NormalizedOrder): Promise
   }
 
   await recordUsage(ctx, order.merchantId, "conversion", 1, conversion.id);
-  await emitWebhook(ctx, order.merchantId, "conversion.created", {
-    conversionId: conversion.id,
-    affiliateId: attribution.affiliateId,
-    amountCents: order.amountCents,
-    mechanism: attribution.mechanism,
+  events.push({
+    merchantId: order.merchantId,
+    type: "conversion.created",
+    payload: {
+      conversionId: conversion.id,
+      affiliateId: attribution.affiliateId,
+      amountCents: order.amountCents,
+      mechanism: attribution.mechanism,
+      ...(currencyIssue ? { unpriced: currencyIssue } : {}),
+    },
   });
 
+  const notes = [currencyIssue ? `not priced: ${currencyIssue}` : null, fraud.decision === "review" || currencyIssue ? "flagged for review" : null].filter(Boolean);
   return {
     status: "attributed",
     orderId: order.id,
     conversionId: conversion.id,
     attribution,
     ledgerEntryIds,
-    reason: reason + (fraud.decision === "review" ? " (flagged for review)" : ""),
+    reason: reason + (notes.length ? ` (${notes.join(" — ")})` : ""),
     fraud,
   };
 }
 
 // ---- helpers ----------------------------------------------------------------
 
-async function persistCustomerAndOrder(ctx: AppContext, normalized: NormalizedOrder): Promise<Order> {
+async function persistCustomerAndOrder(ctx: AppContext, normalized: NormalizedOrderWithBuyer): Promise<Order> {
   const { db, clock } = ctx;
   const order = { ...normalized.order };
+  const emailHash = normalized.customerEmailHash ?? null;
   if (normalized.customerRef) {
     let customer = await db.customers.findOne(
       (c) => c.merchantId === order.merchantId && c.externalCustomerId === normalized.customerRef,
@@ -214,11 +258,13 @@ async function persistCustomerAndOrder(ctx: AppContext, normalized: NormalizedOr
         id: newId("cust"),
         merchantId: order.merchantId,
         externalCustomerId: normalized.customerRef,
-        emailHash: null,
+        emailHash, // was always null, so the self-referral check could never fire
         country: order.country,
         firstSeenAt: clock.now().toISOString(),
       };
       await db.customers.insert(customer);
+    } else if (emailHash && customer.emailHash !== emailHash) {
+      await db.customers.update(customer.id, { emailHash });
     }
     order.customerId = customer.id;
   }
@@ -244,49 +290,42 @@ async function recentClicks(ctx: AppContext, order: Order): Promise<Click[]> {
   return clicks.filter((c) => new Date(c.ts).getTime() <= orderTs).slice(-50);
 }
 
-async function matchCodes(ctx: AppContext, order: Order): Promise<CodeMatch[]> {
+async function matchCodes(ctx: AppContext, order: Order, relationships: AffiliateRelationship[]): Promise<CodeMatch[]> {
   if (order.couponCodes.length === 0) return [];
   const out: CodeMatch[] = [];
   for (const codeStr of order.couponCodes) {
     const code = await ctx.db.codes.findOne((c) => c.merchantId === order.merchantId && c.code === codeStr);
     if (!code) continue;
-    const relationship = await ctx.db.relationships.findOne(
-      (r) => r.affiliateId === code.affiliateId && r.merchantId === order.merchantId,
-    );
+    // A code is the affiliate's, not a program's: use a relationship that can earn if there is one.
+    const theirs = relationships.filter((r) => r.affiliateId === code.affiliateId);
+    const relationship = theirs.find((r) => r.status === "active") ?? theirs[0];
     if (relationship) out.push({ code, relationship });
   }
   return out;
 }
 
-interface RelationshipLookup {
-  sync: (affiliateId: string, offerId: string) => AffiliateRelationship | null;
-  cache: Map<string, AffiliateRelationship>;
-}
-
-function makeRelationshipLookup(ctx: AppContext, offersById: Map<string, Offer>): RelationshipLookup {
-  const cache = new Map<string, AffiliateRelationship>();
-  return {
-    cache,
-    sync: (affiliateId, offerId) => {
-      const offer = offersById.get(offerId);
-      if (!offer) return null;
-      return cache.get(`${affiliateId}:${offer.programId}`) ?? null;
-    },
+/** Resolve the relationship for a click's affiliate + offer: the one in that offer's program. */
+function makeRelationshipLookup(
+  relationships: AffiliateRelationship[],
+  offersById: Map<string, Offer>,
+): (affiliateId: string, offerId: string) => AffiliateRelationship | null {
+  const byAffiliateAndProgram = new Map<string, AffiliateRelationship>();
+  for (const r of relationships) byAffiliateAndProgram.set(`${r.affiliateId}:${r.programId}`, r);
+  return (affiliateId, offerId) => {
+    const offer = offersById.get(offerId);
+    if (!offer) return null;
+    return byAffiliateAndProgram.get(`${affiliateId}:${offer.programId}`) ?? null;
   };
 }
 
-async function primeRelationshipCache(
-  ctx: AppContext,
-  lookup: RelationshipLookup,
-  candidateClicks: Click[],
-  matchedCodes: CodeMatch[],
-  postbackClick: Click | null,
-): Promise<void> {
-  const all = await ctx.db.relationships.all();
-  for (const r of all) lookup.cache.set(`${r.affiliateId}:${r.programId}`, r);
-  void candidateClicks;
-  void matchedCodes;
-  void postbackClick;
+/** Which of these affiliates are paused or banned (the affiliate's own, global status). */
+async function inactiveAffiliateIds(ctx: AppContext, affiliateIds: string[]): Promise<Set<string>> {
+  const inactive = new Set<string>();
+  for (const id of new Set(affiliateIds)) {
+    const affiliate = await ctx.db.affiliates.get(id);
+    if (affiliate && affiliate.status !== "active") inactive.add(id);
+  }
+  return inactive;
 }
 
 async function assembleOnOrderContext(
@@ -296,12 +335,13 @@ async function assembleOnOrderContext(
     offer: Offer;
     attribution: Attribution;
     relationship: AffiliateRelationship;
+    relationships: AffiliateRelationship[];
     conversionId: string;
     now: Date;
   },
 ): Promise<OnOrderContext> {
   const { db } = ctx;
-  const { order, offer, attribution, relationship, conversionId, now } = args;
+  const { order, offer, attribution, relationship, relationships, conversionId, now } = args;
 
   // Prior conversions for this affiliate on this merchant (volume + counts).
   const priorConversions = await db.conversions.find(
@@ -314,18 +354,28 @@ async function assembleOnOrderContext(
   const priorVolumeCents = priorConversions.reduce((s, c) => s + c.amountCents, 0);
   const priorConversionCount = priorConversions.length;
 
+  // Bonuses of this offer the affiliate already holds. A refund can pull the count or
+  // volume back under a threshold; the next sale crossing it again must not pay again.
+  const bonusIds = new Set(offer.bonuses.map((b) => b.id));
+  const awardedBonusIds = (
+    await db.ledger.find(
+      (e) => e.merchantId === order.merchantId && e.affiliateId === relationship.affiliateId && e.type === "bonus" && e.status !== "reversed",
+    )
+  )
+    .map((e) => e.metadata?.["bonusId"])
+    .filter((id): id is string => typeof id === "string" && bonusIds.has(id));
+
   // Sponsor relationship (for two-tier override eligibility), guarding cycles.
   let sponsorRelationship: AffiliateRelationship | null = null;
   if (relationship.sponsorAffiliateId) {
-    const all = await db.relationships.find((r) => r.merchantId === order.merchantId);
-    const byAffiliate = new Map(all.map((r) => [r.affiliateId, r]));
+    const byAffiliate = new Map(relationships.map((r) => [r.affiliateId, r]));
     const cyclic = hasSponsorCycle(
       relationship.affiliateId,
       (id) => byAffiliate.get(id)?.sponsorAffiliateId ?? null,
     );
     if (!cyclic) {
       sponsorRelationship =
-        all.find((r) => r.affiliateId === relationship.sponsorAffiliateId && r.programId === offer.programId) ?? null;
+        relationships.find((r) => r.affiliateId === relationship.sponsorAffiliateId && r.programId === offer.programId) ?? null;
     }
   }
 
@@ -340,6 +390,7 @@ async function assembleOnOrderContext(
     priorConversionCount,
     isFirstConversionForAffiliate: priorConversionCount === 0,
     isFirstSaleUnderSponsor: priorConversionCount === 0,
+    awardedBonusIds,
     now,
   };
 }
@@ -350,6 +401,8 @@ async function assessOrderFraud(
   attribution: Attribution,
   relationship: AffiliateRelationship,
   click: Click | null,
+  offer: Offer,
+  buyerEmailHash: string | null,
 ): Promise<{ score: number; decision: "approve" | "review" | "reject"; reasons: string[] }> {
   const allClicks = await ctx.db.clicks.find((c) => c.merchantId === order.merchantId);
   const affiliateConversions = await ctx.db.conversions.find(
@@ -365,14 +418,16 @@ async function assessOrderFraud(
   const byAffiliate = new Map(all.map((r) => [r.affiliateId, r]));
   const isCircular = hasSponsorCycle(relationship.affiliateId, (id) => byAffiliate.get(id)?.sponsorAffiliateId ?? null);
 
-  // Real self-referral: the converting affiliate is the buyer. Compare the
-  // affiliate's email hash to the customer's hashed email.
+  // Real self-referral: the converting affiliate is the buyer. Compare the affiliate's
+  // email hash with the buyer's — from this order when the feed carried the email, else
+  // from what an earlier order recorded for the same customer.
   let isSelfReferral = false;
-  if (order.customerId) {
-    const customer = await ctx.db.customers.get(order.customerId);
+  const customer = order.customerId ? await ctx.db.customers.get(order.customerId) : null;
+  const buyerHash = buyerEmailHash ?? customer?.emailHash ?? null;
+  if (buyerHash) {
     const affiliate = await ctx.db.affiliates.get(attribution.affiliateId);
-    if (customer?.emailHash && affiliate?.primaryEmail) {
-      isSelfReferral = customer.emailHash === sha256Hex(affiliate.primaryEmail.trim().toLowerCase());
+    if (affiliate?.primaryEmail) {
+      isSelfReferral = buyerHash === sha256Hex(affiliate.primaryEmail.trim().toLowerCase());
     }
   }
 
@@ -380,7 +435,9 @@ async function assessOrderFraud(
   const windowMs = 60 * 60 * 1000;
   const ipClickCountInWindow = click?.ip ? ipClickVelocity(allClicks, click.ip, windowMs, ctx.clock.now()) : 0;
 
-  const manualReviewOver = findManualReviewThreshold(ctx, attribution.offerId);
+  const reviewRule = offer.rules.find((r) => r.kind === "manual_review_over_cents");
+  // A threshold in the offer's currency says nothing about an amount in another one.
+  const sameCurrency = order.currency.toUpperCase() === offer.currency.toUpperCase();
 
   const signals: FraudSignals = {
     ipClickCountInWindow,
@@ -390,17 +447,11 @@ async function assessOrderFraud(
     isSelfReferral,
     isCircularSponsorship: isCircular,
     amountCents: order.amountCents,
-    manualReviewOverCents: await manualReviewOver,
+    manualReviewOverCents: reviewRule && reviewRule.kind === "manual_review_over_cents" && sameCurrency ? reviewRule.value : null,
   };
   return assessFraud(signals);
 }
 
 function sha256Hex(value: string): string {
   return createHash("sha256").update(value).digest("hex");
-}
-
-async function findManualReviewThreshold(ctx: AppContext, offerId: string): Promise<number | null> {
-  const offer = await ctx.db.offers.get(offerId);
-  const rule = offer?.rules.find((r) => r.kind === "manual_review_over_cents");
-  return rule && rule.kind === "manual_review_over_cents" ? rule.value : null;
 }

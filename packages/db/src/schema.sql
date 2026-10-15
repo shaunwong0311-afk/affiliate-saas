@@ -1,10 +1,20 @@
 -- =============================================================================
 -- Affiliate Platform — normalized Postgres schema (Section 10).
 --
--- This is the production data model. The application's DEFAULT runtime uses the
--- in-memory repository (memory.ts) so the system boots with zero external
--- services; this schema is the target for a Postgres deployment and for the
--- reporting/analytics surface. `postgres.ts` provides a Database-port adapter.
+-- REFERENCE MODEL ONLY — NOTHING APPLIES THIS FILE.
+-- The Postgres adapter (postgres.ts) does not read or execute it. A Postgres
+-- deployment runs on per-entity JSONB document tables (`kv_*`: id, doc, seq) that
+-- the adapter creates itself; see `operationalDdl()` for the DDL that actually
+-- runs, and `constraints.ts` for the uniqueness rules that are actually enforced
+-- (as unique indexes on those tables — the UNIQUE/CHECK/NOT NULL/foreign-key
+-- constraints written below are NOT in effect anywhere).
+--
+-- This file is a sketch of a normalized relational model for a future migration
+-- and for reporting. It has drifted from `entities.ts`, which is the source of
+-- truth: several entities have no table here, and some column rules contradict
+-- the entity definitions (for example `prospect_signals.reach NOT NULL DEFAULT 0`,
+-- where the entity uses null to mean "unknown"). Do not treat it as a
+-- description of production, and do not run it against a live database.
 --
 -- Conventions: ids are text (UUIDv4 with prefixes, UUIDv7 for clicks). Money is
 -- integer cents + a 3-letter currency. Every tenant-scoped table carries

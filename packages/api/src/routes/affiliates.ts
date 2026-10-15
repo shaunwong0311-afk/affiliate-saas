@@ -122,8 +122,15 @@ export const affiliateRoutes: RouteModule = (app, ctx) => {
       z.object({
         role: roleEnum.optional(),
         status: relationshipStatusEnum.optional(),
+        // Negotiated terms decide what is paid, so they are bounded like an offer's: a rate is
+        // a share of the base (0.3 = 30%, never above 1 — `rate: 5` used to pay 500%), a flat
+        // amount is whole, non-negative cents.
         commissionTerms: z
-          .object({ rate: z.number().optional(), flatAmountCents: z.number().optional(), note: z.string().optional() })
+          .object({
+            rate: z.number().min(0).max(1, "must be a decimal no greater than 1 — 0.3 means 30%").optional(),
+            flatAmountCents: z.number().int("must be a whole number of cents").min(0).max(Number.MAX_SAFE_INTEGER).optional(),
+            note: z.string().max(2000).optional(),
+          })
           .nullish(),
         tags: z.array(z.string()).optional(),
         ownerUserId: z.string().nullish(),

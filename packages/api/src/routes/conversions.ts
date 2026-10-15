@@ -48,7 +48,9 @@ export const conversionRoutes: RouteModule = (app, ctx) => {
     const id = (request.params as { id: string }).id;
     const conversion = await ctx.db.conversions.get(id);
     if (!conversion || conversion.merchantId !== merchantId) throw notFound("conversion");
-    await approveConversion(ctx, id, ctx.config.defaultHoldDays);
+    // The hold period is the conversion's own program's; only a pending conversion can be
+    // approved (409 otherwise).
+    await approveConversion(ctx, id);
     const updated = await ctx.db.conversions.get(id);
     return ok(reply, updated);
   });
