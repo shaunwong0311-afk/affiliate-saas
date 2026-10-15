@@ -24,10 +24,19 @@ export interface AffiliateNetworkPattern {
   confidence: SignalConfidence;
   /** Hostnames (suffix match) that belong to this network's redirect/links. */
   hosts?: string[];
-  /** Query parameters whose presence signals affiliate tracking. */
+  /**
+   * Query parameters whose presence signals affiliate tracking. On a HOST pattern they
+   * are a REQUIREMENT: the host matches only when one of `params` or `pathContains` is
+   * present (a network's marketing site is not an affiliate link).
+   */
   params?: string[];
-  /** Path fragments that signal affiliate tracking. */
+  /** Path fragments that signal affiliate tracking (a requirement on a host pattern, as above). */
   pathContains?: string[];
+  /**
+   * The host is a tracking-only domain whose BRAND is the subdomain (`acme.pxf.io`): the
+   * bare apex is not a link, any subdomain is.
+   */
+  subdomainOnly?: boolean;
 }
 
 export const AFFILIATE_PATTERNS: AffiliateNetworkPattern[] = [
@@ -37,12 +46,21 @@ export const AFFILIATE_PATTERNS: AffiliateNetworkPattern[] = [
   { network: "Amazon Associates", confidence: "high", hosts: ["amzn.to"] },
   { network: "Amazon Associates", confidence: "high", hosts: ["amazon.com", "amazon.co.uk", "amazon.de"], params: ["tag"] },
   { network: "ShareASale", confidence: "high", hosts: ["shareasale.com"], params: ["u", "m", "afftrack"] },
-  { network: "Impact", confidence: "high", hosts: ["impact.com", "ojrq.net", "7eer.net", "evyy.net"], pathContains: ["/c/"] },
+  // shrsl.com is ShareASale's short-link domain — like amzn.to, the host alone is the signal.
+  { network: "ShareASale", confidence: "high", hosts: ["shrsl.com"] },
+  // Impact's brand tracking domains host nothing but tracking links (both the long
+  // `/c/<partner>/<ad>/<campaign>` form and short vanity links), so any brand subdomain
+  // counts. impact.com itself is the company's marketing site: only a `/c/` path is a link.
+  { network: "Impact", confidence: "high", hosts: ["pxf.io", "sjv.io", "ojrq.net", "7eer.net", "evyy.net"], subdomainOnly: true },
+  { network: "Impact", confidence: "high", hosts: ["impact.com"], pathContains: ["/c/"] },
   { network: "Awin", confidence: "high", hosts: ["awin1.com", "zenaps.com"], params: ["awinmid", "awinaffid"] },
   { network: "CJ Affiliate", confidence: "high", hosts: ["anrdoezrs.net", "dpbolvw.net", "jdoqocy.com", "kqzyfj.com", "tkqlhce.com"] },
   { network: "ClickBank", confidence: "high", hosts: ["hop.clickbank.net"] },
   { network: "Rakuten", confidence: "high", hosts: ["click.linksynergy.com", "linksynergy.com"], params: ["mid", "murl"] },
+  // Partnerize's click domain (`prf.hn/click/camref:…`) — tracking only.
+  { network: "Partnerize", confidence: "high", hosts: ["prf.hn"] },
   { network: "PartnerStack", confidence: "high", hosts: ["partnerstack.com"], pathContains: ["/c/"] },
+  { network: "PartnerStack", confidence: "high", hosts: ["partnerlinks.io"], subdomainOnly: true },
   { network: "Refersion", confidence: "high", hosts: ["refersion.com"], params: ["rfsn"] },
   { network: "FirstPromoter", confidence: "high", params: ["fpr", "fp_ref"] },
   { network: "Rewardful", confidence: "low", params: ["via"] },
@@ -93,8 +111,13 @@ export function detectAffiliateUrl(raw: string): AffiliateSignal[] {
     if (pattern.hosts) {
       const matched = hostMatches(host, pattern.hosts);
       if (matched) {
-        // Some host patterns also require a param (e.g. Amazon needs ?tag=).
-        if (pattern.params && !pattern.params.some((p) => params.has(p.toLowerCase()))) continue;
+        if (pattern.subdomainOnly && host === matched) continue; // the bare tracking apex is not a link
+        // A host pattern that names params and/or path fragments REQUIRES one of them
+        // (Amazon needs ?tag=, impact.com needs /c/) — otherwise every link to a network's
+        // own marketing site would read as a proven affiliate link.
+        const hasParam = pattern.params?.some((p) => params.has(p.toLowerCase())) ?? false;
+        const hasPath = pattern.pathContains?.some((f) => path.includes(f)) ?? false;
+        if ((pattern.params || pattern.pathContains) && !hasParam && !hasPath) continue;
         out.push({ url: raw, network: pattern.network, confidence: pattern.confidence, evidence: `host:${matched}`, targetHost: host });
         continue;
       }
@@ -117,11 +140,28 @@ export function hasProvenAffiliateSignal(signals: AffiliateSignal[]): boolean {
   return signals.some((s) => s.confidence === "high");
 }
 
-/** Extract href URLs from raw HTML and classify each. */
-export function detectAffiliateLinksInHtml(html: string): AffiliateSignal[] {
-  const hrefs = [...html.matchAll(/href\s*=\s*["']([^"']+)["']/gi)].map((m) => m[1]!);
-  const signals = hrefs.flatMap((h) => detectAffiliateUrl(h));
+/**
+ * Extract href URLs from raw HTML and classify each. Pass the page's own URL as
+ * `baseUrl` so relative links (`/go/brand` — the usual shape of a cloaked affiliate
+ * link) come back ABSOLUTE and can be followed; without it they are classified as
+ * found and cannot be resolved.
+ */
+export function detectAffiliateLinksInHtml(html: string, baseUrl?: string | null): AffiliateSignal[] {
+  const base = baseUrl ? safeUrl(baseUrl) : null;
+  const hrefs = [...html.matchAll(/href\s*=\s*["']([^"']+)["']/gi)].map((m) => absolutize(m[1]!, base));
+  const signals = hrefs.flatMap((h) => (h ? detectAffiliateUrl(h) : []));
   return dedupe(signals);
+}
+
+function absolutize(href: string, base: URL | null): string | null {
+  if (/^(mailto:|tel:|javascript:|data:|#)/i.test(href)) return null;
+  if (!base || /^https?:\/\//i.test(href)) return href;
+  try {
+    const u = new URL(href, base);
+    return u.protocol === "http:" || u.protocol === "https:" ? u.toString() : null;
+  } catch {
+    return null;
+  }
 }
 
 /**

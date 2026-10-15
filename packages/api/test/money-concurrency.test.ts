@@ -96,6 +96,7 @@ describe("a failed ingestion leaves nothing behind", () => {
 
   it("emits webhooks only for work that committed", async () => {
     const { ctx, db } = await world({ offer: { payoutValue: 20 } });
+    Object.assign(ctx, { webhookSender: async () => ({ ok: true, status: 200 }) }); // offline: no real delivery
     await db.webhookSubscriptions.insert({ id: "wh1", merchantId: "m1", url: "https://hooks.example.test/in", events: ["conversion.created", "order.unattributed"], secret: "s", status: "active" });
     await expect(sale(ctx, "t1", 10_000)).rejects.toThrow();
     expect(await db.webhookDeliveries.count()).toBe(0);

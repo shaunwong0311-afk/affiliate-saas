@@ -2,6 +2,7 @@ import { newId, competitorHostsFromLinks } from "@affiliate/core";
 import type { FrontierMerchant, Merchant, Prospect } from "@affiliate/db";
 import { extractHrefs, type DiscoveryQuery, type RawCandidate } from "@affiliate/integrations";
 import type { RecruitmentDeps } from "./deps.js";
+import { ingestExclusionsFor } from "./guards.js";
 import { ingestCandidate, buildIdentityIndex } from "./pipeline.js";
 
 /**
@@ -13,6 +14,13 @@ import { ingestCandidate, buildIdentityIndex } from "./pipeline.js";
  * ecosystem. Every step is HARD-CAPPED (seeds, expansions, new seeds, depth, a
  * co-promotion threshold) so it can't run away; the frontier persists across cycles,
  * so it's genuinely continuous.
+ *
+ * WHAT COUNTS AS "ALSO PROMOTES" is deliberately narrow, because each promoted host
+ * becomes a seed that real backlink budget is spent on: only a host the affiliate-
+ * network registry identifies as a merchant (a vanity tracking domain, the destination
+ * of a shared-network link, a network-specific self-hosted marker). A link that merely
+ * carries `?ref=`, `?via=` or sits under `/go/` promotes nothing — twitter.com and
+ * bluehost.com both match those shapes. See `competitorHostsFromLinks`.
  */
 
 export interface FrontierBudget {
@@ -55,8 +63,10 @@ export async function expandFrontier(deps: RecruitmentDeps, merchantId: string, 
   };
   const backlink = deps.discoverySources.find((s) => s.sourceType === "backlink_mining");
   const now = () => deps.clock.now().toISOString();
-  // One identity-key index for the whole expansion so per-candidate ingest is O(1), not O(N).
+  // One identity-key index for the whole expansion so per-candidate ingest is O(1), not O(N);
+  // and the domains to keep away from (competitors' own + the merchant's own), read once.
   const identityIndex = await buildIdentityIndex(deps, merchantId);
+  const exclusions = await ingestExclusionsFor(deps, merchant);
 
   // 1) Seed the frontier with the merchant's competitors (depth 0).
   const existing = await deps.db.frontierMerchants.find((f) => f.merchantId === merchantId);
@@ -91,7 +101,7 @@ export async function expandFrontier(deps: RecruitmentDeps, merchantId: string, 
         cands = [];
       }
       for (const cand of cands) {
-        const p = await ingestCandidate(deps, merchant, cand, { identityIndex });
+        const p = await ingestCandidate(deps, merchant, cand, { identityIndex, exclusions });
         if (p) {
           affiliates.push(p);
           discovered++;
@@ -108,7 +118,9 @@ export async function expandFrontier(deps: RecruitmentDeps, merchantId: string, 
   //    affiliates surfaced it (the MINIMUM across nodes when several promote the same
   //    host, keeping that node as discoveredFrom) — so maxDepth bounds REAL hops and
   //    the Niche Map edge points at the true parent, even on a mixed-depth batch.
-  const exclude = new Set<string>([...known, ...merchant.competitors.map(normDomain)].filter(Boolean));
+  // Never a new seed: what is already on the frontier, the declared competitors, and the
+  // merchant's OWN domains (an affiliate who also promotes the merchant is not pointing at a rival).
+  const exclude = new Set<string>([...known, ...merchant.competitors.map(normDomain), ...exclusions.merchantDomains].filter(Boolean));
   const tally = new Map<string, { count: number; depth: number; discoveredFrom: string }>();
   let expanded = 0;
   for (const { node, affiliates } of minedNodes) {

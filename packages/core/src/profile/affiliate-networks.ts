@@ -13,6 +13,8 @@
  * Pure (URL/string only). Designed to grow: add a NetworkSpec to extend coverage.
  */
 
+import { hostIsOrUnder, isSharedPlatformHost } from "./hosts.js";
+
 export type NetworkKind = "vanity" | "shared" | "self_hosted";
 
 export interface ResolvedProgram {
@@ -24,6 +26,14 @@ export interface ResolvedProgram {
   vanityHost: string | null;
   /** The merchant's own domain, for self_hosted programs. */
   merchantDomain?: string | null;
+  /**
+   * TRUE when a self_hosted program was recognized only by a GENERIC marker param
+   * (Rewardful's `?via=`, which is also Twitter's "via @user" share param and a common
+   * plain tracking tag). Good enough to read a competitor's OWN program page, where the
+   * host is already known to be the merchant — never enough, on an arbitrary host found
+   * in the wild, to call that host a merchant.
+   */
+  genericMarker?: boolean;
 }
 
 /** A backlink query: the domain to pull links for, optionally filtered by `url_to` substring. */
@@ -52,6 +62,8 @@ interface NetworkSpec {
   merchantParamAlts?: string[];
   /** Param markers that identify a self_hosted affiliate link on any domain. */
   selfHostedParams?: string[];
+  /** The marker param is a common word, not a network-specific name (see `genericMarker`). */
+  genericMarker?: boolean;
   /** Custom extractor for networks whose id lives in the path/subdomain. */
   extract?: (u: URL) => { merchantId?: string | null; vanityHost?: string | null } | null;
 }
@@ -71,6 +83,15 @@ const NETWORKS: NetworkSpec[] = [
     kind: "shared",
     hosts: ["anrdoezrs.net", "dpbolvw.net", "jdoqocy.com", "kqzyfj.com", "tkqlhce.com", "qksrv.net", "emjcd.com", "ftjcfx.com", "lduhtrp.net"],
     merchantParam: "aid",
+    // UNVALIDATED against live CJ links (AUDIT-2026-10 D16). Two assumptions here are
+    // most likely wrong on a first real run:
+    //  1. In the legacy path form `/click-<PID>-<AID>` the second number is CJ's LINK
+    //     ("ad") id — one advertiser has many — not a stable advertiser/merchant id.
+    //  2. `backlinkTargetsFor` turns this into a query filter `aid=<id>` plus an exact
+    //     `?aid=` param check, which a path-style link can never satisfy, so path-style
+    //     rows are dropped by BacklinkDiscoverySource rather than mis-attributed.
+    // Net effect today: CJ programs resolve, but mining them returns nothing. That is
+    // an honest empty, not a wrong answer; fix only with real CJ rows in hand.
     extract: (u) => {
       const aid = u.searchParams.get("aid");
       if (aid) return { merchantId: aid };
@@ -95,7 +116,7 @@ const NETWORKS: NetworkSpec[] = [
   },
 
   // ---- Self-hosted (affiliate link on the merchant's own domain) -------------
-  { name: "Rewardful", kind: "self_hosted", selfHostedParams: ["via"] },
+  { name: "Rewardful", kind: "self_hosted", selfHostedParams: ["via"], genericMarker: true },
   { name: "Refersion", kind: "self_hosted", selfHostedParams: ["rfsn"] },
   { name: "FirstPromoter", kind: "self_hosted", selfHostedParams: ["fpr", "fp_ref"] },
   { name: "PartnerStack (self-serve)", kind: "self_hosted", selfHostedParams: ["ps_partner_key", "gr_pk"] },
@@ -134,10 +155,20 @@ export function identifyProgram(rawUrl: string): ResolvedProgram | null {
       return { network: spec.name, kind: spec.kind, merchantId: merchantId ?? null, vanityHost: ex?.vanityHost ?? null };
     }
   }
-  // self_hosted: any host carrying a known marker param.
-  for (const spec of NETWORKS) {
-    if (spec.kind === "self_hosted" && spec.selfHostedParams?.some((p) => u.searchParams.has(p))) {
-      return { network: spec.name, kind: "self_hosted", merchantId: null, vanityHost: null, merchantDomain: host };
+  // self_hosted: any host carrying a known marker param. Network-specific markers
+  // (`rfsn`, `fpr`, …) are tried before the generic one (`via`), so a link carrying both
+  // is identified by the stronger evidence.
+  const selfHosted = NETWORKS.filter((s) => s.kind === "self_hosted");
+  for (const spec of [...selfHosted.filter((s) => !s.genericMarker), ...selfHosted.filter((s) => s.genericMarker)]) {
+    if (spec.selfHostedParams?.some((p) => u.searchParams.has(p))) {
+      return {
+        network: spec.name,
+        kind: "self_hosted",
+        merchantId: null,
+        vanityHost: null,
+        merchantDomain: host,
+        ...(spec.genericMarker ? { genericMarker: true } : {}),
+      };
     }
   }
   return null;
@@ -169,51 +200,6 @@ export function backlinkTargetsFor(program: ResolvedProgram, competitorDomain?: 
   return [];
 }
 
-/**
- * Parse a MANUAL override into a program. Forgiving: accepts a pasted affiliate /
- * join link (best — we extract it), a "Network id" pair ("ShareASale 56789",
- * "awin:12345"), or a bare vanity domain ("acme.pxf.io").
- */
-export function parseProgramInput(text: string, competitorDomain?: string): ResolvedProgram | null {
-  const t = text.trim();
-  if (!t) return null;
-
-  // 1) A pasted URL / domain → extract directly.
-  if (/^https?:\/\//i.test(t) || /^[a-z0-9-]+(\.[a-z0-9-]+)+(\/|$)/i.test(t)) {
-    const byUrl = identifyProgram(t);
-    if (byUrl) return byUrl;
-  }
-
-  // 2) "Network id" / "network:id".
-  const m = t.match(/^(.+?)[\s:]+([\w.-]+)$/);
-  if (m) {
-    const netName = m[1]!.trim().toLowerCase().replace(/[^a-z]/g, "");
-    const id = m[2]!.trim();
-    const spec = NETWORKS.find((s) => {
-      const key = s.name.toLowerCase().replace(/[^a-z]/g, "");
-      return key.startsWith(netName) || netName.startsWith(key.split(" ")[0]!);
-    });
-    if (spec) {
-      if (spec.kind === "vanity") return { network: spec.name, kind: "vanity", merchantId: null, vanityHost: id.includes(".") ? id.toLowerCase() : null };
-      if (spec.kind === "self_hosted") return { network: spec.name, kind: "self_hosted", merchantId: null, vanityHost: null, merchantDomain: competitorDomain ?? id };
-      return { network: spec.name, kind: "shared", merchantId: id, vanityHost: null };
-    }
-  }
-  return null;
-}
-
-/** The networks we recognize, for UI hints / docs. */
-export function knownNetworks(): { name: string; kind: NetworkKind }[] {
-  return NETWORKS.map((s) => ({ name: s.name, kind: s.kind }));
-}
-
-// Ubiquitous retailers everyone promotes — never a "competitor" worth mining.
-const MEGA_RETAILERS = [
-  "amazon.com", "amzn.to", "ebay.com", "walmart.com", "target.com", "etsy.com", "aliexpress.com",
-  "bestbuy.com", "wayfair.com", "apple.com", "google.com", "play.google.com", "microsoft.com",
-  "paypal.com", "shopify.com", "gumroad.com", "patreon.com",
-];
-
 // Only SHARED click hosts (shareasale.com, awin1.com…) — NOT vanity suffixes, since a
 // vanity host (acme.pxf.io) IS the brand and is itself a mineable merchant.
 function isNetworkClickHost(host: string): boolean {
@@ -222,42 +208,50 @@ function isNetworkClickHost(host: string): boolean {
 
 /**
  * From the affiliate links found on a creator's page, the OTHER merchant hosts they
- * promote — the recursive-discovery expansion signal. Returns mineable hosts: a
- * vanity affiliate domain (`acme.pxf.io`), a self-hosted merchant domain (`brand.com`
- * via `?via=`), or a direct merchant domain carrying any affiliate marker. Network
- * click hosts, mega-retailers, and `exclude`d hosts (your merchant + known
- * competitors) are filtered out. Shared-network links (no clean domain) are skipped.
+ * promote — the recursive-discovery expansion signal, i.e. what the frontier will
+ * spend backlink budget mining next. A host qualifies ONLY when the network registry
+ * identifies it (see {@link merchantDomainFromLink}); generic `?ref=` / `?via=` /
+ * `/go/` shapes never do, because nearly every share button, shortener and product
+ * link on the web carries one. Network click hosts, shared platforms (social,
+ * marketplaces, shorteners, search) and `exclude`d hosts — your own domains and known
+ * competitors, including their subdomains — are filtered out.
  */
 export function competitorHostsFromLinks(links: string[], exclude: Iterable<string> = []): string[] {
-  const skip = new Set([...exclude].map((d) => d.toLowerCase().replace(/^www\./, "")));
+  const skip = [...exclude].map((d) => d.toLowerCase().replace(/^www\./, "")).filter(Boolean);
   const out = new Set<string>();
   for (const raw of links) {
-    let merchant = merchantDomainFromLink(raw);
-    if (!merchant) continue;
-    merchant = merchant.toLowerCase().replace(/^www\./, "");
-    if (skip.has(merchant) || isNetworkClickHost(merchant)) continue;
-    if (MEGA_RETAILERS.some((m) => merchant === m || merchant!.endsWith(`.${m}`))) continue;
+    const found = merchantDomainFromLink(raw);
+    if (!found) continue;
+    const merchant = found.toLowerCase().replace(/^www\./, "");
+    if (skip.some((s) => hostIsOrUnder(merchant, s))) continue;
+    if (isNetworkClickHost(merchant) || isSharedPlatformHost(merchant)) continue;
     out.add(merchant);
   }
   return [...out];
 }
 
 /**
- * The merchant brand DOMAIN an affiliate link points at: a vanity host
- * (`acme.pxf.io`), a self-hosted domain (`brand.com` via `?via=`), a direct merchant
- * domain (affiliate marker present), or — for a SHARED network — the destination
- * encoded in the link's params (`shareasale.com/...&urllink=https://brand.com`,
- * Rakuten `murl`, Awin `ued`). Returns null when no brand domain is recoverable
- * (then the caller can fall back to following the redirect).
+ * The merchant brand DOMAIN an affiliate link provably points at, per the network
+ * registry:
+ *  - a vanity host — `acme.pxf.io` IS the brand's tracking domain;
+ *  - a SHARED-network link whose destination is spelled out in its params
+ *    (`shareasale.com/…&urllink=https://brand.com`, Rakuten `murl`, Awin `ued`);
+ *  - a self-hosted program link carrying a NETWORK-SPECIFIC marker (`?rfsn=`, `?fpr=`,
+ *    `?ps_partner_key=`) — the host is the merchant's own.
+ * Returns null for everything else, on purpose: a generic `?ref=`, `?aff=`, `?via=` or
+ * `/go/` path is a LOW-confidence shape (see affiliate-detection.ts) that says nothing
+ * reliable about who the host is — `twitter.com/intent/tweet?via=…` and
+ * `bluehost.com/go/…` both match. A shared-network link with no recoverable destination
+ * also returns null (it would need its redirect followed).
  */
 export function merchantDomainFromLink(rawUrl: string): string | null {
   const u = parseUrl(rawUrl);
   if (!u) return null;
   const prog = identifyProgram(rawUrl);
-  if (prog?.kind === "vanity" && prog.vanityHost) return prog.vanityHost;
-  if (prog?.kind === "self_hosted" && prog.merchantDomain) return prog.merchantDomain;
-  if (prog?.kind === "shared") return destinationHostFromParams(u); // resolve via the dest param
-  if (!prog && !isNetworkClickHost(hostOf(u)) && hasAffiliateMarker(u)) return hostOf(u);
+  if (!prog) return null;
+  if (prog.kind === "vanity") return prog.vanityHost ?? null;
+  if (prog.kind === "shared") return destinationHostFromParams(u); // resolve via the dest param
+  if (prog.kind === "self_hosted" && !prog.genericMarker) return prog.merchantDomain ?? null;
   return null;
 }
 
@@ -281,11 +275,4 @@ function destinationHostFromParams(u: URL): string | null {
     }
   }
   return null;
-}
-
-// A direct link is "affiliate-ish" if it carries a tracking param or affiliate path.
-function hasAffiliateMarker(u: URL): boolean {
-  const params = new Set([...u.searchParams.keys()].map((k) => k.toLowerCase()));
-  if (["ref", "aff", "affiliate", "aff_id", "referral", "partner", "via", "rfsn", "fpr"].some((p) => params.has(p))) return true;
-  return /\/(aff|affiliate|ref|go|recommends?)\//i.test(u.pathname);
 }

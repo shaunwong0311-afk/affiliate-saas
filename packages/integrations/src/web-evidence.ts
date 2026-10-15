@@ -1,4 +1,6 @@
+import { BIO_AGGREGATOR_HOSTS, isSharedPlatformHost } from "@affiliate/core";
 import type { RedirectResolver, EmailVerifier } from "./ports.js";
+import { guardedFetch } from "./net-guard.js";
 
 /**
  * Real, network-backed evidence helpers (Section 8.1/8.2). These are NOT stubs:
@@ -7,24 +9,32 @@ import type { RedirectResolver, EmailVerifier } from "./ports.js";
  * null / not-deliverable) rather than inventing a positive result.
  */
 
-/** Follows redirects to confirm where a generic affiliate link (`?ref=`, `?via=`) lands. */
+/** Something that can follow a URL's redirects and report where it ends (see `ProxyHttpFetcher.follow`). */
+export interface RedirectFollower {
+  follow(url: string): Promise<{ status: number; finalUrl: string }>;
+}
+
+/**
+ * Follows redirects to confirm where a generic affiliate link (`?ref=`, `?via=`) lands.
+ * The links it is given come straight off scraped pages, so it never fetches on its
+ * own terms: pass the page fetcher as `via` and resolution uses the SAME guarded,
+ * proxied path as every page fetch (public destinations only, each hop re-checked, no
+ * direct connection when a proxy is required). Without `via` it still goes through the
+ * outbound guard, directly. It does not download the landing page.
+ */
 export class FetchRedirectResolver implements RedirectResolver {
   readonly kind = "fetch";
-  constructor(private readonly opts: { timeoutMs?: number } = {}) {}
+  constructor(private readonly opts: { timeoutMs?: number; via?: RedirectFollower } = {}) {}
 
   async resolve(url: string): Promise<{ finalUrl: string; finalHost: string } | null> {
-    const controller = new AbortController();
-    const t = setTimeout(() => controller.abort(), this.opts.timeoutMs ?? 8000);
     try {
-      // GET with redirect:follow — fetch exposes the FINAL url on res.url.
-      const res = await fetch(url, { redirect: "follow", signal: controller.signal, headers: { "User-Agent": "VantageBot/1.0" } });
-      const finalUrl = res.url || url;
+      const finalUrl = this.opts.via
+        ? (await this.opts.via.follow(url)).finalUrl
+        : (await guardedFetch(url, { discardBody: true, timeoutMs: this.opts.timeoutMs ?? 8000, headers: { "User-Agent": "VantageBot/1.0" } })).url;
       const finalHost = new URL(finalUrl).hostname.replace(/^www\./, "");
-      return { finalUrl, finalHost };
+      return finalHost ? { finalUrl, finalHost } : null;
     } catch {
-      return null;
-    } finally {
-      clearTimeout(t);
+      return null; // blocked, timed out or unreachable — never guess a destination
     }
   }
 }
@@ -42,6 +52,7 @@ export class MxEmailVerifier implements EmailVerifier {
     const domain = email.split("@")[1]?.toLowerCase();
     if (!domain || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return { deliverable: false, reason: "malformed address" };
     if (this.cache.has(domain)) return { deliverable: this.cache.get(domain)!, reason: "mx (cached)" };
+    if (this.cache.size >= 5000) this.cache.clear(); // bounded: a long-lived worker sees unbounded domains
     try {
       const dns = await import("node:dns/promises");
       let hasMail = false;
@@ -65,35 +76,35 @@ export class MxEmailVerifier implements EmailVerifier {
   }
 }
 
-/** A verifier for environments with no real DNS — used only in dev/test. */
-export class NoopEmailVerifier implements EmailVerifier {
-  readonly kind = "noop";
-  async verify(): Promise<{ deliverable: boolean; reason: string }> {
-    return { deliverable: false, reason: "no verifier configured" };
-  }
-}
-
 const EMAIL_RE = /[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/gi;
 
 /**
- * Obfuscated-email pattern: `local <at> domain <dot> tld`, where <at> is a bracketed
- * word (`[at]`, `(at)`), a bare UPPERCASE word (`AT` — the deliberate-obfuscation
- * signal), or spaced punctuation (` @ `); and <dot> is any of those forms OR a plain
- * literal `.` adjacent to the TLD. The literal-dot alternative catches the most common
- * SINGLE-obfuscation form — `john [at] gmail.com` — where only the at-part is disguised.
- * The bare-word AT/DOT forms stay UPPERCASE-only so prose like "look at the dot-com era"
- * (lowercase) never matches; the literal dot is safe because it can only fire AFTER a
- * valid at-separator has matched (which lowercase prose "at" won't satisfy). The domain
- * group is greedy so multi-part domains (`sub.example DOT com`) reconstruct correctly.
+ * Obfuscated-email patterns: `local <at> domain <dot> tld`. Two shapes, kept SEPARATE
+ * because how strong the at-separator is decides how loose the dot may be:
+ *
+ *  1. A DELIBERATE at-separator — a bracketed word (`[at]`, `(at)`) or a bare UPPERCASE
+ *     word (`AT`). Nobody writes those by accident, so the dot may be any form including
+ *     a plain literal `.` — this catches the common single obfuscation `john [at]
+ *     gmail.com`. The bare-word AT/DOT forms stay UPPERCASE-only so prose like "look at
+ *     the dot-com era" never matches.
+ *  2. A SPACED `@` (`hello @ brandsite . com`). A spaced `@` on its own is ordinary
+ *     prose — "Follow me @ instagram.com/jane" — so here the dot must ALSO be disguised
+ *     (bracketed, `DOT`, or spaced). With a literal dot this shape used to yield
+ *     `me@instagram.com`.
+ *
+ * The domain group is greedy so multi-part domains (`sub.example DOT com`) reconstruct
+ * correctly. Whatever matches is still dropped if it is followed by a URL path or sits
+ * at a shared platform's domain (see {@link extractEmailsFromHtml}).
  */
-const OBFUSCATED_RE = new RegExp(
-  String.raw`([a-zA-Z0-9._%+-]+)` +
-    String.raw`(?:\s*[\[\(\{]\s*[aA][tT]\s*[\]\)\}]\s*|\s+AT\s+|\s+@\s+)` +
-    String.raw`([a-zA-Z0-9.-]+)` +
-    String.raw`(?:\s*[\[\(\{]\s*[dD][oO][tT]\s*[\]\)\}]\s*|\s+DOT\s+|\s+\.\s+|\.)` +
-    String.raw`([a-zA-Z]{2,})`,
+const LOCAL = String.raw`([a-zA-Z0-9._%+-]+)`;
+const DOMAIN = String.raw`([a-zA-Z0-9.-]+)`;
+const TLD = String.raw`([a-zA-Z]{2,})`;
+const DOT_DISGUISED = String.raw`\s*[\[\(\{]\s*[dD][oO][tT]\s*[\]\)\}]\s*|\s+DOT\s+|\s+\.\s+`;
+const OBFUSCATED_DELIBERATE_AT_RE = new RegExp(
+  LOCAL + String.raw`(?:\s*[\[\(\{]\s*[aA][tT]\s*[\]\)\}]\s*|\s+AT\s+)` + DOMAIN + `(?:${DOT_DISGUISED}|\\.)` + TLD,
   "g",
 );
+const OBFUSCATED_SPACED_AT_RE = new RegExp(LOCAL + String.raw`\s+@\s+` + DOMAIN + `(?:${DOT_DISGUISED})` + TLD, "g");
 
 export type EmailSource = "mailto" | "page" | "obfuscated" | "cfemail";
 
@@ -129,7 +140,17 @@ export function extractEmailsFromHtml(html: string): { email: string; source: Em
   // 2) mailto: links (highest intent). 3) visible addresses. 4) obfuscations.
   for (const m of text.matchAll(/mailto:([^"'?>\s]+)/gi)) add(m[1]!, "mailto");
   for (const m of text.matchAll(EMAIL_RE)) add(m[0], "page");
-  for (const m of text.matchAll(OBFUSCATED_RE)) add(`${m[1]}@${m[2]}.${m[3]}`, "obfuscated");
+  for (const re of [OBFUSCATED_DELIBERATE_AT_RE, OBFUSCATED_SPACED_AT_RE]) {
+    for (const m of text.matchAll(re)) {
+      // A reconstructed "address" that runs straight into a path (`…instagram.com/jane`)
+      // is a URL someone wrote in a sentence, and nobody's mailbox is at a social
+      // platform's own domain — both are prose, not obfuscated contact details.
+      if (text[m.index! + m[0].length] === "/") continue;
+      const domain = `${m[2]}.${m[3]}`.replace(/\s+/g, "").toLowerCase();
+      if (isSharedPlatformHost(domain)) continue;
+      add(`${m[1]}@${m[2]}.${m[3]}`, "obfuscated");
+    }
+  }
 
   return out;
 }
@@ -176,11 +197,7 @@ function isPlausibleEmail(e: string): boolean {
 // stage can fetch them and run the same real extraction — more free, real emails
 // before paying a finder.
 
-const BIO_HOSTS = [
-  "linktr.ee", "beacons.ai", "bio.link", "solo.to", "lnk.bio", "carrd.co", "tap.bio",
-  "withkoji.com", "koji.to", "msha.ke", "linkpop.com", "komi.io", "snipfeed.co",
-  "stan.store", "flowcode.com", "shor.by", "campsite.bio", "many.link", "pillar.io",
-];
+const BIO_HOSTS = BIO_AGGREGATOR_HOSTS; // one list, shared with the identity graph
 const CONTACT_PATH_RE = /\/(contact|about|work-with-me|collaborat|sponsor|advertis|partnership|press|media-?kit|pr-?inquir|business)/i;
 
 export type ContactUrlKind = "bio_aggregator" | "contact_page" | "youtube_about";

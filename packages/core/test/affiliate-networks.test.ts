@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { identifyProgram, backlinkTargetsFor, parseProgramInput, competitorHostsFromLinks, merchantDomainFromLink } from "../src/index.js";
+import { identifyProgram, backlinkTargetsFor, competitorHostsFromLinks, merchantDomainFromLink } from "../src/index.js";
 
 describe("identifyProgram — extracts network + merchant from an affiliate link", () => {
   it("ShareASale (m= param)", () => {
@@ -76,48 +76,64 @@ describe("backlinkTargetsFor — turns a program into backlink queries", () => {
   });
 });
 
-describe("parseProgramInput — forgiving manual entry", () => {
-  it("accepts a pasted affiliate / join link", () => {
-    expect(parseProgramInput("https://shareasale.com/shareasale.cfm?merchantID=56789")).toMatchObject({ network: "ShareASale", merchantId: "56789" });
+describe("identifyProgram — a generic marker is flagged as generic", () => {
+  it("marks ?via= (Rewardful) as a generic marker; network-specific markers are not", () => {
+    // `via` is also Twitter's "via @user" share param and an ordinary tracking tag.
+    expect(identifyProgram("https://acme.com/pricing?via=joe")).toMatchObject({ network: "Rewardful", genericMarker: true });
+    expect(identifyProgram("https://acme.com/?fpr=joe")?.genericMarker).toBeUndefined();
+    expect(identifyProgram("https://acme.com/?rfsn=1.abc")?.genericMarker).toBeUndefined();
   });
 
-  it("accepts a bare vanity domain", () => {
-    expect(parseProgramInput("acme.pxf.io")).toMatchObject({ network: "Impact", kind: "vanity", vanityHost: "acme.pxf.io" });
-  });
-
-  it("accepts 'Network id' and 'network:id' (case / spacing insensitive)", () => {
-    expect(parseProgramInput("ShareASale 56789")).toMatchObject({ network: "ShareASale", merchantId: "56789" });
-    expect(parseProgramInput("awin:12345")).toMatchObject({ network: "Awin", merchantId: "12345" });
-    expect(parseProgramInput("rakuten 38000")).toMatchObject({ network: "Rakuten Advertising", merchantId: "38000" });
-  });
-
-  it("returns null for unrecognized input", () => {
-    expect(parseProgramInput("")).toBeNull();
-    expect(parseProgramInput("just some text")).toBeNull();
+  it("prefers the network-specific marker when a link carries both", () => {
+    expect(identifyProgram("https://acme.com/?via=joe&fpr=joe")).toMatchObject({ network: "FirstPromoter" });
   });
 });
 
 describe("competitorHostsFromLinks — recursive expansion signal", () => {
-  it("extracts other merchant hosts, skipping networks / mega-retailers / non-affiliate links", () => {
+  it("promotes only hosts the network registry identifies as a merchant", () => {
     const hosts = competitorHostsFromLinks(
       [
-        "https://acme.pxf.io/c/1/2", // vanity → mineable
-        "https://brandb.com/buy?ref=joe", // direct affiliate marker → mineable
-        "https://rival.com/?via=joe", // self-hosted (Rewardful) → mineable
-        "https://shareasale.com/r.cfm?m=222", // shared network → no clean domain, skip
-        "https://amzn.to/3x?tag=joe-20", // mega-retailer → skip
+        "https://acme.pxf.io/c/1/2", // vanity tracking domain → the brand itself
+        "https://shareasale.com/r.cfm?m=222&u=joe&urllink=https%3A%2F%2Fbrandb.com%2F", // shared network, destination spelled out
+        "https://brandc.com/?fpr=joe", // network-specific self-hosted marker (FirstPromoter)
+        "https://shareasale.com/r.cfm?m=222", // shared network, no recoverable destination → skip
+        "https://amzn.to/3x?tag=joe-20", // retailer → skip
         "https://news.com/article", // no affiliate marker → skip
       ],
       ["mycompany.com"],
     );
-    expect(hosts).toEqual(expect.arrayContaining(["acme.pxf.io", "brandb.com", "rival.com"]));
-    expect(hosts).not.toContain("shareasale.com");
-    expect(hosts).not.toContain("amzn.to");
-    expect(hosts).not.toContain("news.com");
+    expect(hosts.sort()).toEqual(["acme.pxf.io", "brandb.com", "brandc.com"]);
   });
 
-  it("respects the exclude set (your merchant + known competitors)", () => {
-    expect(competitorHostsFromLinks(["https://known.com/buy?ref=x"], ["known.com"])).toEqual([]);
+  it("NEVER promotes a host on a generic ?ref= / ?via= / /go/ shape (AUDIT-2026-10 D7)", () => {
+    // Every one of these matched before, and each became a seed the frontier went on to
+    // backlink-mine: a share button, a hosting company, a blog's own outbound redirect.
+    const hosts = competitorHostsFromLinks([
+      "https://twitter.com/intent/tweet?text=hi&via=someblog",
+      "https://www.bluehost.com/go/deal",
+      "https://brandb.com/buy?ref=joe",
+      "https://rival.com/?via=joe",
+      "https://someshop.com/aff/123",
+      "https://another.com/?affiliate=9",
+    ]);
+    expect(hosts).toEqual([]);
+    expect(merchantDomainFromLink("https://brandb.com/buy?ref=joe")).toBeNull();
+    expect(merchantDomainFromLink("https://rival.com/?via=joe")).toBeNull();
+  });
+
+  it("never promotes a social network, a marketplace or a shortener even when a link names it", () => {
+    const hosts = competitorHostsFromLinks([
+      "https://shareasale.com/r.cfm?m=1&urllink=https%3A%2F%2Fwww.instagram.com%2Fbrand",
+      "https://shareasale.com/r.cfm?m=1&urllink=https%3A%2F%2Fwww.amazon.co.uk%2Fdp%2FX",
+      "https://shareasale.com/r.cfm?m=1&urllink=https%3A%2F%2Fbit.ly%2Fabc",
+      "https://youtube.com/watch?v=1&fpr=joe",
+    ]);
+    expect(hosts).toEqual([]);
+  });
+
+  it("respects the exclude set — your own domains and known competitors, subdomains included", () => {
+    expect(competitorHostsFromLinks(["https://known.com/?fpr=x"], ["known.com"])).toEqual([]);
+    expect(competitorHostsFromLinks(["https://shop.known.com/?fpr=x"], ["known.com"])).toEqual([]);
   });
 });
 

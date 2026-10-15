@@ -1,13 +1,82 @@
 import { createHmac } from "node:crypto";
 import { newId } from "@affiliate/core";
+import { guardedFetch, unsafeUrlReason, UnsafeUrlError, type GuardPolicy } from "@affiliate/integrations";
 import type { AppContext } from "../context.js";
 
 /**
  * Outbound webhooks on key events (Section 9). Deliveries are recorded with
- * attempts/last_error for the delivery-log UX; a worker retries failures. In dev
- * we attempt delivery via fetch when a real URL is configured, otherwise just
- * record. The signature lets the receiver verify authenticity.
+ * attempts/last_error for the delivery-log UX. The signature lets the receiver verify
+ * authenticity.
+ *
+ * A webhook target is a URL a TENANT typed in, and the server will POST to it — so every
+ * delivery goes through the outbound guard (`guardedFetch`): the host is resolved and
+ * must be a public address, redirects are NOT followed, and the request has a deadline.
+ * Nothing is ever recorded as delivered without a 2xx answer from the receiver.
  */
+
+/** One delivery attempt, as the delivery log needs to know it. */
+export interface WebhookSendResult {
+  ok: boolean;
+  /** Recorded as `lastError` when not ok. */
+  error?: string;
+}
+
+/** Performs one delivery attempt. The default is the guarded network send. */
+export type WebhookSender = (request: { url: string; body: string; headers: Record<string, string> }) => Promise<WebhookSendResult>;
+
+const DELIVERY_TIMEOUT_MS = 10_000;
+
+/**
+ * Build the guarded network sender: a POST that never follows a redirect (a receiver
+ * answering 3xx is a failed delivery — following it would let a public URL bounce the
+ * signed payload somewhere else) and reads at most a little of the reply. `policy` is
+ * the outbound guard's test seam (DNS + which addresses count as public); production
+ * uses the defaults.
+ */
+export function createWebhookSender(policy: GuardPolicy & { timeoutMs?: number } = {}): WebhookSender {
+  return async ({ url, body, headers }) => {
+    try {
+      const res = await guardedFetch(url, {
+        method: "POST",
+        headers,
+        body,
+        maxRedirects: 0,
+        timeoutMs: policy.timeoutMs ?? DELIVERY_TIMEOUT_MS,
+        maxBodyBytes: 16_384,
+        lookup: policy.lookup,
+        isAllowedAddress: policy.isAllowedAddress,
+      });
+      if (res.status >= 200 && res.status < 300) return { ok: true };
+      const redirected = res.status >= 300 && res.status < 400 ? " (redirects are not followed)" : "";
+      return { ok: false, error: `HTTP ${res.status}${redirected}` };
+    } catch (err) {
+      if (err instanceof UnsafeUrlError) return { ok: false, error: `blocked: ${err.reason}` };
+      return { ok: false, error: (err as Error)?.message ?? String(err) };
+    }
+  };
+}
+
+/** The real sender, with the production guard. */
+export const sendWebhook: WebhookSender = createWebhookSender();
+
+// In-flight deliveries. emitWebhook does not make its caller wait on a third party's
+// server; this lets tests (and a graceful shutdown) wait for what is still out.
+const inflight = new Set<Promise<void>>();
+
+/** Resolve once every delivery started so far has been recorded. */
+export async function flushWebhookDeliveries(): Promise<void> {
+  while (inflight.size) await Promise.all([...inflight]);
+}
+
+/**
+ * The sender for a context. Tests inject one by putting a `webhookSender` on the context
+ * object (`Object.assign(ctx, { webhookSender })`) — there is no URL that is "delivered"
+ * without being sent.
+ */
+function senderFor(ctx: AppContext): WebhookSender {
+  return (ctx as AppContext & { webhookSender?: WebhookSender }).webhookSender ?? sendWebhook;
+}
+
 export async function emitWebhook(
   ctx: AppContext,
   merchantId: string,
@@ -31,60 +100,37 @@ export async function emitWebhook(
       ts: ctx.clock.now().toISOString(),
     };
     await ctx.db.webhookDeliveries.insert(delivery);
-    void deliver(ctx, delivery.id, sub.url, body, signature);
+    const task = deliver(ctx, delivery.id, sub.url, body, signature).finally(() => inflight.delete(task));
+    inflight.add(task);
   }
 }
 
 /**
- * SSRF guard: outbound webhooks must target public HTTP(S) endpoints only — never
- * localhost, link-local, cloud metadata, or private ranges. (Hostname-literal
- * screening; a hardened deployment also pins the resolved IP.)
+ * Cheap, synchronous screen for a webhook URL as the tenant types it: http(s), no
+ * embedded credentials, and not localhost / an internal name / a private, link-local or
+ * metadata IP — in ANY spelling (`http://2130706433/`, `http://[::ffff:127.0.0.1]/`).
+ * It does not resolve DNS, so it is a courtesy at creation time, NOT the protection: a
+ * public-looking name that points at a private address is refused when the delivery is
+ * attempted, where the guard resolves it.
  */
 export function isPublicWebhookUrl(raw: string): boolean {
-  let u: URL;
-  try {
-    u = new URL(raw);
-  } catch {
-    return false;
-  }
-  if (u.protocol !== "https:" && u.protocol !== "http:") return false;
-  const host = u.hostname.toLowerCase();
-  if (host === "localhost" || host.endsWith(".local") || host.endsWith(".internal")) return false;
-  // IPv4 literal in a private / link-local / loopback range.
-  const m = host.match(/^(\d+)\.(\d+)\.(\d+)\.(\d+)$/);
-  if (m) {
-    const [a, b] = [Number(m[1]), Number(m[2])];
-    if (a === 127 || a === 10 || a === 0 || (a === 169 && b === 254) || (a === 192 && b === 168) || (a === 172 && b >= 16 && b <= 31)) return false;
-  }
-  if (host === "::1" || host.startsWith("fe80") || host.startsWith("fc") || host.startsWith("fd")) return false;
-  return true;
+  return unsafeUrlReason(raw) === null;
 }
 
 async function deliver(ctx: AppContext, deliveryId: string, url: string, body: string, signature: string): Promise<void> {
+  let result: WebhookSendResult;
   try {
-    if (url.includes("example.")) {
-      await ctx.db.webhookDeliveries.update(deliveryId, { status: "delivered", attempts: 1 });
-      return;
-    }
-    if (!isPublicWebhookUrl(url)) {
-      await ctx.db.webhookDeliveries.update(deliveryId, { status: "failed", attempts: 1, lastError: "blocked: non-public webhook target" });
-      return;
-    }
-    const res = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "X-Affiliate-Signature": signature },
-      body,
-    });
-    await ctx.db.webhookDeliveries.update(deliveryId, {
-      status: res.ok ? "delivered" : "failed",
-      attempts: 1,
-      lastError: res.ok ? null : `HTTP ${res.status}`,
-    });
+    result = await senderFor(ctx)({ url, body, headers: { "Content-Type": "application/json", "X-Affiliate-Signature": signature } });
   } catch (err) {
+    result = { ok: false, error: (err as Error)?.message ?? String(err) };
+  }
+  try {
     await ctx.db.webhookDeliveries.update(deliveryId, {
-      status: "failed",
+      status: result.ok ? "delivered" : "failed",
       attempts: 1,
-      lastError: (err as Error).message,
+      lastError: result.ok ? null : (result.error ?? "delivery failed"),
     });
+  } catch {
+    /* the delivery row is gone (store reset) — nothing left to record */
   }
 }

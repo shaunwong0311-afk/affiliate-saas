@@ -19,7 +19,7 @@ export {
   type SmtpTransportFactory,
   type MailboxCredentials,
 } from "./mailbox.js";
-export { StubEmailFinder, HunterFinder } from "./enrichment.js";
+export { StubEmailFinder, NullEmailFinder, HunterFinder } from "./enrichment.js";
 export {
   CompetitorAffiliateSource,
   CreatorDiscoverySource,
@@ -29,15 +29,34 @@ export {
 export {
   FetchRedirectResolver,
   MxEmailVerifier,
-  NoopEmailVerifier,
   extractEmailsFromHtml,
   extractHrefs,
   discoverContactUrls,
   detectsContactForm,
+  type RedirectFollower,
   type EmailSource,
   type ContactUrl,
   type ContactUrlKind,
 } from "./web-evidence.js";
+export {
+  guardedFetch,
+  assertPublicUrl,
+  assertPublicHost,
+  unsafeUrlReason,
+  isPublicIp,
+  ipBlockReason,
+  directTransport,
+  UnsafeUrlError,
+  GuardedFetchError,
+  type GuardPolicy,
+  type GuardedFetchOptions,
+  type GuardedResponse,
+  type GuardedTransport,
+  type HopRequest,
+  type HopResponse,
+  type AddressInfo,
+  type LookupFn,
+} from "./net-guard.js";
 export {
   YouTubeEnricher,
   ScrapeMetricsEnricher,

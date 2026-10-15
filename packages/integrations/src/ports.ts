@@ -156,6 +156,20 @@ export interface EmailCandidate {
 
 export interface EmailFinder {
   readonly name: string;
+  /**
+   * TRUE for a finder that FABRICATES plausible addresses instead of looking them up
+   * (the deterministic demo stub). The pipeline lets such a finder run only for
+   * synthetic (demo) prospects, never marks its output verified, and never lets it
+   * stand in as a verifier for a real prospect. Real finders leave this unset.
+   */
+  readonly guesses?: boolean;
+  /**
+   * FALSE when this finder cannot check deliverability at all (the "no finder
+   * configured" placeholder): its `verify` always says no, so it must not be consulted
+   * as the mailbox-level check — otherwise every address found on a page would be
+   * refused. Omitted = `verify` is a real check (Hunter).
+   */
+  readonly verifies?: boolean;
   find(input: { fullName?: string; domain?: string; siteUrl?: string }): Promise<EmailCandidate[]>;
   verify(email: string): Promise<{ deliverable: boolean; reason: string }>;
 }
@@ -168,6 +182,30 @@ export interface DiscoveryQuery {
   keywords: string[];
   channels: Array<"serp" | "youtube" | "blog" | "newsletter" | "podcast" | "community" | "social">;
   limit: number;
+  /**
+   * Which window of the query plan to run. A source that cannot afford its whole plan
+   * in one run (SERP: more planned queries than slots) uses this to cover a DIFFERENT
+   * slice each run, so every query gets its turn. Omitted → the source keeps its own
+   * per-merchant run counter. Set it to make a run reproducible.
+   */
+  rotation?: number;
+}
+
+/** A source-level problem worth telling the operator about (as opposed to "no results"). */
+export interface DiscoveryIssue {
+  sourceType: string;
+  /** Human-readable, safe to show: provider, HTTP status, the provider's own message. */
+  message: string;
+}
+
+/** Side channel a source reports through while it runs. */
+export interface DiscoveryHooks {
+  /**
+   * Called when part of a run FAILED — a provider rejected the key, the quota ran out, a
+   * request timed out. Sources isolate such failures and still return what they found;
+   * this is how the failure is kept from looking like an empty result.
+   */
+  onError?(issue: DiscoveryIssue): void;
 }
 
 export interface RawCandidate {
@@ -181,6 +219,13 @@ export interface RawCandidate {
   outboundLinks: string[];
   /** Raw page HTML (for contact extraction), if the source fetched it. */
   pageHtml?: string | null;
+  /**
+   * Contact addresses the SOURCE itself established as this candidate's own — a podcast
+   * feed's declared `<itunes:owner>` email, an address the merchant supplied on import.
+   * `source` says how (`"feed_owner"`, `"import"`). These are tried FIRST, ahead of
+   * anything scraped off a page. Never a guess.
+   */
+  contactEmails?: { email: string; source: string }[];
   reachHint?: number;
   /**
    * Domain authority (0..100) when the source already knows it — e.g. backlink mining
@@ -216,7 +261,12 @@ export interface EmailVerifier {
 
 export interface DiscoverySource {
   readonly sourceType: string;
-  discover(query: DiscoveryQuery): Promise<RawCandidate[]>;
+  /**
+   * Find candidates. A source isolates its own partial failures (one bad query does not
+   * sink the run) and reports them through `hooks.onError`; it THROWS only when it could
+   * do nothing at all, so the caller can tell "provider is refusing us" from "nothing found".
+   */
+  discover(query: DiscoveryQuery, hooks?: DiscoveryHooks): Promise<RawCandidate[]>;
 }
 
 // ---- Creator identity graph + audience (profile-graph plan) ----------------
@@ -250,7 +300,8 @@ export interface ProfileSource {
  * paid add (`source: "provider"`); this seam carries reach + engagement first. */
 export interface AccountMetrics {
   reach: number | null; // followers / subscribers
-  engagementRate: number | null; // 0..1, from recent public posts
+  /** Engagement as a FRACTION (0.03 = 3%), from recent public posts. null = not measured. */
+  engagementRate: number | null;
   primaryGeo: string | null; // the CREATOR's country, when exposed (not audience geo)
   language: string | null;
   source: "api" | "scrape" | "page" | "provider";
@@ -263,6 +314,12 @@ export interface AccountMetrics {
   /** Most recent content date (ISO) when the provider exposes it (YouTube upload, RSS
    * pubDate). Powers the activity-recency signal — a dead property scores lower. Null unknown. */
   lastContentAt?: string | null;
+  /**
+   * Other canonical URLs of THIS SAME account, when the platform reports them — a YouTube
+   * channel is both `/channel/UC…` and `/@handle`. Lets a back-link written in either
+   * form be recognized as pointing at the account.
+   */
+  aliases?: string[];
 }
 
 /**

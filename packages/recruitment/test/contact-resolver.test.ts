@@ -53,8 +53,12 @@ describe("resolveContact — graph traversal", () => {
   });
 
   it("CHAIN: YouTube description has no email but links a website → follows it to its /contact page", async () => {
+    // The website links BACK to the channel — that is what makes it the creator's own site
+    // rather than a sponsor's. (This fixture used to have no back-link, and the test passed
+    // because ANY linked website was trusted; see audit-2026-10-contact.test.ts for the
+    // sponsor case that proved why it must not be.)
     const fetcher = fetcherFrom({
-      "https://creatorsite.com": `<a href="/contact">Work with me</a>`,
+      "https://creatorsite.com": `<a href="/contact">Work with me</a><a href="https://www.youtube.com/@creator">My channel</a>`,
       "https://creatorsite.com/contact": `<a href="mailto:hi@creatorsite.com">email me</a>`,
     });
     const res = await resolveContact(

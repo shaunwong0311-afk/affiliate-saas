@@ -1,12 +1,13 @@
-import { blendWeights, defaultWeights, newId, preScoreProspect, type PreScoreResult } from "@affiliate/core";
+import { newId, preScoreProspect, type PreScoreResult } from "@affiliate/core";
 import type { OutreachCampaign, Prospect, ProspectOutcome } from "@affiliate/db";
+import type { DiscoveryIssue } from "@affiliate/integrations";
 import type { RecruitmentDeps } from "./deps.js";
 import { discover, enrich, score, queueFirstTouch, send } from "./pipeline.js";
 import { planDiscovery, type DiscoveryPlan } from "./discovery-planner.js";
 import { routeReply, type ReplyOutcome } from "./reply-router.js";
 import { isGoodLocalSendTime } from "./send-timing.js";
 import { isSuppressed } from "./suppression.js";
-import { existingAffiliateEmails } from "./guards.js";
+import { existingAffiliateIndex } from "./guards.js";
 import { isWithinSendWindow } from "./sequencing.js";
 import { deliverabilityHealth, capacityAvailable } from "./deliverability.js";
 
@@ -34,6 +35,12 @@ export interface SourcingSummary {
   /** The plan the orchestrator chose — which sources ran (warmest first) and which
    * were skipped and why. Surfaced so the operator sees exactly what happened. */
   plan: DiscoveryPlan;
+  /**
+   * Sources that FAILED during this run, with the provider's own reason (rejected key,
+   * exhausted quota, missing subscription, timeout). A source listed here did not report
+   * "nothing found" — it could not look. Empty when every source that ran, ran cleanly.
+   */
+  sourceErrors: DiscoveryIssue[];
 }
 
 /** Cheap, reachable-contact heuristic from what discovery already captured. */
@@ -63,9 +70,29 @@ export async function runSourcing(
   merchantId: string,
   opts?: { limit?: number; excludeSourceTypes?: string[]; maxEnrich?: number },
 ): Promise<SourcingSummary> {
+  // Prospects whose score is still PROVISIONAL (the relevance model was unavailable when
+  // they were scored) get another try first. Stop at the first one that is still unknown:
+  // if the model is still down there is no point asking it fifty more times.
+  const provisional = await deps.db.prospects.find((p) => p.merchantId === merchantId && p.state === "enriched");
+  for (const p of provisional.slice(0, 50)) {
+    if ((await score(deps, p.id)).state !== "scored") break;
+  }
+
   // Plan first: decide which methods to run, warmest-first, skipping the inapplicable.
   const plan = await planDiscovery(deps, merchantId, { excludeSourceTypes: opts?.excludeSourceTypes });
-  const created = await discover(deps, merchantId, { ...opts, plan });
+  const sourceErrors: DiscoveryIssue[] = [];
+  const created = await discover(deps, merchantId, {
+    ...opts,
+    plan,
+    onSourceError: (issue) => {
+      // Kept bounded and de-duplicated; logged because the scheduler has no other channel.
+      if (sourceErrors.length < 20 && !sourceErrors.some((e) => e.sourceType === issue.sourceType && e.message === issue.message)) {
+        sourceErrors.push(issue);
+        // eslint-disable-next-line no-console
+        console.warn(`[discovery] ${issue.sourceType} failed for merchant ${merchantId}: ${issue.message}`);
+      }
+    },
+  });
 
   // Pre-score every prospect on cheap signals, then process best-first.
   const triaged: Array<{ prospect: Prospect; pre: PreScoreResult }> = [];
@@ -82,8 +109,9 @@ export async function runSourcing(
   }
   triaged.sort((a, b) => b.pre.preScore - a.pre.preScore);
 
-  // Guard set: people we already have as affiliates (computed once for the whole run).
-  const affiliateEmails = await existingAffiliateEmails(deps, merchantId);
+  // Guard: people we already have as affiliates (computed once for the whole run) —
+  // matched on email, on their site, or on their platform account, not on email alone.
+  const affiliates = await existingAffiliateIndex(deps, merchantId);
 
   let enriched = 0;
   let scored = 0;
@@ -97,11 +125,11 @@ export async function runSourcing(
     byBand[pre.band] = (byBand[pre.band] ?? 0) + 1;
     if (prospect.synthetic) synthetic++;
 
-    // Guard: if we already know a contact email for this prospect and it's an existing
-    // affiliate or a suppressed/opted-out address, kill it now — never waste enrichment
+    // Guard: if this prospect is an existing affiliate (by email, site or account), or its
+    // known contact email is suppressed/opted-out, kill it now — never waste enrichment
     // (or risk outreach) on someone we already have or can't email.
     const email = knownEmailOf(prospect);
-    if (email && (affiliateEmails.has(email.toLowerCase()) || (await isSuppressed(deps, merchantId, email)))) {
+    if (affiliates.matches({ ...prospect, email }) || (email && (await isSuppressed(deps, merchantId, email)))) {
       await deps.db.prospects.update(prospect.id, { state: "dead", updatedAt: deps.clock.now().toISOString() });
       guarded++;
       continue;
@@ -112,7 +140,12 @@ export async function runSourcing(
     processed++;
     // Tier only the PAID enrichment depth; contact-finding fetches always run (they're
     // cheap + cached, and they're what make the prospect contactable).
-    await enrich(deps, prospect.id, { maxAccounts: pre.enrichDepth });
+    const after = await enrich(deps, prospect.id, { maxAccounts: pre.enrichDepth });
+    if (after.state === "dead") {
+      // enrich retired it (it is the merchant's own domain or a competitor's) — a guard, not an enrichment.
+      guarded++;
+      continue;
+    }
     enriched++;
     const finished = await score(deps, prospect.id);
     if (finished.tier) {
@@ -126,11 +159,12 @@ export async function runSourcing(
     scored,
     byTier,
     byBand,
-    deferred: created.length - processed - guarded,
+    deferred: created.length - enriched - guarded,
     guarded,
     real: created.length - synthetic,
     synthetic,
     plan,
+    sourceErrors,
   };
 }
 
@@ -139,12 +173,20 @@ export async function processBacklog(deps: RecruitmentDeps, merchantId: string):
   const prospects = await deps.db.prospects.find((p) => p.merchantId === merchantId && (p.state === "discovered" || p.state === "enriched"));
   let enriched = 0;
   let scored = 0;
+  // A prospect already `enriched` is waiting on a PROVISIONAL score (the relevance model
+  // was unavailable). Retry those only until one is still unknown — the model is still
+  // down, and asking again for every one of them just makes the pass slow.
+  let relevanceStillUnknown = false;
   for (const p of prospects) {
     if (p.state === "discovered") {
-      await enrich(deps, p.id);
+      const after = await enrich(deps, p.id);
+      if (after.state === "dead") continue; // retired by the ingest rule re-check — nothing to score
       enriched++;
+    } else if (relevanceStillUnknown) {
+      continue;
     }
-    await score(deps, p.id);
+    const result = await score(deps, p.id);
+    if (p.state === "enriched" && result.state !== "scored") relevanceStillUnknown = true;
     scored++;
   }
   return { enriched, scored };
@@ -323,14 +365,4 @@ export async function recordOutcome(
     scoreBreakdown: { ...breakdown, outcome: label, outcomeAt: now },
     ...(label === "bad_fit" || label === "not_an_affiliate" ? { state: "dead" as const } : {}),
   });
-}
-
-/**
- * Expose the learned-weight blend so the scoring model can shift toward
- * "will drive sales." `alpha` rises with the volume of revenue-labeled outcomes.
- */
-export function learnedWeights(producedSalesCount: number, totalLabeled: number) {
-  const alpha = totalLabeled > 0 ? Math.min(0.8, producedSalesCount / totalLabeled) : 0;
-  // A learned model would emphasize affiliate-propensity + commercial intent.
-  return blendWeights(defaultWeights, { affiliatePropensity: 0.4, commercialIntent: 0.2 }, alpha);
 }

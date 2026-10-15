@@ -35,6 +35,7 @@ const SOURCE_META: Record<string, { label: string; priority: number }> = {
   competitor_affiliate_mining: { label: "Competitor-affiliate (demo generator)", priority: 2 },
   youtube_discovery: { label: "YouTube creator discovery", priority: 2 },
   podcast_discovery: { label: "Podcast discovery (Apple/iTunes)", priority: 2 },
+  social_discovery: { label: "Instagram / TikTok creator discovery", priority: 2 },
   serp_mining: { label: "Buyer-intent SERP mining", priority: 3 },
   creator_discovery: { label: "Creator discovery (demo generator)", priority: 4 },
 };
@@ -51,6 +52,8 @@ function rationaleFor(type: string, hasCompetitors: boolean, orderCount: number)
       return "Finds video creators reviewing in your niche — the affiliates who don't run a website (so backlink mining can't see them).";
     case "podcast_discovery":
       return "Finds niche podcasts via Apple/iTunes and reads their RSS feed for the host's contact email — a channel backlinks rarely surface.";
+    case "social_discovery":
+      return "Finds Instagram / TikTok creators posting in your niche — where most consumer-product affiliates live, with no site to backlink-mine.";
     case "serp_mining":
       return "Broad coverage: buyer-intent + platform-targeted queries surface creators across the web.";
     case "creator_discovery":
@@ -79,7 +82,7 @@ export async function planDiscovery(
     const type = source.sourceType;
     const meta = SOURCE_META[type] ?? { label: type, priority: 5 };
     if (excluded.has(type)) {
-      skipped.push({ sourceType: type, reason: "pruned — low yield in this merchant's history" });
+      skipped.push({ sourceType: type, reason: "pruned — low yield among this merchant's contacted prospects (see source yield)" });
       continue;
     }
     if ((type === "backlink_mining" || type === "competitor_affiliate_mining") && !hasCompetitors) {

@@ -368,9 +368,28 @@ export interface Prospect {
   evidence: {
     affiliateLinks?: { url: string; network: string; confidence: string; verified?: boolean }[];
     competitorPromoted?: string | null;
-    /** How the email was obtained: "page:mailto" | "bio_aggregator:mailto" | "pattern-guess" | null. */
+    /**
+     * How the email was obtained: "page:mailto" | "bio_aggregator:mailto" |
+     * "youtube_api:description" | "feed_owner" | "import" | "hunter" | null — or
+     * "pattern-guess", which only ever appears on a SYNTHETIC (demo) prospect.
+     */
     contactSource?: string | null;
-    /** Contact emails extracted from the real fetched page (unverified candidates). */
+    /**
+     * Whether a real deliverability check confirmed the email. False for a merchant-
+     * imported address (taken on trust) and for a demo pattern-guess (never verifiable).
+     */
+    contactVerified?: boolean;
+    /** Addresses found for this prospect and REFUSED as its contact, with the reason. */
+    contactRejected?: { email: string; reason: string }[];
+    /**
+     * Why this prospect was retired before enrichment: it turned out to be on a competitor's
+     * own domain or the merchant's own (learned after it was discovered).
+     */
+    excludedReason?: string;
+    /**
+     * Candidate contact emails, best first (unverified): addresses the discovery source
+     * vouched for, then addresses printed on the prospect's own page that could be theirs.
+     */
     contactEmails?: { email: string; source: string }[];
     /** Contact-bearing pages the creator linked (Linktree, /contact, YouTube About). */
     contactUrls?: { url: string; kind: string }[];
@@ -412,15 +431,21 @@ export interface ProspectSource {
 export interface ProspectSignal {
   id: Id;
   prospectId: Id;
-  /** Topical relevance 0..1 (embedding similarity). Real-ish. */
-  relevance: number;
+  /**
+   * Topical relevance 0..1. null = UNKNOWN: not scored yet, or the relevance scorer was
+   * unavailable. Never a placeholder 0 — that would read as "irrelevant".
+   */
+  relevance: number | null;
   /** Has a HIGH-confidence (named-network) affiliate link. */
   isAffiliate: boolean;
   /** Promotes a competitor with a TRUSTWORTHY (verified/high-confidence) link. */
   promotesCompetitor: boolean;
   /** Commercial-intent score 0..1 from real page text. */
   intent: number;
-  /** Verified deliverable email on file. */
+  /**
+   * An email is on file AND a real deliverability check confirmed it. Never true for a
+   * pattern-guessed address or one accepted on the merchant's word.
+   */
   verifiedEmail: boolean;
   // ---- Provider-required signals. null = UNKNOWN (no provider wired). Never
   // invented; excluded from scoring and lowering confidence when null. ----------

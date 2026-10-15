@@ -1,11 +1,10 @@
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect } from "vitest";
 import {
   extractEmailsFromHtml,
   discoverContactUrls,
   detectsContactForm,
   FetchRedirectResolver,
   MxEmailVerifier,
-  NoopEmailVerifier,
   SerpDiscoverySource,
   type SerpProvider,
   type SerpHit,
@@ -87,6 +86,21 @@ describe("extractEmailsFromHtml — obfuscation handling", () => {
   it("does NOT false-positive on ordinary prose (lowercase at/dot)", () => {
     expect(emailsIn("Look at the best dot com sites and meet me at the cafe.")).toEqual([]);
   });
+
+  it("does NOT read 'me @ instagram.com/jane' as an address (AUDIT-2026-10 D11)", () => {
+    // A spaced `@` in front of a URL is a sentence about a social profile. It used to
+    // yield `me@instagram.com` — and that became the prospect's contact.
+    expect(emailsIn("Follow me @ instagram.com/jane for daily routines")).toEqual([]);
+    expect(emailsIn("Find us @ twitter.com and say hi")).toEqual([]);
+    expect(emailsIn("DM us @ linktr.ee/brand")).toEqual([]);
+    expect(emailsIn("more @ mysite.com/shop today")).toEqual([]); // a spaced @ before a plain URL
+  });
+
+  it("drops an 'obfuscated' match that is really a URL or a platform's domain", () => {
+    expect(emailsIn("write to jane [at] instagram.com")).toEqual([]); // nobody's mailbox is @instagram.com
+    expect(emailsIn("see john [at] mysite.com/contact")).toEqual([]); // runs into a path → a URL in prose
+    expect(emailsIn("write to jane [at] mysite.com today")).toContain("jane@mysite.com"); // the real thing still reads
+  });
 });
 
 describe("discoverContactUrls", () => {
@@ -135,32 +149,32 @@ describe("detectsContactForm", () => {
   });
 });
 
+// These two used to stub the GLOBAL fetch: the resolver made its own unguarded, direct
+// request with `redirect: "follow"`. It now resolves THROUGH the page fetcher (the guarded,
+// proxied path — exercised end to end in proxy-fail-closed.test.ts), so the follower is
+// what gets injected here.
 describe("FetchRedirectResolver", () => {
   it("returns the final host after following redirects", async () => {
-    vi.stubGlobal("fetch", vi.fn(async () => ({ url: "https://competitor.com/product/123" })) as unknown as typeof fetch);
-    const res = await new FetchRedirectResolver().resolve("https://track.io/go?ref=abc");
-    expect(res).toEqual({ finalUrl: "https://competitor.com/product/123", finalHost: "competitor.com" });
-    vi.unstubAllGlobals();
+    const via = { async follow() { return { status: 200, finalUrl: "https://www.competitor.com/product/123" }; } };
+    const res = await new FetchRedirectResolver({ via }).resolve("https://track.io/go?ref=abc");
+    expect(res).toEqual({ finalUrl: "https://www.competitor.com/product/123", finalHost: "competitor.com" });
   });
 
   it("returns null when the fetch fails — never guesses a destination", async () => {
-    vi.stubGlobal("fetch", vi.fn(async () => {
-      throw new Error("network down");
-    }) as unknown as typeof fetch);
-    expect(await new FetchRedirectResolver().resolve("https://track.io/go?ref=abc")).toBeNull();
-    vi.unstubAllGlobals();
+    const via = { async follow(): Promise<never> { throw new Error("network down"); } };
+    expect(await new FetchRedirectResolver({ via }).resolve("https://track.io/go?ref=abc")).toBeNull();
+  });
+
+  it("without a follower it still goes through the outbound guard (a private target resolves to nothing)", async () => {
+    // No network is touched: the guard refuses the literal before any request.
+    expect(await new FetchRedirectResolver().resolve("http://169.254.169.254/latest/meta-data/")).toBeNull();
+    expect(await new FetchRedirectResolver().resolve("http://localhost:8787/admin")).toBeNull();
   });
 });
 
 describe("MxEmailVerifier", () => {
   it("rejects a malformed address without a DNS call", async () => {
     expect(await new MxEmailVerifier().verify("not-an-email")).toEqual({ deliverable: false, reason: "malformed address" });
-  });
-});
-
-describe("NoopEmailVerifier", () => {
-  it("never reports deliverable (used only where no real verifier exists)", async () => {
-    expect((await new NoopEmailVerifier().verify("x@y.com")).deliverable).toBe(false);
   });
 });
 

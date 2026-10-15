@@ -14,6 +14,7 @@ import {
   type InboundReply,
   type MailboxCredentials,
   StubEmailFinder,
+  NullEmailFinder,
   HunterFinder,
   HashingEmbedder,
   DeterministicLlm,
@@ -153,9 +154,21 @@ export function createContext(overrides: Partial<AppContext> = {}): AppContext {
     : hasDfs
       ? new DataForSEOSerpProvider({ login: process.env.DATAFORSEO_LOGIN!, password: process.env.DATAFORSEO_PASSWORD! })
       : new DeterministicSerpProvider();
-  // A real page fetcher (proxy pool, or direct fetch when only a SERP key is set)
-  // whenever we have real SERP results; deterministic (no network) otherwise.
-  const pageFetcher = realDiscovery ? new ProxyHttpFetcher(staticProxyPool(proxyUrls)) : new DeterministicFetcher();
+  // A real page fetcher whenever we have real SERP results; deterministic (no network)
+  // otherwise. Every URL it is given came from outside (a SERP hit, a scraped link, an
+  // import row), so every request goes through the outbound guard: public destinations
+  // only, redirects re-checked, a deadline and a body cap.
+  //
+  // PROXY_URL set → FAIL CLOSED: each request goes through a proxy from the pool or it
+  // fails. There is no direct fallback — scraping from this machine's own address is
+  // exactly what the setting exists to prevent. PROXY_URL unset → requests go out directly
+  // (fine in dev; in production it means the box IP is what target sites see and block).
+  const networkFetcher0 = realDiscovery ? new ProxyHttpFetcher(staticProxyPool(proxyUrls), { requireProxy: proxyUrls.length > 0 }) : null;
+  const pageFetcher: HttpFetcher = networkFetcher0 ?? new DeterministicFetcher();
+  if (networkFetcher0 && proxyUrls.length === 0 && config.isProduction) {
+    // eslint-disable-next-line no-console
+    console.warn("[boot] Real discovery is enabled without PROXY_URL — pages will be fetched from this machine's own IP address. Set PROXY_URL to a rotating/residential proxy.");
+  }
   // Build ONE hardened fetcher used everywhere real pages are read (SERP result pages,
   // competitor program pages, contact links, frontier expansion, enrich homepages):
   //  - BROWSER_FETCH=true → escalate a JS-rendered/anti-bot-challenged page from the
@@ -203,7 +216,8 @@ export function createContext(overrides: Partial<AppContext> = {}): AppContext {
         ? new DeterministicBacklinkProvider()
         : undefined;
   // Resolves each competitor's affiliate program (network + merchant id) by reading
-  // their site, so backlink mining queries the RIGHT links. Needs a fetcher.
+  // their site, so backlink mining queries the RIGHT links. Needs a fetcher. (There is no
+  // manual-override input: no per-merchant program data exists to pass.)
   const programResolver = fetcher ? new CompetitorProgramResolver({ fetcher }) : undefined;
   // Direct YouTube creator discovery — finds video reviewers (no website to backlink-mine).
   // Free Data API; only wired when a key is present. Reach/engagement come from YouTubeEnricher.
@@ -230,15 +244,24 @@ export function createContext(overrides: Partial<AppContext> = {}): AppContext {
     ...(socialDiscovery ? [socialDiscovery] : []),
   ];
 
-  // Email finding: real Hunter.io when keyed, deterministic pattern stub otherwise.
+  // Email finding: real Hunter.io when keyed. Otherwise the pattern-GUESSING stub only
+  // where synthetic (demo) discovery is allowed — it invents addresses, and the pipeline
+  // lets it touch synthetic prospects only. Where synthetic discovery is off (production)
+  // there is simply no finder: a prospect whose address was not found on a surface it
+  // owns has no contact, and says so.
   const emailFinder =
     overrides.emailFinder ??
-    (process.env.HUNTER_API_KEY ? new HunterFinder({ apiKey: process.env.HUNTER_API_KEY, http: jsonHttp }) : new StubEmailFinder());
+    (process.env.HUNTER_API_KEY
+      ? new HunterFinder({ apiKey: process.env.HUNTER_API_KEY, http: jsonHttp })
+      : config.allowSyntheticDiscovery
+        ? new StubEmailFinder()
+        : new NullEmailFinder());
 
   // Real network helpers — only wired when real discovery is on, so tests/dev never
-  // hit the network. When absent, generic affiliate links stay unverified and email
-  // verification falls back to the finder's own check.
-  const redirectResolver = overrides.redirectResolver ?? (realDiscovery ? new FetchRedirectResolver() : undefined);
+  // hit the network. When absent, generic affiliate links stay unverified and no real
+  // address can be confirmed. The redirect resolver follows links THROUGH the page
+  // fetcher — the same guard, the same proxy rule — never on a connection of its own.
+  const redirectResolver = overrides.redirectResolver ?? (networkFetcher0 ? new FetchRedirectResolver({ via: networkFetcher0 }) : undefined);
   const emailVerifier = overrides.emailVerifier ?? (realDiscovery ? new MxEmailVerifier() : undefined);
 
   // Audience enrichment: one registry, cheapest source per platform. YouTube is free

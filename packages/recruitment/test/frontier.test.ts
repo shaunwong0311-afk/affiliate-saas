@@ -24,11 +24,25 @@ const backlinkStub: DiscoverySource = {
     return [affiliate(`${base}-aff1.com`, comp), affiliate(`${base}-aff2.com`, comp)];
   },
 };
-// Every affiliate page promotes brandb + brandc (and Amazon, which must be filtered).
+// Every affiliate page promotes two merchants the NETWORK REGISTRY can identify — brandb
+// through its Impact vanity domain, brandc as the spelled-out destination of a ShareASale
+// link — plus links that only LOOK affiliate-ish (a share button's ?via=, a host's /go/
+// path, a plain ?ref=) and Amazon. Only the first two may become frontier seeds.
+// (This fixture used to promote brandb/brandc on `?ref=` / `?via=` alone — the D7 defect.)
 const fetcher: HttpFetcher = {
   kind: "mock",
   async get(url: string): Promise<FetchResult> {
-    return { status: 200, url, html: `<a href="https://brandb.com/buy?ref=x">b</a><a href="https://brandc.com/?via=y">c</a><a href="https://amzn.to/3?tag=z">a</a>` };
+    return {
+      status: 200,
+      url,
+      html:
+        `<a href="https://brandb.pxf.io/c/1/2/3">b</a>` +
+        `<a href="https://shareasale.com/r.cfm?m=9&u=1&urllink=https%3A%2F%2Fbrandc.com%2F">c</a>` +
+        `<a href="https://twitter.com/intent/tweet?text=hi&via=someone">tweet</a>` +
+        `<a href="https://www.bluehost.com/go/deal">host</a>` +
+        `<a href="https://generic-shop.com/buy?ref=x">shop</a>` +
+        `<a href="https://amzn.to/3?tag=z">a</a>`,
+    };
   },
 };
 
@@ -49,15 +63,16 @@ describe("expandFrontier — recursive merchant-expansion", () => {
 
     expect(report.mined).toContain("rival.com");
     expect(report.discovered).toBe(2);
-    // brandb + brandc each promoted by both affiliates → promoted as new seeds.
-    expect(report.promoted.map((p) => p.domain)).toEqual(expect.arrayContaining(["brandb.com", "brandc.com"]));
-    // Amazon is a mega-retailer — never promoted.
-    expect(report.promoted.map((p) => p.domain)).not.toContain("amzn.to");
+    // brandb + brandc each promoted by both affiliates → promoted as new seeds. And ONLY
+    // those: Amazon is a retailer, and twitter.com / bluehost.com / generic-shop.com merely
+    // carry a generic ?via= / /go/ / ?ref= — they used to be promoted and then mined (D7).
+    expect(report.promoted.map((p) => p.domain).sort()).toEqual(["brandb.pxf.io", "brandc.com"]);
 
     const frontier = await db.frontierMerchants.find((f) => f.merchantId === "m1");
     expect(frontier.find((f) => f.domain === "rival.com")?.status).toBe("mined");
-    expect(frontier.filter((f) => f.status === "pending").map((f) => f.domain)).toEqual(expect.arrayContaining(["brandb.com", "brandc.com"]));
-    expect(frontier.find((f) => f.domain === "brandb.com")?.depth).toBe(1); // one hop deeper
+    expect(frontier.filter((f) => f.status === "pending").map((f) => f.domain).sort()).toEqual(["brandb.pxf.io", "brandc.com"]);
+    expect(frontier.map((f) => f.domain)).not.toEqual(expect.arrayContaining(["twitter.com"]));
+    expect(frontier.find((f) => f.domain === "brandb.pxf.io")?.depth).toBe(1); // one hop deeper
   });
 
   it("respects the depth cap (no promotion past maxDepth)", async () => {
@@ -77,8 +92,8 @@ describe("expandFrontier — recursive merchant-expansion", () => {
       kind: "mock",
       async get(url: string): Promise<FetchResult> {
         const html = url.includes("deepbrand")
-          ? `<a href="https://brandz.com/buy?ref=x">z</a>`
-          : `<a href="https://brandb.com/buy?ref=x">b</a>`;
+          ? `<a href="https://brandz.pxf.io/c/1/2/3">z</a>`
+          : `<a href="https://brandb.pxf.io/c/1/2/3">b</a>`;
         return { status: 200, url, html };
       },
     };
@@ -86,12 +101,12 @@ describe("expandFrontier — recursive merchant-expansion", () => {
     expect(report.mined).toEqual(expect.arrayContaining(["rival.com", "deepbrand.com"]));
     // brandz was surfaced by the DEPTH-2 node's affiliates → depth 3, edge from deepbrand
     // (previously min(batch depths)+1 = 1 and discoveredFrom = mined[0], corrupting both).
-    expect(report.promoted.find((p) => p.domain === "brandz.com")?.depth).toBe(3);
-    const zRow = (await db.frontierMerchants.find((f) => f.domain === "brandz.com"))[0];
+    expect(report.promoted.find((p) => p.domain === "brandz.pxf.io")?.depth).toBe(3);
+    const zRow = (await db.frontierMerchants.find((f) => f.domain === "brandz.pxf.io"))[0];
     expect(zRow?.discoveredFrom).toBe("deepbrand.com");
     // brandb came from the depth-0 seed → depth 1, edge from rival.
-    expect(report.promoted.find((p) => p.domain === "brandb.com")?.depth).toBe(1);
-    const bRow = (await db.frontierMerchants.find((f) => f.domain === "brandb.com"))[0];
+    expect(report.promoted.find((p) => p.domain === "brandb.pxf.io")?.depth).toBe(1);
+    const bRow = (await db.frontierMerchants.find((f) => f.domain === "brandb.pxf.io"))[0];
     expect(bRow?.discoveredFrom).toBe("rival.com");
   });
 
@@ -104,15 +119,15 @@ describe("expandFrontier — recursive merchant-expansion", () => {
       kind: "mock",
       async get(url: string): Promise<FetchResult> {
         const html = url.includes("deepbrand")
-          ? `<a href="https://brandz.com/buy?ref=x">z</a>`
-          : `<a href="https://brandb.com/buy?ref=x">b</a>`;
+          ? `<a href="https://brandz.pxf.io/c/1/2/3">z</a>`
+          : `<a href="https://brandb.pxf.io/c/1/2/3">b</a>`;
         return { status: 200, url, html };
       },
     };
     // maxDepth 2: the depth-2 node's promotion would be hop 3 → dropped; the seed's survives.
     const report = await expandFrontier(deps({ fetcher: perNodeFetcher }), "m1", { maxSeedsPerCycle: 2, minCoPromotions: 2, maxDepth: 2 });
-    expect(report.promoted.map((p) => p.domain)).toContain("brandb.com");
-    expect(report.promoted.map((p) => p.domain)).not.toContain("brandz.com");
+    expect(report.promoted.map((p) => p.domain)).toContain("brandb.pxf.io");
+    expect(report.promoted.map((p) => p.domain)).not.toContain("brandz.pxf.io");
   });
 
   it("does not re-seed or re-mine on a second run (visited set persists)", async () => {

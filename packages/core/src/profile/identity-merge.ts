@@ -1,4 +1,5 @@
-import type { Account, Profile, Provenance } from "./identity.js";
+import { accountKey, classifyAccountUrl, seedAccount, type Account, type Profile, type Provenance } from "./identity.js";
+import { emailAtOwnDomain, isSharedPlatformHost, normalizeHost, ownEmailDomains } from "./hosts.js";
 
 /**
  * Prospect-level identity resolution (Section 8.1). The identity GRAPH unifies the
@@ -8,18 +9,12 @@ import type { Account, Profile, Provenance } from "./identity.js";
  * backlink mining. When they share a hard identifier we merge instead of creating a
  * duplicate, building one comprehensive profile per person.
  *
- * "Hard identifier" = a shared social account/handle, a shared contact email, or a
- * shared website domain. We deliberately do NOT merge on a shared name alone (two
- * different people can share a name) or on a shared platform host without a handle.
+ * "Hard identifier" = a shared social account/handle, a shared website domain, or a
+ * shared contact email AT THE CREATOR'S OWN DOMAIN. We deliberately do NOT merge on a
+ * shared name (two people can share one), on a platform host without a handle (every
+ * YouTube video is not one creator), or on an email at someone else's domain (two blogs
+ * that both print an ad network's address are not the same blog).
  */
-
-function rootDomain(url: string): string | null {
-  try {
-    return new URL(url.startsWith("http") ? url : `https://${url}`).hostname.replace(/^www\./, "").toLowerCase();
-  } catch {
-    return null;
-  }
-}
 
 export interface IdentitySignals {
   /**
@@ -35,7 +30,11 @@ export interface IdentitySignals {
    * (else two blogs linking the same brand's Instagram would collapse into one creator).
    */
   weakAccountKeys: Set<string>;
-  /** Lowercased contact emails (always a hard identifier). */
+  /**
+   * Lowercased contact emails AT THE CREATOR'S OWN DOMAIN — the only emails that are a
+   * hard identifier. An address at any other domain (an ad network, an agency, a free
+   * mailbox printed in a footer) is dropped here and can never establish a merge.
+   */
   emails: Set<string>;
   /** The creator's own website domain(s) (from an owned/seed website — a hard identifier). */
   domains: Set<string>;
@@ -44,7 +43,7 @@ export interface IdentitySignals {
 const STRONG_PROVENANCE: ReadonlySet<Provenance> = new Set<Provenance>(["seed", "bio_aggregator", "reciprocal_link"]);
 
 /** An account we trust the creator OWNS (not a mere one-directional link). */
-function isStrongAccount(a: Account): boolean {
+export function isStrongAccount(a: Pick<Account, "provenance" | "confidence">): boolean {
   return STRONG_PROVENANCE.has(a.provenance) || a.confidence >= 0.85;
 }
 
@@ -54,37 +53,70 @@ export function identitySignalsFromProfile(profile: Profile | null, emails: Read
   const weakAccountKeys = new Set<string>();
   const domains = new Set<string>();
   for (const a of profile?.accounts ?? []) {
-    const key = a.handle ? `${a.platform}:${a.handle.toLowerCase()}` : `url:${a.url.toLowerCase().replace(/\/+$/, "")}`;
+    // Re-derive the key from the URL with TODAY's parser rather than trusting the stored
+    // handle: profiles persisted before the handle parser was platform-aware carry bogus
+    // identities (`instagram:@p`, a "website" at youtube.com) that must not match anything.
+    const current = a.platform === "website" ? seedAccount(a.url) : classifyAccountUrl(a.url);
+    if (!current) continue;
     const strong = isStrongAccount(a);
-    (strong ? accountKeys : weakAccountKeys).add(key);
-    // A domain is only a hard identifier when it comes from an account we trust they own.
-    if (strong && a.platform === "website" && !a.handle) {
-      const d = rootDomain(a.url);
-      if (d) domains.add(d);
+    (strong ? accountKeys : weakAccountKeys).add(accountKey(current));
+    // A domain is a hard identifier only for a site the creator owns — never a platform host.
+    if (strong && current.platform === "website") {
+      const d = normalizeHost(current.url);
+      if (d && !isSharedPlatformHost(d)) domains.add(d);
     }
   }
+  const own = ownEmailDomains(domains);
   const em = new Set<string>();
-  for (const e of emails) if (e) em.add(e.toLowerCase());
+  for (const e of emails) {
+    if (e && emailAtOwnDomain(e, own)) em.add(e.toLowerCase());
+  }
   return { accountKeys, weakAccountKeys, emails: em, domains };
-}
-
-/**
- * True when two identity-signal sets share a hard identifier (→ same creator). A shared
- * account key counts only when it is STRONG on at least one side (strong↔strong or
- * strong↔weak); a purely weak↔weak account match does NOT (both sides merely link it).
- * Emails and domains are hard identifiers and always count.
- */
-export function identitiesOverlap(a: IdentitySignals, b: IdentitySignals): boolean {
-  // a-strong matched by b (strong or weak): strong↔strong and strong↔weak.
-  for (const k of a.accountKeys) if (b.accountKeys.has(k) || b.weakAccountKeys.has(k)) return true;
-  // b-strong matched by a-weak: the symmetric weak↔strong case.
-  for (const k of b.accountKeys) if (a.weakAccountKeys.has(k)) return true;
-  for (const e of a.emails) if (b.emails.has(e)) return true;
-  for (const d of a.domains) if (b.domains.has(d)) return true;
-  return false;
 }
 
 /** Whether a signal set carries any identifier at all (else not mergeable). */
 export function hasIdentitySignal(s: IdentitySignals): boolean {
   return s.accountKeys.size > 0 || s.weakAccountKeys.size > 0 || s.emails.size > 0 || s.domains.size > 0;
+}
+
+/**
+ * An identity-key index: hard identifier → the id it was first registered under. THE one
+ * implementation of "do these two signal sets describe the same creator?" — the ingest
+ * path builds one per merchant so each candidate resolves in O(1) instead of rescanning
+ * every prospect.
+ *
+ * A STRONG identifier (owned account, own-domain email, own domain) matches an existing
+ * strong OR weak key; a WEAK (page_link) account key matches only an existing STRONG key.
+ * Two weak keys never match — both sides merely link the account. First writer wins per
+ * key, so a match resolves to the earliest-registered id.
+ */
+export class IdentityKeyIndex {
+  private readonly strong = new Map<string, string>(); // strong account keys + emails + domains
+  private readonly weak = new Map<string, string>(); // page_link account keys
+
+  add(id: string, s: IdentitySignals): void {
+    for (const k of strongKeys(s)) if (!this.strong.has(k)) this.strong.set(k, id);
+    for (const k of s.weakAccountKeys) {
+      const wk = `a:${k}`;
+      if (!this.weak.has(wk)) this.weak.set(wk, id);
+    }
+  }
+
+  lookup(s: IdentitySignals): string | null {
+    for (const k of strongKeys(s)) {
+      const id = this.strong.get(k) ?? this.weak.get(k); // strong↔strong or strong↔weak
+      if (id) return id;
+    }
+    for (const k of s.weakAccountKeys) {
+      const id = this.strong.get(`a:${k}`); // weak↔strong only (never weak↔weak)
+      if (id) return id;
+    }
+    return null;
+  }
+}
+
+function* strongKeys(s: IdentitySignals): Iterable<string> {
+  for (const k of s.accountKeys) yield `a:${k}`;
+  for (const e of s.emails) yield `e:${e}`;
+  for (const d of s.domains) yield `d:${d}`;
 }

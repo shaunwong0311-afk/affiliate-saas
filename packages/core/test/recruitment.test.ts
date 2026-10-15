@@ -136,9 +136,14 @@ describe("scoring with unknown (un-provided) signals", () => {
   });
 
   it("reaches full confidence only when every signal is known", () => {
-    const res = scoreProspect({ ...partial, reach: 100_000, domainAuthority: 60, engagementRate: 0.05, audienceOverlap: 0.7 });
+    // Content freshness is a scoring factor now, so "every signal" includes it.
+    const res = scoreProspect({ ...partial, reach: 100_000, domainAuthority: 60, engagementRate: 0.05, audienceOverlap: 0.7, activityRecency: 1 });
     expect(res.confidence).toBe(1);
     expect(res.unknownFactors).toEqual([]);
+    // …and without it the score is unchanged but honestly less than fully known.
+    const noFreshness = scoreProspect({ ...partial, reach: 100_000, domainAuthority: 60, engagementRate: 0.05, audienceOverlap: 0.7 });
+    expect(noFreshness.unknownFactors).toEqual(["activity"]);
+    expect(noFreshness.confidence).toBeLessThan(1);
   });
 });
 

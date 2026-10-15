@@ -28,7 +28,7 @@ export interface PreScoreSignals {
 }
 
 export interface PreScoreResult {
-  /** 0..1 triage score — higher = enrich first, enrich deeper. */
+  /** 0..1 triage score over the KNOWN signals — higher = enrich first, enrich deeper. */
   preScore: number;
   band: TriageBand;
   /**
@@ -41,6 +41,8 @@ export interface PreScoreResult {
   enrichDepth: number;
   /** Short human reasons, best first (explainability). */
   reasons: string[];
+  /** Signals that were unknown at discovery time and therefore left OUT of the pre-score. */
+  unknownFactors: string[];
 }
 
 export interface TriageThresholds {
@@ -64,26 +66,34 @@ const W = {
   contactPath: 0.1,
 };
 
-/** Cheap pre-enrichment triage score from discovery-time signals only. */
+/**
+ * Cheap pre-enrichment triage score from discovery-time signals only. An UNKNOWN signal
+ * (domain authority, for every source but backlink mining) is left out and the weights
+ * renormalized over what is known — exactly as full scoring does — so "not measured"
+ * never ranks a prospect below an identical one that measured poorly.
+ */
 export function preScoreProspect(s: PreScoreSignals, thresholds: TriageThresholds = defaultTriageThresholds): PreScoreResult {
-  const da = s.domainAuthority != null ? clamp01(s.domainAuthority / 100) : 0;
+  const da = s.domainAuthority != null && Number.isFinite(s.domainAuthority) ? clamp01(s.domainAuthority / 100) : null;
   const intent = clamp01(s.commercialIntent);
 
-  const parts: Array<{ v: number; w: number; reason: string }> = [
-    { v: s.promotesCompetitor ? 1 : 0, w: W.promotesCompetitor, reason: "promotes a direct competitor" },
-    { v: s.runsAffiliateLinks ? 1 : 0, w: W.runsAffiliateLinks, reason: "runs affiliate links (proven monetizer)" },
-    { v: da, w: W.domainAuthority, reason: s.domainAuthority != null ? `domain authority ${s.domainAuthority}` : "" },
-    { v: intent, w: W.commercialIntent, reason: intent > 0.5 ? "high commercial intent" : "" },
-    { v: s.hasContactPath ? 1 : 0, w: W.contactPath, reason: "has a contact path" },
+  const parts: Array<{ factor: string; v: number | null; w: number; reason: string }> = [
+    { factor: "promotesCompetitor", v: s.promotesCompetitor ? 1 : 0, w: W.promotesCompetitor, reason: "promotes a direct competitor" },
+    { factor: "runsAffiliateLinks", v: s.runsAffiliateLinks ? 1 : 0, w: W.runsAffiliateLinks, reason: "runs affiliate links (proven monetizer)" },
+    { factor: "domainAuthority", v: da, w: W.domainAuthority, reason: da != null ? `domain authority ${s.domainAuthority}` : "" },
+    { factor: "commercialIntent", v: intent, w: W.commercialIntent, reason: intent > 0.5 ? "high commercial intent" : "" },
+    { factor: "contactPath", v: s.hasContactPath ? 1 : 0, w: W.contactPath, reason: "has a contact path" },
   ];
 
-  const preScore = clamp01(parts.reduce((sum, p) => sum + p.v * p.w, 0));
+  const known = parts.filter((p): p is typeof p & { v: number } => p.v != null);
+  const knownWeight = known.reduce((sum, p) => sum + p.w, 0) || 1;
+  const preScore = clamp01(known.reduce((sum, p) => sum + p.v * p.w, 0) / knownWeight);
   const band: TriageBand = preScore >= thresholds.hot ? "hot" : preScore >= thresholds.warm ? "warm" : "cold";
   const enrichDepth = band === "hot" ? 5 : band === "warm" ? 3 : 1;
-  const reasons = parts
+  const reasons = known
     .filter((p) => p.v > 0 && p.reason)
     .sort((a, b) => b.v * b.w - a.v * a.w)
     .map((p) => p.reason);
+  const unknownFactors = parts.filter((p) => p.v == null).map((p) => p.factor);
 
-  return { preScore, band, enrichDepth, reasons };
+  return { preScore, band, enrichDepth, reasons, unknownFactors };
 }

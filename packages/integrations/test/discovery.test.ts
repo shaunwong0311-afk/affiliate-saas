@@ -248,9 +248,10 @@ describe("CompetitorProgramResolver", () => {
     expect(programs).toContainEqual(expect.objectContaining({ network: "ShareASale", merchantId: "56789" }));
   });
 
-  it("honors a manual override (and skips the crawl)", async () => {
-    const r = new CompetitorProgramResolver({ overrides: { "acme.com": [{ network: "Impact", kind: "vanity", merchantId: null, vanityHost: "acme.pxf.io" }] } });
-    expect(await r.resolve("acme.com")).toContainEqual(expect.objectContaining({ vanityHost: "acme.pxf.io" }));
+  it("resolves nothing without a fetcher — there is no manual-override input (D15)", async () => {
+    // The `overrides` option was never passed by the application (no per-merchant program
+    // data exists), so it was removed rather than left as a capability nothing can use.
+    expect(await new CompetitorProgramResolver().resolve("acme.com")).toEqual([]);
   });
 
   it("does NOT trust a bare network link on the homepage — it may point at ANOTHER merchant (#28)", async () => {
@@ -314,9 +315,20 @@ describe("CompetitorProgramResolver", () => {
   });
 });
 
+/** A resolver that learns the competitor's program the real way: from its /affiliates page. */
+function resolverSeeing(programLink: string): CompetitorProgramResolver {
+  const site: HttpFetcher = {
+    kind: "mock",
+    async get(url: string): Promise<FetchResult> {
+      return url.endsWith("/affiliates") ? { status: 200, url, html: `<a href="${programLink}">Join our program</a>` } : { status: 404, url, html: "" };
+    },
+  };
+  return new CompetitorProgramResolver({ fetcher: site });
+}
+
 describe("BacklinkDiscoverySource — resolved network targeting", () => {
   it("queries the resolved vanity host and confirms the competitor", async () => {
-    const resolver = new CompetitorProgramResolver({ overrides: { "acme.com": [{ network: "Impact", kind: "vanity", merchantId: null, vanityHost: "acme.pxf.io" }] } });
+    const resolver = resolverSeeing("https://acme.pxf.io/c/1/2/3");
     const provider = new RecordingBacklinks([{ urlFrom: "https://affblog.com/review", urlTo: "https://acme.pxf.io/c/1/2", anchor: "x" }]);
     const cands = await new BacklinkDiscoverySource(provider, resolver).discover({ ...baseQuery, competitors: ["acme.com"], limit: 5 });
     expect(provider.targets.some((t) => t.startsWith("acme.pxf.io"))).toBe(true); // queried the vanity host, not the apex
@@ -325,14 +337,14 @@ describe("BacklinkDiscoverySource — resolved network targeting", () => {
   });
 
   it("filters the shared network by merchant id", async () => {
-    const resolver = new CompetitorProgramResolver({ overrides: { "acme.com": [{ network: "ShareASale", kind: "shared", merchantId: "56789", vanityHost: null }] } });
+    const resolver = resolverSeeing("https://shareasale.com/shareasale.cfm?merchantID=56789");
     const provider = new RecordingBacklinks([{ urlFrom: "https://aff.com/x", urlTo: "https://shareasale.com/r.cfm?m=56789", anchor: "" }]);
     await new BacklinkDiscoverySource(provider, resolver).discover({ ...baseQuery, competitors: ["acme.com"], limit: 5 });
     expect(provider.targets).toContain("shareasale.com?m=56789"); // queried the network, filtered by id
   });
 
   it("post-filters shared-network rows to the EXACT merchant id — the LIKE filter is a substring (#26)", async () => {
-    const resolver = new CompetitorProgramResolver({ overrides: { "acme.com": [{ network: "ShareASale", kind: "shared", merchantId: "1234", vanityHost: null }] } });
+    const resolver = resolverSeeing("https://shareasale.com/shareasale.cfm?merchantID=1234");
     const provider = new RecordingBacklinks([
       // %m=1234% ALSO matches m=12345 server-side — this row belongs to ANOTHER
       // merchant and must never be emitted as acme's confirmed affiliate.
