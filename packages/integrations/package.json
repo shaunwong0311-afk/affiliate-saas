@@ -11,7 +11,13 @@
   "dependencies": {
     "@affiliate/core": "*",
     "@affiliate/db": "*",
-    "@anthropic-ai/sdk": "^0.69.0"
+    "@anthropic-ai/sdk": "^0.69.0",
+    "undici": "^7.30.0"
+  },
+  "optionalDependencies": {
+    "imapflow": "^2.4.0",
+    "mailparser": "^3.9.38",
+    "nodemailer": "^10.1.0"
   },
   "scripts": {
     "typecheck": "tsc -b"

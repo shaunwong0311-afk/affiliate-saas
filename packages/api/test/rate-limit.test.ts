@@ -110,12 +110,12 @@ describe("the limiter keys on the real client address (S6)", () => {
     expect(direct[AUTH_LIMIT.max]).toBe(429);
   });
 
-  it("reads TRUST_PROXY: unset/false → none, true → all, a number → hops, otherwise an address list", () => {
+  it("reads TRUST_PROXY: unset/false → none, true → all, an address list as given; a hop count is refused", () => {
     expect(loadConfig({}).trustProxy).toBe(false);
     expect(loadConfig({ TRUST_PROXY: "" }).trustProxy).toBe(false);
     expect(loadConfig({ TRUST_PROXY: "false" }).trustProxy).toBe(false);
     expect(loadConfig({ TRUST_PROXY: "true" }).trustProxy).toBe(true);
-    expect(loadConfig({ TRUST_PROXY: "2" }).trustProxy).toBe(2);
+    expect(() => loadConfig({ TRUST_PROXY: "2" })).toThrow(/hop count/);
     expect(loadConfig({ TRUST_PROXY: "10.0.0.0/8, loopback" }).trustProxy).toBe("10.0.0.0/8, loopback");
   });
 

@@ -19,7 +19,7 @@ async function start() {
     console.warn(
       "[boot] TRUST_PROXY is not set: the client address is the socket peer and X-Forwarded-For is ignored. " +
         "Behind a reverse proxy or CDN that makes every request look like the proxy — all clients then share ONE " +
-        "rate-limit bucket. Set TRUST_PROXY to the proxy's address/range (or hop count) in that case.",
+        "rate-limit bucket. Set TRUST_PROXY to the proxy's address/range in that case.",
     );
   }
 

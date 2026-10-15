@@ -37,11 +37,12 @@ export interface AppConfig {
    * Which proxies may tell us the client address (Fastify `trustProxy`), from TRUST_PROXY:
    * unset/"false" → none (the socket address is the client; X-Forwarded-For is ignored),
    * a comma-separated list of addresses / CIDR ranges / the names loopback, linklocal,
-   * uniquelocal → only those peers (the safe form), a number → that many hops, "true" → every
-   * peer. The last two believe whatever X-Forwarded-For says and are only safe when the
-   * origin is unreachable except through a proxy that sets that header itself.
+   * uniquelocal → only those peers (the safe form), "true" → every peer (believes whatever
+   * X-Forwarded-For says; only safe when the origin is unreachable except through a proxy
+   * that sets that header itself). A bare hop count is REFUSED: Fastify dropped it after a
+   * spoofing advisory, and a count cannot tell a proxy from an attacker.
    */
-  trustProxy: boolean | number | string;
+  trustProxy: boolean | string;
   /** Request-log level (pino). Null = logging off. Default: "info" in production, off elsewhere. */
   logLevel: string | null;
 }
@@ -61,11 +62,13 @@ export function positiveNumber(raw: string | undefined, fallback: number): numbe
   return Number.isFinite(value) && value > 0 ? value : fallback;
 }
 
-function parseTrustProxy(raw: string | undefined): boolean | number | string {
+function parseTrustProxy(raw: string | undefined): boolean | string {
   const value = (raw ?? "").trim();
   if (value === "" || value.toLowerCase() === "false") return false;
   if (value.toLowerCase() === "true") return true;
-  if (/^\d+$/.test(value)) return Number(value);
+  if (/^\d+$/.test(value)) {
+    throw new Error("TRUST_PROXY must be an address/CIDR list (or true/false) — a hop count is not supported");
+  }
   return value;
 }
 
