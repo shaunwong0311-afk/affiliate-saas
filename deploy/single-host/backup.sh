@@ -2,6 +2,7 @@
 # Nightly dump of the Vantage database (run from /etc/cron.d/vantage-backup).
 # Keeps 14 days next to the host's other dumps in /opt/backups. Copy them off the server too.
 set -eu
+umask 077
 DIR=/opt/backups/vantage
 mkdir -p "$DIR"
 chmod 700 "$DIR"
