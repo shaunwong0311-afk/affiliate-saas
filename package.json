@@ -20,7 +20,8 @@
     "worker": "node --import tsx packages/api/src/worker.ts",
     "demo": "node --import tsx packages/api/src/dev/demo.ts",
     "web:dev": "npm run dev -w @affiliate/web",
-    "lint": "npm run typecheck"
+    "lint": "npm run typecheck",
+    "create-owner": "node --import tsx packages/api/src/admin/create-owner.ts"
   },
   "dependencies": {
     "tsx": "^4.19.2"

@@ -269,7 +269,8 @@ describe("creating a team invite", () => {
     expect(typeof dev.data.devInviteToken).toBe("string");
     expect((await accept({ token: dev.data.devInviteToken, password: "invitee-password-1" })).status).toBe(200);
 
-    await boot({ config: loadConfig({ NODE_ENV: "production", JWT_SECRET: "0d2f4b6a8c1e3f5a7c9e1b3d5f7a9c0e2b4d6f8a1c3e5b7d", LOG_LEVEL: "silent" }) });
+    // ALLOW_SIGNUP: the setup signs a merchant up; signup is closed in production by default.
+    await boot({ config: loadConfig({ NODE_ENV: "production", JWT_SECRET: "0d2f4b6a8c1e3f5a7c9e1b3d5f7a9c0e2b4d6f8a1c3e5b7d", LOG_LEVEL: "silent", ALLOW_SIGNUP: "true" }) });
     const prod = await invite(INVITEE);
     expect(prod.status).toBe(201);
     expect(prod.data.devInviteToken).toBeUndefined();

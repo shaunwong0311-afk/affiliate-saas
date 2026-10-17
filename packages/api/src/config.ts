@@ -20,6 +20,14 @@ export interface AppConfig {
    * with ALLOW_SYNTHETIC_DISCOVERY=true (e.g. a sales demo) or off in dev.
    */
   allowSyntheticDiscovery: boolean;
+  /**
+   * Whether anyone may create a merchant account through POST /auth/signup. Default: open
+   * outside production, CLOSED in production — a single-business install (one merchant, its
+   * team invited from Settings, its partners signing in through emailed links) must not let
+   * strangers create tenants. Set ALLOW_SIGNUP=true to run it as an open SaaS. The first
+   * merchant on a closed install is created with `npm run create-owner`.
+   */
+  allowSignup: boolean;
   /** Public base URL of THIS API (for OAuth redirect URIs + magic/unsub links). */
   publicApiUrl: string;
   /** Mailbox-OAuth client credentials (per provider). Absent → that provider's connect is off. */
@@ -117,6 +125,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     exposeMagicLink: !isProduction,
     allowSyntheticDiscovery:
       setting("ALLOW_SYNTHETIC_DISCOVERY") != null ? setting("ALLOW_SYNTHETIC_DISCOVERY") === "true" : !isProduction,
+    allowSignup: setting("ALLOW_SIGNUP") != null ? setting("ALLOW_SIGNUP") === "true" : !isProduction,
     publicApiUrl: setting("PUBLIC_API_URL") ?? "http://localhost:8787",
     oauth: {
       microsoft:

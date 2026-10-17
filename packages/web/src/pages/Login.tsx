@@ -1,6 +1,6 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useAuth } from "../auth";
-import { errorMessage, errorStatus } from "../api";
+import { api, errorMessage, errorStatus } from "../api";
 import { Field, ErrorBanner, Notice } from "../ui";
 
 type Mode = "login" | "signup" | "affiliate";
@@ -13,6 +13,21 @@ export function Login({ initialMode = "login" }: { initialMode?: Mode }) {
   const [linkSentTo, setLinkSentTo] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [form, setForm] = useState({ email: "", password: "", name: "", merchantName: "", niche: "" });
+  // Whether this install lets anyone create a merchant (closed by default in production:
+  // a single-business install invites its team instead). Unknown until the API answers.
+  const [signupOpen, setSignupOpen] = useState(false);
+  useEffect(() => {
+    let cancelled = false;
+    api.get<{ signupOpen?: boolean }>("/auth/config").then(
+      (c) => { if (!cancelled) setSignupOpen(c?.signupOpen === true); },
+      () => { /* keep it hidden: the API refuses signup anyway when closed */ },
+    );
+    return () => { cancelled = true; };
+  }, []);
+  // A closed install must not leave the visitor on a signup form it cannot submit.
+  useEffect(() => {
+    if (!signupOpen && mode === "signup") setMode("login");
+  }, [signupOpen, mode]);
 
   const set = (k: string) => (e: React.ChangeEvent<HTMLInputElement>) => setForm({ ...form, [k]: e.target.value });
 
@@ -59,9 +74,11 @@ export function Login({ initialMode = "login" }: { initialMode?: Mode }) {
           <button type="button" className={mode === "login" ? "active" : ""} onClick={() => switchMode("login")}>
             Sign in
           </button>
-          <button type="button" className={mode === "signup" ? "active" : ""} onClick={() => switchMode("signup")}>
-            New merchant
-          </button>
+          {signupOpen && (
+            <button type="button" className={mode === "signup" ? "active" : ""} onClick={() => switchMode("signup")}>
+              New merchant
+            </button>
+          )}
           <button type="button" className={mode === "affiliate" ? "active" : ""} onClick={() => switchMode("affiliate")}>
             Affiliate
           </button>

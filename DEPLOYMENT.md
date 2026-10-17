@@ -66,6 +66,28 @@ What the compose file does:
 
 Without Docker, in-memory: `npm run api`, `npm run edge`, `npm run web:dev`.
 
+## Single-host install behind an existing reverse proxy
+
+How Perfect Design runs it: on a server that already hosts other services, behind that
+server's Caddy. Files: `deploy/single-host/`.
+
+- `compose.override.yml` layers onto the base compose file: a pre-built image (built
+  elsewhere and `docker load`ed, so the server never runs a build), memory/CPU limits per
+  container, read-only non-root containers with no Linux capabilities, bounded logs, no host
+  port for Postgres, the API on `127.0.0.1:18787` only, the edge off, and a network whose
+  bridge is always named `br-vantage`.
+- One host firewall rule keeps Vantage from reaching anything else on the machine:
+  `ufw insert 1 deny in on br-vantage`. Containers still reach the internet (mail, APIs).
+- `Caddyfile.site` is the site block for the host's Caddy: the web app's static files, the
+  API under `/api`, HSTS and a content security policy. Set `PUBLIC_API_URL` to
+  `https://<host>/api` and `CORS_ORIGINS` to `https://<host>`. Requests reach the API
+  through Docker's port proxy, so `TRUST_PROXY` is the network gateway (`172.31.250.1`).
+- `backup.sh` dumps the database nightly into `/opt/backups/vantage` (14 days kept), run
+  from `/etc/cron.d`. Copy the dumps off the server as well.
+- Public signup is closed in production. Create the merchant and its owner once:
+  `docker compose … run --rm api node --import tsx packages/api/src/admin/create-owner.ts
+  --merchant "Name" --email owner@example.com --currency MYR` prints a single-use invite link.
+
 ## Persistence
 
 - No `DATABASE_URL`: an in-memory store. Nothing survives a restart, and each process has its

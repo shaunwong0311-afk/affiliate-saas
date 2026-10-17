@@ -1,0 +1,79 @@
+# Single-host install: Vantage on a machine that already runs other services, behind that
+# machine's own reverse proxy (Caddy, for Perfect Design). Layered on the base file:
+#
+#   docker compose -p vantage --env-file /opt/vantage/.env \
+#     -f deploy/docker-compose.yml -f deploy/single-host/compose.override.yml up -d
+#
+# What it adds to the base file, so Vantage cannot disturb or reach its neighbours:
+# - a pre-built image (built elsewhere and `docker load`ed — no build load on the server);
+# - memory and CPU limits per container;
+# - its own network with a FIXED bridge name (br-vantage), so one firewall rule on the host
+#   (`ufw insert 1 deny in on br-vantage`) stops every Vantage container from reaching host
+#   services: the other app's Postgres, Redis, API, WhatsApp bridge, SSH;
+# - no host port for Postgres at all; the API only on 127.0.0.1 for the host's reverse proxy;
+# - containers that run as a non-root user, cannot gain privileges, hold no Linux
+#   capabilities, and have read-only filesystems (a small tmpfs for /tmp);
+# - bounded container logs;
+# - the Node tracking edge only on request (`--profile edge`): link redirects are off here.
+
+x-limits-small: &limits
+  mem_limit: 512m
+  memswap_limit: 512m
+  cpus: 1.0
+  pids_limit: 256
+
+x-logs: &logs
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+x-locked-down: &locked-down
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  read_only: true
+  tmpfs:
+    - /tmp:size=64m
+
+services:
+  postgres:
+    ports: !reset []
+    <<: [*limits, *logs]
+    security_opt:
+      - no-new-privileges:true
+
+  api:
+    build: !reset null
+    image: vantage:${VANTAGE_IMAGE_TAG:?set VANTAGE_IMAGE_TAG to the loaded image tag}
+    pull_policy: never
+    ports: !override
+      - "127.0.0.1:${VANTAGE_API_PORT:-18787}:8787"
+    <<: [*limits, *logs, *locked-down]
+
+  worker:
+    build: !reset null
+    image: vantage:${VANTAGE_IMAGE_TAG:?set VANTAGE_IMAGE_TAG to the loaded image tag}
+    pull_policy: never
+    <<: [*limits, *logs, *locked-down]
+
+  edge:
+    build: !reset null
+    image: vantage:${VANTAGE_IMAGE_TAG:?set VANTAGE_IMAGE_TAG to the loaded image tag}
+    pull_policy: never
+    profiles: ["edge"]
+    ports: !override
+      - "127.0.0.1:${VANTAGE_EDGE_PORT:-18788}:8788"
+    <<: [*limits, *logs, *locked-down]
+
+networks:
+  default:
+    name: vantage
+    driver_opts:
+      com.docker.network.bridge.name: br-vantage
+    ipam:
+      config:
+        - subnet: 172.31.250.0/24
+          gateway: 172.31.250.1

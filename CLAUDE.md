@@ -81,7 +81,11 @@ npm run web:dev               # dashboard :5173 (Vite proxies /api → :8787)
 - Nothing loads `.env` automatically: `node --env-file=.env --import tsx <entrypoint>`, or
   export the variables. `.env.example` lists every variable the code reads.
 - Full stack in containers: `docker compose --env-file .env -f deploy/docker-compose.yml up --build`
-  (see `DEPLOYMENT.md`).
+  (see `DEPLOYMENT.md`). On a shared server behind its own reverse proxy, add
+  `-f deploy/single-host/compose.override.yml` (isolated, resource-limited, read-only).
+- Public signup is closed in production (`ALLOW_SIGNUP`); create the first merchant with
+  `npm run create-owner -- --merchant "Name" --email owner@example.com --currency MYR`,
+  which prints a single-use owner invite link.
 - Tests, typecheck and the web build must stay green before committing. Commit/push only when
   asked; author is `shaunwong0311`; remote `shaunwong0311-afk/affiliate-saas`; commits
   co-authored by Claude.
