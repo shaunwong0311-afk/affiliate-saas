@@ -234,6 +234,11 @@ Website-prototype-automation repo's `.devbox/notes.md` (`devbox-note`).
   `TRUST_PROXY=172.31.250.1` (Docker's port proxy).
 - Backups: `/etc/cron.d/vantage-backup` at 02:45 → `/opt/backups/vantage` (14 days). On the
   server only, like the host's other dumps — no off-server copy yet.
+- Health check (read-only, run after any change on that server, by either project):
+  `ssh -i ~/.ssh/hetzner_perfectdesign root@46.225.78.249 /opt/vantage/deploy/single-host/check.sh`
+  — Perfect Design's API, icaur.com.sg, PM2, WhatsApp bridge, Caddy, memory/disk; Vantage's
+  containers, URLs, closed signup, certificate; the isolation rule and a live probe from inside
+  Vantage; backup freshness. Exit 0 = all PASS (WARNs allowed).
 - Not yet configured: the Perfect Design merchant and owner (`create-owner`), a transactional
   email key, the outreach mailbox.
 

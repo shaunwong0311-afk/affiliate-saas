@@ -84,6 +84,9 @@ server's Caddy. Files: `deploy/single-host/`.
   through Docker's port proxy, so `TRUST_PROXY` is the network gateway (`172.31.250.1`).
 - `backup.sh` dumps the database nightly into `/opt/backups/vantage` (14 days kept), run
   from `/etc/cron.d`. Copy the dumps off the server as well.
+- `check.sh` is a read-only health check of the whole host: the neighbours' services, Vantage's
+  containers and URLs, closed signup, the certificate, the isolation rule plus a live probe
+  from inside Vantage, and backup freshness. Exit 0 when nothing FAILs.
 - Public signup is closed in production. Create the merchant and its owner once:
   `docker compose … run --rm api node --import tsx packages/api/src/admin/create-owner.ts
   --merchant "Name" --email owner@example.com --currency MYR` prints a single-use invite link.
