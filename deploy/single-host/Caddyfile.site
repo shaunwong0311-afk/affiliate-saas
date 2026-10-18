@@ -1,0 +1,30 @@
+# Vantage partner portal — appended to the host's /etc/caddy/Caddyfile.
+# DNS: an A record straight to this server (not proxied), so Caddy issues the certificate,
+# like the other sites on this host.
+partners.perfectdesign.my {
+	encode zstd gzip
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=()"
+		Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'; object-src 'none'"
+		-Server
+	}
+
+	# The API lives under /api: the web app calls /api/…, and emailed links (unsubscribe,
+	# OAuth callbacks) are built from PUBLIC_API_URL=https://partners.perfectdesign.my/api.
+	handle_path /api/* {
+		reverse_proxy 127.0.0.1:18787
+	}
+
+	# The web app (static files built from packages/web).
+	handle {
+		root * /opt/vantage/web
+		@assets path /assets/*
+		header @assets Cache-Control "public, max-age=31536000, immutable"
+		try_files {path} /index.html
+		file_server
+	}
+}

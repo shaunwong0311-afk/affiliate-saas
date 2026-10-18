@@ -18,7 +18,8 @@ const json = { "content-type": "application/json" };
 async function productionApp(db: Database, env: Record<string, string> = {}): Promise<{ app: FastifyInstance; logs: () => Array<Record<string, any>> }> {
   const lines: string[] = [];
   const app = await buildApp(
-    { db, config: loadConfig({ NODE_ENV: "production", JWT_SECRET: JWT, ...env }), transactionalMailer: new ConsoleTransactionalMailer() },
+    // ALLOW_SIGNUP: setups sign a merchant up; signup is closed in production by default.
+    { db, config: loadConfig({ NODE_ENV: "production", JWT_SECRET: JWT, ALLOW_SIGNUP: "true", ...env }), transactionalMailer: new ConsoleTransactionalMailer() },
     { logStream: { write: (line: string) => void lines.push(line) } },
   );
   return { app, logs: () => lines.map((l) => JSON.parse(l) as Record<string, any>) };

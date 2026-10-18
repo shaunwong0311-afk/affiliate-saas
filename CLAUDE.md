@@ -81,7 +81,11 @@ npm run web:dev               # dashboard :5173 (Vite proxies /api → :8787)
 - Nothing loads `.env` automatically: `node --env-file=.env --import tsx <entrypoint>`, or
   export the variables. `.env.example` lists every variable the code reads.
 - Full stack in containers: `docker compose --env-file .env -f deploy/docker-compose.yml up --build`
-  (see `DEPLOYMENT.md`).
+  (see `DEPLOYMENT.md`). On a shared server behind its own reverse proxy, add
+  `-f deploy/single-host/compose.override.yml` (isolated, resource-limited, read-only).
+- Public signup is closed in production (`ALLOW_SIGNUP`); create the first merchant with
+  `npm run create-owner -- --merchant "Name" --email owner@example.com --currency MYR`,
+  which prints a single-use owner invite link.
 - Tests, typecheck and the web build must stay green before committing. Commit/push only when
   asked; author is `shaunwong0311`; remote `shaunwong0311-afk/affiliate-saas`; commits
   co-authored by Claude.
@@ -197,6 +201,46 @@ with two human gates" (A-tier outreach approval, warm-reply handoff). Detail in 
 - Declare as optional any field the API can omit; an error boundary wraps the routed page.
 - The API strips `postbackSecret` and `passwordHash` from reads; secrets come from their own
   admin-gated endpoints.
+
+## Live deployment (Perfect Design)
+
+Running since 2026-10-17 at **https://partners.perfectdesign.my**, for one business (Perfect
+Design), on the Perfect Design server (Hetzner `46.225.78.249`, SSH key
+`~/.ssh/hetzner_perfectdesign`, user root). That server also runs Perfect Design's own API
+(PM2), its CRM/communications Postgres, Redis and a WhatsApp bridge — treat it as live
+customer infrastructure: say what you will change before changing it, and leave a line in the
+Website-prototype-automation repo's `.devbox/notes.md` (`devbox-note`).
+
+- Layout: `/opt/vantage/` — `.env` (root, 600; secrets generated on the server, never
+  printed), `deploy/` (base compose + `single-host/` override, Caddy block, backup script),
+  `web/` (built SPA served by Caddy).
+- Run: `cd /opt/vantage && docker compose -p vantage --env-file /opt/vantage/.env -f
+  deploy/docker-compose.yml -f deploy/single-host/compose.override.yml up -d` (postgres, api,
+  worker; the edge is off). Containers are `vantage-{postgres,api,worker}-1`.
+- Release: build the image on the dev box (`docker build -f deploy/Dockerfile -t
+  vantage:<date>-<sha> .`), ship it (`docker save | gzip | ssh … "gunzip | docker load"`),
+  set `VANTAGE_IMAGE_TAG` in `/opt/vantage/.env`, `up -d`. Rebuild the SPA and copy it to
+  `/opt/vantage/web/`. Never build on the server.
+- Isolation: ufw rule 1 `deny in on br-vantage` — Vantage containers cannot reach any host
+  service (verified: SSH, Caddy, the other API, Postgres, Redis, WhatsApp bridge all
+  blocked; internet egress works). Postgres has no host port; the API listens on
+  `127.0.0.1:18787` for Caddy only. 512 MB / 1 CPU per container.
+- Caddy: the `partners.perfectdesign.my` block in `/etc/caddy/Caddyfile` (backup taken
+  before the change as `Caddyfile.bak-20261017-*-before-vantage`). Always `caddy validate`
+  before `systemctl reload caddy` — the same file serves `api.perfectdesign.app`.
+- DNS: `partners` A record → `46.225.78.249`, not proxied (Cloudflare zone perfectdesign.my),
+  so Caddy issues the certificate.
+- Config: production, `ALLOW_SIGNUP=false`, `PUBLIC_API_URL=https://partners.perfectdesign.my/api`,
+  `TRUST_PROXY=172.31.250.1` (Docker's port proxy).
+- Backups: `/etc/cron.d/vantage-backup` at 02:45 → `/opt/backups/vantage` (14 days). On the
+  server only, like the host's other dumps — no off-server copy yet.
+- Health check (read-only, run after any change on that server, by either project):
+  `ssh -i ~/.ssh/hetzner_perfectdesign root@46.225.78.249 /opt/vantage/deploy/single-host/check.sh`
+  — Perfect Design's API, icaur.com.sg, PM2, WhatsApp bridge, Caddy, memory/disk; Vantage's
+  containers, URLs, closed signup, certificate; the isolation rule and a live probe from inside
+  Vantage; backup freshness. Exit 0 = all PASS (WARNs allowed).
+- Not yet configured: the Perfect Design merchant and owner (`create-owner`), a transactional
+  email key, the outreach mailbox.
 
 ## Current state (2026-10-12)
 

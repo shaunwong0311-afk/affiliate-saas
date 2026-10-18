@@ -1,6 +1,4 @@
 import { z } from "zod";
-import { newId } from "@affiliate/core";
-import { randomBytes } from "node:crypto";
 import type { RouteModule } from "./helpers.js";
 import { parseBody, ok } from "./helpers.js";
 import { signJwt, hashPassword, verifyPasswordOrDummy } from "../auth/jwt.js";
@@ -8,6 +6,7 @@ import { acceptTeamInvite } from "../auth/invite.js";
 import { mintSignInMagicLink, redeemMagicLinkToken, SIGN_IN_LINK_TTL_SECONDS } from "../auth/magic-link.js";
 import { requirePrincipal } from "../auth/middleware.js";
 import { HttpError, badRequest, unauthorized, conflict } from "../errors.js";
+import { createMerchantWithOwner } from "../services/merchant-setup.js";
 import { writeAudit } from "../services/audit.js";
 import { publicUser } from "../sanitize.js";
 
@@ -22,54 +21,24 @@ const signupSchema = z.object({
 const loginSchema = z.object({ email: z.string().email(), password: z.string() });
 
 export const authRoutes: RouteModule = (app, ctx) => {
+  // ---- Public sign-in configuration (what the login screen may offer) -------
+  app.get("/auth/config", async (_request, reply) => ok(reply, { signupOpen: ctx.config.allowSignup }));
+
   // ---- Merchant user signup → creates merchant, owner membership, trial -----
+  // Closed by default in production (config.allowSignup): a single-business install must not
+  // let strangers create tenants on it.
   app.post("/auth/signup", async (request, reply) => {
+    if (!ctx.config.allowSignup) throw new HttpError(403, "signup is closed on this installation — ask the account owner for an invitation", "signup_closed");
     const body = parseBody(signupSchema, request);
     const existing = await ctx.db.users.findOne((u) => u.email.toLowerCase() === body.email.toLowerCase());
     if (existing) throw conflict("email already registered");
 
-    const now = ctx.clock.now().toISOString();
-    const user = await ctx.db.users.insert({
-      id: newId("usr"),
-      email: body.email,
-      name: body.name,
-      passwordHash: hashPassword(body.password),
-      createdAt: now,
-    });
-
-    const merchant = await ctx.db.merchants.insert({
-      id: newId("mer"),
-      name: body.merchantName,
-      status: "trial",
+    const { user, merchant } = await createMerchantWithOwner(ctx, {
+      merchantName: body.merchantName,
       niche: body.niche ?? null,
-      competitors: [],
-      billingStatus: "trialing",
-      defaultCurrency: "USD",
-      postbackSecret: `whsec_${randomBytes(24).toString("hex")}`,
-      physicalAddress: null,
-      createdAt: now,
+      owner: { email: body.email, name: body.name, passwordHash: hashPassword(body.password) },
+      ownerStatus: "active",
     });
-
-    await ctx.db.merchantUsers.insert({
-      id: newId("mu"),
-      merchantId: merchant.id,
-      userId: user.id,
-      email: user.email,
-      name: user.name,
-      role: "owner",
-      status: "active",
-    });
-
-    await ctx.db.subscriptions.insert({
-      id: newId("sub"),
-      merchantId: merchant.id,
-      plan: "track_export",
-      status: "trialing",
-      trialEndsAt: new Date(ctx.clock.now().getTime() + 14 * 86_400_000).toISOString(),
-      renewsAt: null,
-    });
-
-    await writeAudit(ctx, { merchantId: merchant.id, actorId: user.id, action: "merchant.created", subjectType: "merchant", subjectId: merchant.id });
 
     const token = signJwt({ sub: user.id, kind: "user", email: user.email }, ctx.config.jwtSecret);
     return ok(reply, { token, user: { id: user.id, email: user.email, name: user.name }, merchant }, 201);
